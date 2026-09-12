@@ -1,0 +1,211 @@
+
+import React, { useState } from 'react';
+import { Job, JobStatus, StepStatus } from '../types';
+import TranscriptView from './TranscriptView';
+import SummaryView from './SummaryView';
+import ChatView from './ChatView';
+import { exportJobAsJSON, exportErrorAsJSON } from '../services/exportUtils';
+
+interface JobDetailProps {
+  job: Job;
+  onUpdateJob: (updates: Partial<Job>) => void;
+  onAlert: (title: string, message: string) => void;
+  onRetry?: (id: string) => void;
+}
+
+const JobDetail: React.FC<JobDetailProps> = ({ job, onUpdateJob, onAlert, onRetry }) => {
+  const [activeTab, setActiveTab] = useState<'status' | 'transcript' | 'summary' | 'chat'>('status');
+
+  const getStepIcon = (status: StepStatus) => {
+    switch (status) {
+      case StepStatus.IDLE: return <i className="fa-regular fa-circle text-slate-200"></i>;
+      case StepStatus.PROCESSING: return <i className="fa-solid fa-circle-notch fa-spin text-indigo-500"></i>;
+      case StepStatus.SUCCESS: return <i className="fa-solid fa-circle-check text-emerald-500"></i>;
+      case StepStatus.ERROR: return <i className="fa-solid fa-circle-xmark text-rose-500"></i>;
+    }
+  };
+
+  return (
+    <div className="flex-1 flex flex-col h-full overflow-hidden">
+      <div className="flex border-b border-slate-100 bg-white shrink-0 overflow-x-auto items-center justify-between pr-4">
+        <div className="flex">
+          <TabButton active={activeTab === 'status'} onClick={() => setActiveTab('status')} label="任務進度" />
+          <TabButton active={activeTab === 'transcript'} onClick={() => setActiveTab('transcript')} label="完整逐字稿" count={job.transcript?.length} disabled={!job.transcript} />
+          <TabButton active={activeTab === 'summary'} onClick={() => setActiveTab('summary')} label="AI 會議記錄" disabled={!job.analysis} />
+          <TabButton 
+            active={activeTab === 'chat'} 
+            onClick={() => setActiveTab('chat')} 
+            label="AI 智慧問答" 
+            disabled={!job.transcript}
+            icon="fa-wand-magic-sparkles"
+          />
+        </div>
+
+        <div className="flex items-center gap-3 py-2">
+          {job.status === JobStatus.FAILED && (
+             <button 
+               onClick={() => exportErrorAsJSON(job)}
+               className="text-rose-600 hover:bg-rose-50 px-3 py-1.5 rounded text-xs font-bold flex items-center gap-2"
+             >
+               <i className="fa-solid fa-bug"></i> 診斷
+             </button>
+          )}
+
+          <div className={`px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider hidden sm:block ${
+            job.status === JobStatus.COMPLETED ? 'bg-emerald-50 text-emerald-600' :
+            job.status === JobStatus.FAILED ? 'bg-rose-50 text-rose-600' :
+            job.status === JobStatus.RUNNING ? 'bg-indigo-50 text-indigo-600' : 'bg-slate-50 text-slate-400'
+          }`.trim().concat(' ')}>
+             {job.status === JobStatus.RUNNING ? '處理中' : 
+              job.status === JobStatus.COMPLETED ? '已完成' : 
+              job.status === JobStatus.FAILED ? '失敗' : '等待'}
+          </div>
+        </div>
+      </div>
+
+      <div className={`flex-1 relative ${activeTab === 'chat' ? 'overflow-hidden' : 'overflow-y-auto bg-slate-50/30'}`}>
+        {activeTab === 'status' && (
+          <div className="max-w-xl mx-auto space-y-8 py-12 px-6 pb-24">
+            <div className="text-center mb-8">
+               <h2 className="text-lg font-bold text-slate-800 break-words">{job.fileName}</h2>
+               <p className="text-xs text-slate-400 mt-1">建立於 {new Date(job.createdAt).toLocaleString()}</p>
+            </div>
+
+            {job.status === JobStatus.FAILED && (
+              <div className="bg-rose-50 border border-rose-100 p-6 rounded-2xl flex gap-4 items-start shadow-sm animate-in fade-in slide-in-from-top-4 duration-500">
+                <div className="bg-rose-500 text-white p-2 rounded-full text-xs shrink-0">
+                  <i className="fa-solid fa-triangle-exclamation"></i>
+                </div>
+                <div className="flex-1 min-w-0">
+                  <h4 className="text-rose-900 font-bold text-sm mb-1">任務處理中斷</h4>
+                  <p className="text-rose-600 text-xs leading-relaxed mb-3">{job.error || '發生未知錯誤，請檢查網路連線或金鑰權限。'}</p>
+                  {onRetry && (
+                    <button
+                      onClick={() => onRetry(job.id)}
+                      className="bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-3.5 py-1.5 rounded-lg transition-colors flex items-center gap-1.5 shadow-sm"
+                    >
+                      <i className="fa-solid fa-rotate-right"></i>
+                      重新處理此任務
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {job.status === JobStatus.RUNNING && job.etaSeconds && job.etaSeconds > 0 && (
+              <div className="bg-indigo-900 text-white p-4 rounded-xl shadow-lg flex items-center justify-between">
+                <div>
+                  <p className="text-[10px] font-black uppercase tracking-[0.2em] opacity-60">AI 預估剩餘時間</p>
+                  <p className="text-xl font-bold">{Math.floor(job.etaSeconds / 60)} 分 {job.etaSeconds % 60} 秒</p>
+                </div>
+                <div className="text-4xl opacity-20"><i className="fa-solid fa-hourglass-half animate-pulse"></i></div>
+              </div>
+            )}
+
+            <div className="relative">
+              <div className="absolute left-3 top-0 bottom-0 w-0.5 bg-slate-100"></div>
+              <div className="space-y-10 relative">
+                {job.steps.map((step, idx) => (
+                  <div key={idx} className="flex gap-6 items-start">
+                    <div className="z-10 bg-white rounded-full p-1 border border-slate-100">
+                      {getStepIcon(step.status)}
+                    </div>
+                    <div className="flex-1 pt-0.5">
+                      <p className={`text-sm font-bold ${
+                        step.status === StepStatus.IDLE ? 'text-slate-300' : 
+                        step.status === StepStatus.ERROR ? 'text-rose-600' : 'text-slate-700'
+                      }`}>
+                        {step.name}
+                      </p>
+                      {step.status === StepStatus.PROCESSING && (
+                        <div className="mt-3">
+                          <div className="h-1.5 w-full bg-slate-100 rounded-full overflow-hidden border border-slate-200">
+                            <div className="h-full bg-indigo-500 animate-[shimmer_1.5s_infinite] origin-left"></div>
+                          </div>
+                          <p className="text-[10px] text-slate-400 mt-2 font-medium flex items-center gap-1">
+                            <i className="fa-solid fa-bolt-lightning animate-pulse"></i>
+                            AI 正在處理您的請求，請保持網頁開啟...
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Data Management Section */}
+            {(job.status === JobStatus.COMPLETED || job.status === JobStatus.FAILED) && (
+              <div className="pt-12 mt-12 border-t border-slate-200">
+                <h3 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-4">資料管理</h3>
+                <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex items-center justify-between">
+                  <div>
+                    <h4 className="text-sm font-bold text-slate-700">原始任務數據 (.json)</h4>
+                    <p className="text-[10px] text-slate-400 mt-1">
+                      下載包含逐字稿、分析結果與除錯資訊的完整備份。
+                    </p>
+                  </div>
+                  <button 
+                    onClick={() => exportJobAsJSON(job)}
+                    className="text-slate-500 hover:text-indigo-600 bg-slate-50 hover:bg-indigo-50 border border-slate-200 hover:border-indigo-200 px-3 py-2 rounded-lg transition-all text-xs font-bold"
+                  >
+                    <i className="fa-solid fa-download mr-1"></i>
+                    下載備份
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {activeTab === 'transcript' && job.transcript && (
+          <TranscriptView 
+            fileName={job.fileName}
+            segments={job.transcript}
+            polishedContent={job.polishedContent}
+            onUpdate={(segments) => onUpdateJob({ transcript: segments })}
+            onSavePolished={(text) => onUpdateJob({ polishedContent: text })}
+            onAlert={onAlert}
+          />
+        )}
+        
+        {activeTab === 'summary' && job.analysis && (
+          <SummaryView 
+            analysis={job.analysis} 
+            jobMetadata={job} 
+            onUpdate={(analysis) => onUpdateJob({ analysis })}
+          />
+        )}
+
+        {activeTab === 'chat' && job.transcript && (
+          <ChatView fileName={job.fileName} transcript={job.transcript} />
+        )}
+      </div>
+      
+      <style>{`
+        @keyframes shimmer {
+          0% { transform: scaleX(0.1); opacity: 0.3; }
+          50% { transform: scaleX(0.8); opacity: 1; }
+          100% { transform: scaleX(1); opacity: 0; }
+        }
+      `}</style>
+    </div>
+  );
+};
+
+const TabButton: React.FC<{active: boolean, onClick: () => void, label: string, disabled?: boolean, count?: number, icon?: string}> = ({ active, onClick, label, disabled, count, icon }) => (
+  <button
+    disabled={disabled}
+    onClick={onClick}
+    className={`px-6 py-4 text-[11px] font-bold uppercase tracking-[0.1em] border-b-2 transition-all whitespace-nowrap flex items-center gap-2 ${
+      disabled ? 'opacity-30 cursor-not-allowed border-transparent' :
+      active ? 'border-indigo-600 text-indigo-600 bg-white' : 'border-transparent text-slate-400 hover:text-slate-600'
+    }`}
+  >
+    {icon && <i className={`fa-solid ${icon}`}></i>}
+    {label} 
+    {count !== undefined && <span className="opacity-50">({count})</span>}
+  </button>
+);
+
+export default JobDetail;

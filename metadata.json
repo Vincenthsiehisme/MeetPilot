@@ -1,0 +1,8 @@
+{
+  "name": "語音蒟蒻",
+  "description": "A comprehensive dashboard for managing audio transcription workflows using WhisperX and Gemini. Features automatic slicing, structured Chinese summarization, and single-concurrency job queuing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
