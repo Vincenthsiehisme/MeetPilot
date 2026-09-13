@@ -1,5 +1,6 @@
 
 import { extractAudio } from './ffmpegService';
+import { resolveDuration } from './audioDuration';
 
 /**
  * 負責處理前端音訊切片與重取樣
@@ -225,17 +226,16 @@ export async function* generateAudioSlices(
   const fullAudioBuffer = await preprocessAudioBuffer(rawAudioBuffer);
   (rawAudioBuffer as any) = null; // 釋放記憶體
 
-  // 如果前面無法獲得長度 (totalDuration 為 0)，改用解碼後的實際長度
-  if (totalDuration <= 0) {
-    totalDuration = fullAudioBuffer.duration;
-  }
-
   const sampleRate = fullAudioBuffer.sampleRate;
   const channelData = fullAudioBuffer.getChannelData(0);
   let currentStart = 0;
   let index = 0;
 
   try {
+    // metadata 長度不是有限正數 (讀取失敗為 0、串流或某些容器為 Infinity/NaN) 就改用解碼後的實際長度；
+    // 兩者都壞會拋錯，不讓 Infinity 進下面的 while 迴圈。放在 try 內讓 finally 能關掉 tempCtx
+    totalDuration = resolveDuration(totalDuration, fullAudioBuffer.duration);
+
     while (currentStart < totalDuration) {
       const end = Math.min(currentStart + sliceDuration + overlapSeconds, totalDuration);
       const frameStart = Math.floor(currentStart * sampleRate);
