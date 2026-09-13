@@ -11,9 +11,8 @@ const listenConfig = resolveListenConfig(process.env);
 
 const app = express();
 
-// Allow large payloads for audio slices (up to 50MB)
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+// 順序重要：限流與 Basic Auth 先掛，body parser 後掛。
+// 否則未認證的請求會先把整個 50MB body 讀完、解析完，才在後面被拒絕。
 
 // /api/* 限流：每個 IP 每分鐘最多 20 次。放在 Basic Auth 前面，猜密碼也一起被限
 const apiRateLimiter = createRateLimiter({ limit: 20, windowMs: 60_000 });
@@ -38,6 +37,11 @@ if (listenConfig.basicAuth) {
     next();
   });
 }
+
+// Allow large payloads for audio slices (up to 50MB)
+// 只掛在 /api 底下，通過限流與認證後才解析 body；/api 以外沒有路由讀 req.body
+app.use('/api', express.json({ limit: '50mb' }));
+app.use('/api', express.urlencoded({ limit: '50mb', extended: true }));
 
 // Lazy GoogleGenAI client
 let aiClient: GoogleGenAI | null = null;
