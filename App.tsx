@@ -19,6 +19,7 @@ import {
 } from './services/storageService';
 
 const STALE_JOB_THRESHOLD = 5 * 60 * 1000;
+const SLICE_OVERLAP_SECONDS = 15; // generateAudioSlices 與 mergeSliceTranscript 必須用同一個值
 
 const translateError = (error: string) => {
   const e = (error || '').toLowerCase();
@@ -182,7 +183,7 @@ const App: React.FC = () => {
       const sliceDurationMin = 10;
       const expectedSlices = duration > 0 ? Math.ceil(duration / (sliceDurationMin * 60)) : 1;
       
-      const sliceGenerator = generateAudioSlices(file, sliceDurationMin, 15); // 增加 overlap 至 15秒
+      const sliceGenerator = generateAudioSlices(file, sliceDurationMin, SLICE_OVERLAP_SECONDS);
       
       await updateJobStep(id, 0, StepStatus.SUCCESS, { 
         totalSlices: expectedSlices,
@@ -216,7 +217,7 @@ const App: React.FC = () => {
         const sliceTranscript = await transcribeSlice(slice.data, slice.startTime, contextText, slice.mimeType || 'audio/wav');
         
         // 智慧接合：以既有逐字稿已涵蓋到的時間為準去掉 overlap 重複（規則見 transcriptMerge.ts）
-        fullTranscript = mergeSliceTranscript(fullTranscript, sliceTranscript, slice.startTime, slice.index === 0);
+        fullTranscript = mergeSliceTranscript(fullTranscript, sliceTranscript, slice.startTime, slice.index === 0, 0.5, SLICE_OVERLAP_SECONDS);
 
         await updateJobInStateAndDB(id, { 
           transcript: fullTranscript,

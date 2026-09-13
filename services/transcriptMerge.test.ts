@@ -59,6 +59,40 @@ describe('mergeSliceTranscript', () => {
     ]);
   });
 
+  it('existing 最後一段 end 超過 overlap 區時，coveredUntil 以 sliceStartTime + overlapSeconds 為上限', () => {
+    // 前一片 LLM 時間戳高估到 640（sliceStart 600 + 40，超過 overlap 15），不能拿 640 當 coveredUntil
+    const existing = [seg(600, 640, 'overshoot')];
+    const incoming = [
+      seg(600, 612, 'in-overlap'),  // end 612 <= 615.5，丟
+      seg(612, 620, 'must-keep'),   // end 620 > 615.5，留（舊規則會因 620 <= 640.5 掉字）
+      seg(620, 630, 'next')
+    ];
+    expect(mergeSliceTranscript(existing, incoming, 600, false)).toEqual([
+      seg(600, 640, 'overshoot'), seg(612, 620, 'must-keep'), seg(620, 630, 'next')
+    ]);
+  });
+
+  it('existing 最後一段 end 在 overlap 區內時，行為跟原本一樣', () => {
+    const existing = [seg(600, 610, 'short')];
+    const incoming = [
+      seg(600, 605, 'dup'),        // end 605 <= 610.5，丟
+      seg(605, 610.5, 'edge'),     // end 610.5 <= 610.5，丟
+      seg(610, 614, 'keep'),       // end 614 > 610.5，留
+      seg(614, 620, 'next')
+    ];
+    expect(mergeSliceTranscript(existing, incoming, 600, false)).toEqual([
+      seg(600, 610, 'short'), seg(610, 614, 'keep'), seg(614, 620, 'next')
+    ]);
+  });
+
+  it('overlapSeconds 可自訂', () => {
+    const existing = [seg(600, 640, 'overshoot')];
+    const incoming = [seg(600, 630, 'a'), seg(630, 636, 'b')];
+    expect(mergeSliceTranscript(existing, incoming, 600, false, 0.5, 30)).toEqual([
+      seg(600, 640, 'overshoot'), seg(630, 636, 'b')
+    ]);
+  });
+
   it('不 mutate 輸入陣列', () => {
     const existing = [seg(0, 10, 'a')];
     const incoming = [seg(5, 10, 'dup'), seg(10, 15, 'b')];
