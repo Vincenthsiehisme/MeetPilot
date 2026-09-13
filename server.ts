@@ -3,14 +3,41 @@ import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
 import { getAgentById } from './services/agents';
+import { checkBasicAuth, createRateLimiter, resolveListenConfig } from './services/httpGuards';
 import { TranscriptSegment, GeminiOutput, ChatMessage, SubAgentType } from './types';
 
+// 監聽設定在啟動時就解析：HOST 不是本機位址又沒設 Basic Auth 會在這裡直接拋錯，不進 listen
+const listenConfig = resolveListenConfig(process.env);
+
 const app = express();
-const PORT = 3000;
 
 // Allow large payloads for audio slices (up to 50MB)
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
+
+// /api/* 限流：每個 IP 每分鐘最多 20 次。放在 Basic Auth 前面，猜密碼也一起被限
+const apiRateLimiter = createRateLimiter({ limit: 20, windowMs: 60_000 });
+app.use('/api', (req, res, next) => {
+  const clientIp = req.ip ?? req.socket.remoteAddress ?? 'unknown';
+  const result = apiRateLimiter.check(clientIp);
+  if (!result.allowed) {
+    res.setHeader('Retry-After', String(result.retryAfterSeconds));
+    return res.status(429).json({ error: `請求太頻繁，請 ${result.retryAfterSeconds} 秒後再試` });
+  }
+  next();
+});
+
+// /api/* Basic Auth：只有設定了帳密才掛，本機位址不設帳密就不要求認證
+if (listenConfig.basicAuth) {
+  const credentials = listenConfig.basicAuth;
+  app.use('/api', (req, res, next) => {
+    if (!checkBasicAuth(req.headers.authorization, credentials)) {
+      res.setHeader('WWW-Authenticate', 'Basic realm="MeetPilot", charset="UTF-8"');
+      return res.status(401).json({ error: '需要 Basic Auth 認證' });
+    }
+    next();
+  });
+}
 
 // Lazy GoogleGenAI client
 let aiClient: GoogleGenAI | null = null;
@@ -668,8 +695,9 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on http://0.0.0.0:${PORT}`);
+  const { host, port, basicAuth } = listenConfig;
+  app.listen(port, host, () => {
+    console.log(`Server running on http://${host}:${port}${basicAuth ? ' (Basic Auth on /api/*)' : ''}`);
   });
 }
 
