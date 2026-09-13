@@ -2,6 +2,7 @@
 import React, { useRef, useEffect } from 'react';
 import { GeminiOutput, Job } from '../types';
 import { exportSummaryAsMarkdown, exportSummaryAsText } from '../services/exportUtils';
+import { buildPrintDocument } from '../services/printDocument';
 
 interface SummaryViewProps {
   analysis: GeminiOutput;
@@ -71,36 +72,8 @@ const SummaryView: React.FC<SummaryViewProps> = ({ analysis, jobMetadata, onUpda
     const printWindow = window.open('', '_blank');
     if (!printWindow) return;
 
-    const htmlContent = document.getElementById('summary-content')?.innerHTML;
-    if (!htmlContent) return;
-
-    printWindow.document.write(`
-      <html>
-        <head>
-          <title>${jobMetadata.fileName} - Meeting Minutes</title>
-          <style>
-             body { font-family: sans-serif; padding: 40px; color: #333; line-height: 1.6; }
-             h1 { font-size: 24px; margin-bottom: 5px; }
-             h2 { font-size: 16px; text-transform: uppercase; border-bottom: 2px solid #eee; padding-bottom: 5px; margin-top: 30px; }
-             h3 { font-size: 12px; color: #999; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 5px; }
-             .topic-item { margin-bottom: 20px; }
-             .topic-title { font-weight: bold; display: block; margin-bottom: 5px; }
-             ul { padding-left: 20px; }
-             li { margin-bottom: 8px; }
-             .meta { font-size: 12px; color: #666; margin-bottom: 30px; }
-             /* 隱藏介面元素 */
-             button, textarea { display: none; }
-             /* 將 textarea 的值轉為 div 顯示 */
-           </style>
-        </head>
-        <body>
-           <div class="meta">
-             FILE: ${jobMetadata.fileName} | DATE: ${new Date(jobMetadata.createdAt).toLocaleDateString()}
-           </div>
-           ${htmlContent.replace(/<textarea[^>]*>(.*?)<\/textarea>/gs, '<div style="white-space: pre-wrap;">$1</div>')}
-        </body>
-      </html>
-    `);
+    // 從結構化資料組列印文件，每個值都經過跳脫；不讀畫面 innerHTML
+    printWindow.document.write(buildPrintDocument(jobMetadata, analysis));
     printWindow.document.close();
     printWindow.focus();
     setTimeout(() => {
@@ -111,7 +84,7 @@ const SummaryView: React.FC<SummaryViewProps> = ({ analysis, jobMetadata, onUpda
 
   return (
     <div className="w-full h-full overflow-y-auto bg-slate-50/20 pb-20">
-      <div id="summary-content" className="max-w-4xl mx-auto my-6 sm:my-10 bg-white shadow-sm border border-slate-200 rounded-none sm:rounded-xl min-h-[800px] flex flex-col relative print:shadow-none print:border-none">
+      <div className="max-w-4xl mx-auto my-6 sm:my-10 bg-white shadow-sm border border-slate-200 rounded-none sm:rounded-xl min-h-[800px] flex flex-col relative print:shadow-none print:border-none">
         
         {/* Document Header */}
         <div className="px-8 sm:px-12 pt-12 pb-8 border-b border-slate-100">

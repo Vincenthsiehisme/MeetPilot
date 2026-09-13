@@ -7,7 +7,7 @@ export default defineConfig(({ mode }) => {
     return {
       server: {
         port: 3000,
-        host: '0.0.0.0',
+        // 不設 host：vite preview 只聽本機，跟 server.ts 的預設一致；要對外走 server.ts 的 HOST 與 Basic Auth
       },
       plugins: [react()],
       resolve: {

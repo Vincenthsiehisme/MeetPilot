@@ -3,14 +3,46 @@ import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
 import { getAgentById } from './services/agents';
+import { checkBasicAuth, createRateLimiter, resolveListenConfig } from './services/httpGuards';
 import { TranscriptSegment, GeminiOutput, ChatMessage, SubAgentType } from './types';
 
+// 監聽設定在啟動時就解析：HOST 不是本機位址又沒設 Basic Auth 會在這裡直接拋錯，不進 listen
+const listenConfig = resolveListenConfig(process.env);
+
 const app = express();
-const PORT = 3000;
+
+// 順序重要：限流與 Basic Auth 先掛，body parser 後掛。
+// 否則未認證的請求會先把整個 50MB body 讀完、解析完，才在後面被拒絕。
+
+// /api/* 限流：每個 IP 每分鐘最多 MEETPILOT_API_RATE_LIMIT 次（預設 60）。放在 Basic Auth 前面，猜密碼也一起被限
+const apiRateLimiter = createRateLimiter({ limit: listenConfig.apiRateLimitPerMinute, windowMs: 60_000 });
+app.use('/api', (req, res, next) => {
+  const clientIp = req.ip ?? req.socket.remoteAddress ?? 'unknown';
+  const result = apiRateLimiter.check(clientIp);
+  if (!result.allowed) {
+    res.setHeader('Retry-After', String(result.retryAfterSeconds));
+    // 訊息要含字面 "429"：前端 geminiService.ts 的 withRetry 靠 msg.includes('429') 決定退避重試
+    return res.status(429).json({ error: `請求太頻繁 (HTTP 429)，請 ${result.retryAfterSeconds} 秒後再試` });
+  }
+  next();
+});
+
+// /api/* Basic Auth：只有設定了帳密才掛，本機位址不設帳密就不要求認證
+if (listenConfig.basicAuth) {
+  const credentials = listenConfig.basicAuth;
+  app.use('/api', (req, res, next) => {
+    if (!checkBasicAuth(req.headers.authorization, credentials)) {
+      res.setHeader('WWW-Authenticate', 'Basic realm="MeetPilot", charset="UTF-8"');
+      return res.status(401).json({ error: '需要 Basic Auth 認證' });
+    }
+    next();
+  });
+}
 
 // Allow large payloads for audio slices (up to 50MB)
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+// 只掛在 /api 底下，通過限流與認證後才解析 body；/api 以外沒有路由讀 req.body
+app.use('/api', express.json({ limit: '50mb' }));
+app.use('/api', express.urlencoded({ limit: '50mb', extended: true }));
 
 // Lazy GoogleGenAI client
 let aiClient: GoogleGenAI | null = null;
@@ -668,8 +700,9 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on http://0.0.0.0:${PORT}`);
+  const { host, port, basicAuth } = listenConfig;
+  app.listen(port, host, () => {
+    console.log(`Server running on http://${host}:${port}${basicAuth ? ' (Basic Auth on /api/*)' : ''}`);
   });
 }
 
