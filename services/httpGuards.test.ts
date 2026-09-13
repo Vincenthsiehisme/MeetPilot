@@ -6,7 +6,7 @@ const basicHeader = (user: string, password: string) =>
 
 describe('resolveListenConfig', () => {
   it('AC-1：不設 HOST 時綁 127.0.0.1、PORT 預設 3000、不啟用 Basic Auth', () => {
-    expect(resolveListenConfig({})).toEqual({ host: '127.0.0.1', port: 3000, basicAuth: null });
+    expect(resolveListenConfig({})).toEqual({ host: '127.0.0.1', port: 3000, basicAuth: null, apiRateLimitPerMinute: 60 });
   });
 
   it('AC-1：HOST 為空字串視同未設定', () => {
@@ -41,13 +41,30 @@ describe('resolveListenConfig', () => {
         MEETPILOT_BASIC_AUTH_USER: 'admin',
         MEETPILOT_BASIC_AUTH_PASSWORD: 'secret',
       })
-    ).toEqual({ host: '0.0.0.0', port: 8080, basicAuth: { user: 'admin', password: 'secret' } });
+    ).toEqual({ host: '0.0.0.0', port: 8080, basicAuth: { user: 'admin', password: 'secret' }, apiRateLimitPerMinute: 60 });
   });
 
   it('AC-3：本機位址（127.0.0.1、localhost、::1）不設帳密時不要求認證', () => {
     for (const host of ['127.0.0.1', 'localhost', '::1']) {
       expect(resolveListenConfig({ HOST: host }).basicAuth).toBeNull();
     }
+  });
+
+  it('不設 MEETPILOT_API_RATE_LIMIT 時每 IP 每分鐘 60 次', () => {
+    expect(resolveListenConfig({}).apiRateLimitPerMinute).toBe(60);
+  });
+
+  it('MEETPILOT_API_RATE_LIMIT="20" 時是 20', () => {
+    expect(resolveListenConfig({ MEETPILOT_API_RATE_LIMIT: '20' }).apiRateLimitPerMinute).toBe(20);
+  });
+
+  it('MEETPILOT_API_RATE_LIMIT 不是正整數時拋錯且訊息含變數名', () => {
+    expect(() => resolveListenConfig({ MEETPILOT_API_RATE_LIMIT: 'abc' })).toThrowError(
+      'MEETPILOT_API_RATE_LIMIT="abc" 必須是正整數（每 IP 每分鐘的請求數），請修正 .env'
+    );
+    expect(() => resolveListenConfig({ MEETPILOT_API_RATE_LIMIT: '0' })).toThrowError(
+      'MEETPILOT_API_RATE_LIMIT="0" 必須是正整數（每 IP 每分鐘的請求數），請修正 .env'
+    );
   });
 
   it('PORT 不是合法連接埠時拋錯', () => {

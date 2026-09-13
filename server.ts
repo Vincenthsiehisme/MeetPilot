@@ -14,14 +14,15 @@ const app = express();
 // 順序重要：限流與 Basic Auth 先掛，body parser 後掛。
 // 否則未認證的請求會先把整個 50MB body 讀完、解析完，才在後面被拒絕。
 
-// /api/* 限流：每個 IP 每分鐘最多 20 次。放在 Basic Auth 前面，猜密碼也一起被限
-const apiRateLimiter = createRateLimiter({ limit: 20, windowMs: 60_000 });
+// /api/* 限流：每個 IP 每分鐘最多 MEETPILOT_API_RATE_LIMIT 次（預設 60）。放在 Basic Auth 前面，猜密碼也一起被限
+const apiRateLimiter = createRateLimiter({ limit: listenConfig.apiRateLimitPerMinute, windowMs: 60_000 });
 app.use('/api', (req, res, next) => {
   const clientIp = req.ip ?? req.socket.remoteAddress ?? 'unknown';
   const result = apiRateLimiter.check(clientIp);
   if (!result.allowed) {
     res.setHeader('Retry-After', String(result.retryAfterSeconds));
-    return res.status(429).json({ error: `請求太頻繁，請 ${result.retryAfterSeconds} 秒後再試` });
+    // 訊息要含字面 "429"：前端 geminiService.ts 的 withRetry 靠 msg.includes('429') 決定退避重試
+    return res.status(429).json({ error: `請求太頻繁 (HTTP 429)，請 ${result.retryAfterSeconds} 秒後再試` });
   }
   next();
 });

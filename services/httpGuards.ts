@@ -13,11 +13,15 @@ export interface ListenConfig {
   port: number;
   // null 代表不啟用 Basic Auth（只允許 host 是本機位址時）
   basicAuth: BasicAuthCredentials | null;
+  // /api/* 每個 IP 每分鐘允許的請求數，來自 MEETPILOT_API_RATE_LIMIT
+  apiRateLimitPerMinute: number;
 }
 
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
 const DEFAULT_HOST = '127.0.0.1';
 const DEFAULT_PORT = 3000;
+// 200 分鐘錄音的正常流程約 20 片轉錄加一次摘要，可能同一分鐘內回來，20 會撞到；60 仍擋得住掃描與猜密碼
+const DEFAULT_API_RATE_LIMIT = 60;
 
 export function isLoopbackHost(host: string): boolean {
   return LOOPBACK_HOSTS.has(host);
@@ -39,11 +43,17 @@ export function resolveListenConfig(env: NodeJS.ProcessEnv): ListenConfig {
     throw new Error(`PORT="${rawPort}" 不是合法的連接埠（1-65535），請修正 .env`);
   }
 
+  const rawRateLimit = readEnv(env, 'MEETPILOT_API_RATE_LIMIT');
+  const apiRateLimitPerMinute = rawRateLimit === undefined ? DEFAULT_API_RATE_LIMIT : Number(rawRateLimit);
+  if (!Number.isInteger(apiRateLimitPerMinute) || apiRateLimitPerMinute < 1) {
+    throw new Error(`MEETPILOT_API_RATE_LIMIT="${rawRateLimit}" 必須是正整數（每 IP 每分鐘的請求數），請修正 .env`);
+  }
+
   const user = readEnv(env, 'MEETPILOT_BASIC_AUTH_USER');
   const password = readEnv(env, 'MEETPILOT_BASIC_AUTH_PASSWORD');
 
   if (user !== undefined && password !== undefined) {
-    return { host, port, basicAuth: { user, password } };
+    return { host, port, basicAuth: { user, password }, apiRateLimitPerMinute };
   }
 
   if (user !== undefined || password !== undefined) {
@@ -58,7 +68,7 @@ export function resolveListenConfig(env: NodeJS.ProcessEnv): ListenConfig {
     );
   }
 
-  return { host, port, basicAuth: null };
+  return { host, port, basicAuth: null, apiRateLimitPerMinute };
 }
 
 function safeEqual(a: string, b: string): boolean {
