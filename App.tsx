@@ -7,6 +7,7 @@ import FileUpload from './components/FileUpload';
 import ConfirmModal from './components/ConfirmModal';
 import { transcribeSlice, analyzeTranscript } from './services/geminiService';
 import { generateAudioSlices, getAudioDuration } from './services/audioService';
+import { mergeSliceTranscript } from './services/transcriptMerge';
 import { 
   saveJobToDB, 
   getAllJobsFromDB, 
@@ -213,14 +214,8 @@ const App: React.FC = () => {
 
         const sliceTranscript = await transcribeSlice(slice.data, slice.startTime, contextText, slice.mimeType || 'audio/wav');
         
-        // 智慧接合：
-        // Overlap 區域的處理。如果是第一個片段，直接使用。
-        // 如果是後續片段，只取 start >= slice.startTime 的部分，避免重複。
-        const filtered = slice.index === 0 
-          ? sliceTranscript 
-          : sliceTranscript.filter(s => s.start >= slice.startTime);
-
-        fullTranscript = [...fullTranscript, ...filtered];
+        // 智慧接合：以既有逐字稿已涵蓋到的時間為準去掉 overlap 重複（規則見 transcriptMerge.ts）
+        fullTranscript = mergeSliceTranscript(fullTranscript, sliceTranscript, slice.startTime, slice.index === 0);
 
         await updateJobInStateAndDB(id, { 
           transcript: fullTranscript,

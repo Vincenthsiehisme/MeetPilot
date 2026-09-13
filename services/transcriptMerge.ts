@@ -24,6 +24,10 @@ export function mergeSliceTranscript(
   isFirstSlice: boolean,
   tolerance: number = 0.5
 ): TranscriptSegment[] {
-  void existing; void incoming; void sliceStartTime; void isFirstSlice; void tolerance;
-  throw new Error('mergeSliceTranscript 尚未實作（工作包 T2）');
+  if (isFirstSlice) {
+    return [...existing, ...incoming];
+  }
+  const coveredUntil = existing.length > 0 ? existing[existing.length - 1].end : sliceStartTime;
+  const kept = incoming.filter(s => s.end > coveredUntil + tolerance);
+  return [...existing, ...kept];
 }
