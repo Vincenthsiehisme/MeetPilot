@@ -180,7 +180,8 @@ const App: React.FC = () => {
       }
       
       const sliceDurationMin = 10;
-      const expectedSlices = duration > 0 ? Math.ceil(duration / (sliceDurationMin * 60)) : 1;
+      // metadata duration 可能是 Infinity/NaN（見 services/audioDuration.ts），不能拿去除；那時先當 1 片，進度文字用 Math.max 撐著
+      const expectedSlices = Number.isFinite(duration) && duration > 0 ? Math.ceil(duration / (sliceDurationMin * 60)) : 1;
       
       const sliceGenerator = generateAudioSlices(file, sliceDurationMin, 15); // 增加 overlap 至 15秒
       
