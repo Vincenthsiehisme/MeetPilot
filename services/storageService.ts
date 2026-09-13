@@ -19,7 +19,17 @@ const openDB = (): Promise<IDBDatabase> => {
   });
 };
 
-export const saveJobToDB = async (job: Job) => {
+// jobs store 的序列化寫入佇列：同一時間只有一筆交易在飛，後來的照呼叫順序排隊。
+// 任一筆失敗只 reject 給它自己的呼叫者，鏈本身吞掉結果繼續往下，後面的不會永遠卡住。
+let jobWriteChain: Promise<void> = Promise.resolve();
+
+const enqueueJobWrite = <T>(task: () => Promise<T>): Promise<T> => {
+  const run = jobWriteChain.then(task);
+  jobWriteChain = run.then(() => undefined, () => undefined);
+  return run;
+};
+
+const putJob = async (job: Job): Promise<void> => {
   const db = await openDB();
   return new Promise<void>((resolve, reject) => {
     const tx = db.transaction(STORE_JOBS, "readwrite");
@@ -29,7 +39,7 @@ export const saveJobToDB = async (job: Job) => {
   });
 };
 
-export const deleteJobFromDB = async (id: string): Promise<void> => {
+const deleteJob = async (id: string): Promise<void> => {
   const db = await openDB();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_JOBS, "readwrite");
@@ -38,6 +48,10 @@ export const deleteJobFromDB = async (id: string): Promise<void> => {
     tx.onerror = () => reject(tx.error);
   });
 };
+
+export const saveJobToDB = (job: Job): Promise<void> => enqueueJobWrite(() => putJob(job));
+
+export const deleteJobFromDB = (id: string): Promise<void> => enqueueJobWrite(() => deleteJob(id));
 
 export const getAllJobsFromDB = async (): Promise<Job[]> => {
   const db = await openDB();

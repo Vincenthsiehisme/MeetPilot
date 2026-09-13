@@ -7,6 +7,7 @@ import FileUpload from './components/FileUpload';
 import ConfirmModal from './components/ConfirmModal';
 import { transcribeSlice, analyzeTranscript } from './services/geminiService';
 import { generateAudioSlices, getAudioDuration } from './services/audioService';
+import { mergeSliceTranscript } from './services/transcriptMerge';
 import { 
   saveJobToDB, 
   getAllJobsFromDB, 
@@ -68,6 +69,15 @@ const App: React.FC = () => {
     hideCancel: false
   });
   const isProcessingRef = useRef<boolean>(false);
+  // jobs 的同步鏡像：持久化要在 setJobs updater 外面算出新 job，所以所有 jobs 變更都走 commitJobs，
+  // 讓 ref 與 state 同步，之後才能拿最新的 job 出來 await 寫入。
+  const jobsRef = useRef<Job[]>([]);
+
+  const commitJobs = useCallback((updater: (prev: Job[]) => Job[]) => {
+    const next = updater(jobsRef.current);
+    jobsRef.current = next;
+    setJobs(next);
+  }, []);
 
   // 初始化與清理孤立檔案
   useEffect(() => {
@@ -101,37 +111,29 @@ const App: React.FC = () => {
       }
 
       const sorted = loadedJobs.sort((a, b) => b.createdAt - a.createdAt);
-      setJobs(sorted);
+      commitJobs(() => sorted);
       if (sorted.length > 0 && !activeJobId) setActiveJobId(sorted[0].id);
     };
     initialize();
   }, []);
 
   const updateJobInStateAndDB = useCallback(async (jobId: string, updates: Partial<Job>) => {
-    const now = Date.now();
-    setJobs(prev => prev.map(j => {
-      if (j.id === jobId) {
-        const updated = { ...j, ...updates, updatedAt: now };
-        saveJobToDB(updated);
-        return updated;
-      }
-      return j;
-    }));
-  }, []);
+    const current = jobsRef.current.find(j => j.id === jobId);
+    if (!current) return;
+    const updated: Job = { ...current, ...updates, updatedAt: Date.now() };
+    commitJobs(prev => prev.map(j => (j.id === jobId ? updated : j)));
+    await saveJobToDB(updated);
+  }, [commitJobs]);
 
-  const updateJobStep = useCallback((jobId: string, stepIdx: number, status: StepStatus, customData?: any) => {
-    const now = Date.now();
-    setJobs(prev => prev.map(job => {
-      if (job.id === jobId) {
-        const newSteps = [...job.steps];
-        newSteps[stepIdx] = { ...newSteps[stepIdx], status, ...customData };
-        const updatedJob = { ...job, steps: newSteps, ...customData, updatedAt: now };
-        saveJobToDB(updatedJob);
-        return updatedJob;
-      }
-      return job;
-    }));
-  }, []);
+  const updateJobStep = useCallback(async (jobId: string, stepIdx: number, status: StepStatus, customData?: any) => {
+    const current = jobsRef.current.find(j => j.id === jobId);
+    if (!current) return;
+    const newSteps = [...current.steps];
+    newSteps[stepIdx] = { ...newSteps[stepIdx], status, ...customData };
+    const updated: Job = { ...current, steps: newSteps, ...customData, updatedAt: Date.now() };
+    commitJobs(prev => prev.map(j => (j.id === jobId ? updated : j)));
+    await saveJobToDB(updated);
+  }, [commitJobs]);
 
   const addJob = async (file: File) => {
     const now = Date.now();
@@ -153,7 +155,7 @@ const App: React.FC = () => {
     };
     await saveFileBlob(jobId, file);
     await saveJobToDB(newJob);
-    setJobs(prev => [newJob, ...prev]);
+    commitJobs(prev => [newJob, ...prev]);
     setActiveJobId(jobId);
     if (!isSidebarOpen) setIsSidebarOpen(true); // 自動展開側邊欄以便查看新任務
   };
@@ -168,7 +170,7 @@ const App: React.FC = () => {
       if (!blob) throw new Error("音檔資源遺失或已被清理");
       const file = new File([blob], job.fileName);
 
-      updateJobStep(id, 0, StepStatus.PROCESSING, { status: JobStatus.RUNNING, currentStep: 0 });
+      await updateJobStep(id, 0, StepStatus.PROCESSING, { status: JobStatus.RUNNING, currentStep: 0 });
       
       let duration = 0;
       try {
@@ -182,7 +184,7 @@ const App: React.FC = () => {
       
       const sliceGenerator = generateAudioSlices(file, sliceDurationMin, 15); // 增加 overlap 至 15秒
       
-      updateJobStep(id, 0, StepStatus.SUCCESS, { 
+      await updateJobStep(id, 0, StepStatus.SUCCESS, { 
         totalSlices: expectedSlices,
         currentStep: 1
       });
@@ -195,7 +197,7 @@ const App: React.FC = () => {
 
         if (slice.index < (job.processedSlices || 0)) continue;
 
-        updateJobStep(id, 1, StepStatus.PROCESSING, {
+        await updateJobStep(id, 1, StepStatus.PROCESSING, {
           steps: [
             { name: `音訊預處理完成`, status: StepStatus.SUCCESS },
             { name: `正在轉錄片段 ${slice.index + 1}/${Math.max(slice.index + 1, expectedSlices)}...`, status: StepStatus.PROCESSING },
@@ -213,14 +215,8 @@ const App: React.FC = () => {
 
         const sliceTranscript = await transcribeSlice(slice.data, slice.startTime, contextText, slice.mimeType || 'audio/wav');
         
-        // 智慧接合：
-        // Overlap 區域的處理。如果是第一個片段，直接使用。
-        // 如果是後續片段，只取 start >= slice.startTime 的部分，避免重複。
-        const filtered = slice.index === 0 
-          ? sliceTranscript 
-          : sliceTranscript.filter(s => s.start >= slice.startTime);
-
-        fullTranscript = [...fullTranscript, ...filtered];
+        // 智慧接合：以既有逐字稿已涵蓋到的時間為準去掉 overlap 重複（規則見 transcriptMerge.ts）
+        fullTranscript = mergeSliceTranscript(fullTranscript, sliceTranscript, slice.startTime, slice.index === 0);
 
         await updateJobInStateAndDB(id, { 
           transcript: fullTranscript,
@@ -228,7 +224,7 @@ const App: React.FC = () => {
         });
       }
 
-      updateJobStep(id, 1, StepStatus.SUCCESS, { 
+      await updateJobStep(id, 1, StepStatus.SUCCESS, { 
         currentStep: 2,
         steps: [
           { name: `音訊預處理完成`, status: StepStatus.SUCCESS },
@@ -242,7 +238,7 @@ const App: React.FC = () => {
         job.meetingTags || [], 
         job.meetingContext || ""
       );
-      updateJobStep(id, 2, StepStatus.SUCCESS, { 
+      await updateJobStep(id, 2, StepStatus.SUCCESS, { 
         analysis, 
         status: JobStatus.COMPLETED,
         steps: [
@@ -256,7 +252,7 @@ const App: React.FC = () => {
 
     } catch (err: any) {
       console.error("Job Failed:", err);
-      updateJobInStateAndDB(id, { 
+      await updateJobInStateAndDB(id, { 
         status: JobStatus.FAILED, 
         error: translateError(err.message)
       });
@@ -291,7 +287,7 @@ const App: React.FC = () => {
       onConfirm: async () => {
         await deleteJobFromDB(id);
         await deleteFileBlob(id);
-        setJobs(prev => prev.filter(j => j.id !== id));
+        commitJobs(prev => prev.filter(j => j.id !== id));
         if (activeJobId === id) setActiveJobId(null);
         setConfirmConfig(prev => ({ ...prev, isOpen: false }));
       }
@@ -325,7 +321,7 @@ const App: React.FC = () => {
           await deleteJobFromDB(id);
           await deleteFileBlob(id);
         }
-        setJobs(prev => prev.filter(j => !finishedIds.includes(j.id)));
+        commitJobs(prev => prev.filter(j => !finishedIds.includes(j.id)));
         if (activeJobId && finishedIds.includes(activeJobId)) setActiveJobId(null);
         setConfirmConfig(prev => ({ ...prev, isOpen: false }));
       }
