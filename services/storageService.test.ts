@@ -23,6 +23,7 @@ type FakeDB = {
 type FakeRequest = {
   onupgradeneeded: (() => void) | null;
   onsuccess: (() => void) | null;
+  onblocked: (() => void) | null;
   onerror: (() => void) | null;
   result: FakeDB | null;
   error: Error | null;
@@ -38,6 +39,12 @@ type FakeIDB = {
   failNextOpen: boolean;
   // 測試把它設 true，下一次 open 直接同步拋錯（IndexedDB 被停用時的 SecurityError）
   throwNextOpen: boolean;
+  // 測試把它設 true，下一次 open 先 onblocked，之後才補一個遲到的 onsuccess
+  // （其他分頁關掉後真的開成功了），用來驗證那條沒人要的連線有被關掉
+  blockNextOpen: boolean;
+  // 每呼叫一次 db.transaction() 就 shift 一個：非 null 就丟出去，
+  // 用來模擬連線被 versionchange 關掉後開交易會拿到的 InvalidStateError
+  txErrors: (Error | null)[];
   open: (name: string, version: number) => FakeRequest;
 };
 
@@ -50,6 +57,8 @@ const makeFakeIDB = (): FakeIDB => {
     opens: 0,
     failNextOpen: false,
     throwNextOpen: false,
+    blockNextOpen: false,
+    txErrors: [],
     open: () => {
       fake.opens += 1;
       if (fake.throwNextOpen) {
@@ -63,6 +72,8 @@ const makeFakeIDB = (): FakeIDB => {
         close: () => { db.closed = true; },
         objectStoreNames: { contains: () => true },
         transaction: (): FakeTx => {
+          const txError = fake.txErrors.shift();
+          if (txError) throw txError;
           const tx: FakeTx = {
             oncomplete: null,
             onerror: null,
@@ -76,14 +87,25 @@ const makeFakeIDB = (): FakeIDB => {
           return tx;
         }
       };
-      const request: FakeRequest = { onupgradeneeded: null, onsuccess: null, onerror: null, result: db, error: null };
+      const request: FakeRequest = { onupgradeneeded: null, onsuccess: null, onblocked: null, onerror: null, result: db, error: null };
       const shouldFail = fake.failNextOpen;
       fake.failNextOpen = false;
+      const shouldBlock = fake.blockNextOpen;
+      fake.blockNextOpen = false;
       queueMicrotask(() => {
         if (shouldFail) {
           request.result = null;
           request.error = new Error('OpenFailed');
           if (request.onerror) request.onerror();
+          return;
+        }
+        if (shouldBlock) {
+          if (request.onblocked) request.onblocked();
+          // 其他分頁關掉後這個 request 還是會成功，用下一個 microtask 模擬那個遲到的 onsuccess
+          queueMicrotask(() => {
+            fake.dbs.push(db);
+            if (request.onsuccess) request.onsuccess();
+          });
           return;
         }
         fake.dbs.push(db);
@@ -264,6 +286,91 @@ describe('storageService jobs 寫入佇列', () => {
     expect(fake.puts).toEqual([job2]);
 
     fake.txs[0].oncomplete!();
+    await expect(p2).resolves.toBeUndefined();
+  });
+  it('open 被其他分頁擋住時呼叫者拿到 reject，下一次呼叫會重新 open', async () => {
+    fake.blockNextOpen = true;
+    const p1 = storage.saveJobToDB(makeJob('job_1'));
+    await expect(p1).rejects.toThrow('其他分頁');
+    expect(fake.opens).toBe(1);
+    expect(fake.puts).toEqual([]);
+
+    const job2 = makeJob('job_2');
+    const p2 = storage.saveJobToDB(job2);
+    await tick();
+    expect(fake.opens).toBe(2);
+    expect(fake.puts).toEqual([job2]);
+
+    fake.txs[0].oncomplete!();
+    await expect(p2).resolves.toBeUndefined();
+  });
+
+  it('blocked 之後才來的 onsuccess 不留下沒人關的連線', async () => {
+    fake.blockNextOpen = true;
+    const p1 = storage.saveJobToDB(makeJob('job_1'));
+    await expect(p1).rejects.toThrow('其他分頁');
+
+    // 遲到的 onsuccess 在下一個 microtask 才跑
+    await tick();
+    expect(fake.dbs).toHaveLength(1);
+    expect(fake.dbs[0].closed).toBe(true);
+  });
+
+  it('交易開到一半連線被關掉（InvalidStateError）時重開連線再試一次，寫入照樣完成', async () => {
+    fake.txErrors = [new DOMException('closed', 'InvalidStateError')];
+    const job1 = makeJob('job_1');
+    const p1 = storage.saveJobToDB(job1);
+
+    await tick();
+    // 第一次 db.transaction() 就丟錯，重開一條連線後才真的開出交易
+    expect(fake.opens).toBe(2);
+    expect(fake.txs).toHaveLength(1);
+    expect(fake.puts).toEqual([job1]);
+
+    fake.txs[0].oncomplete!();
+    await expect(p1).resolves.toBeUndefined();
+  });
+
+  it('重開後仍然 InvalidStateError 就往上拋，不會無限重試', async () => {
+    fake.txErrors = [
+      new DOMException('closed', 'InvalidStateError'),
+      new DOMException('closed', 'InvalidStateError')
+    ];
+    const p1 = storage.saveJobToDB(makeJob('job_1'));
+
+    await expect(p1).rejects.toThrow('closed');
+    expect(fake.opens).toBe(2);
+    expect(fake.txs).toEqual([]);
+    expect(fake.puts).toEqual([]);
+  });
+
+  it('非 InvalidStateError 的錯誤直接上拋，不重開連線', async () => {
+    fake.txErrors = [new DOMException('quota', 'QuotaExceededError')];
+    const p1 = storage.saveJobToDB(makeJob('job_1'));
+
+    await expect(p1).rejects.toThrow('quota');
+    expect(fake.opens).toBe(1);
+    expect(fake.puts).toEqual([]);
+  });
+
+  it('重試發生在佇列的那一格裡，不會插隊也不會卡住後面', async () => {
+    fake.txErrors = [new DOMException('closed', 'InvalidStateError')];
+    const job1 = makeJob('job_1');
+    const job2 = makeJob('job_2');
+    const p1 = storage.saveJobToDB(job1);
+    const p2 = storage.saveJobToDB(job2);
+
+    await tick();
+    // 第一筆在重試，第二筆還沒開始
+    expect(fake.puts).toEqual([job1]);
+    expect(fake.txs).toHaveLength(1);
+
+    fake.txs[0].oncomplete!();
+    await tick();
+    expect(fake.puts).toEqual([job1, job2]);
+
+    fake.txs[1].oncomplete!();
+    await expect(p1).resolves.toBeUndefined();
     await expect(p2).resolves.toBeUndefined();
   });
 });
