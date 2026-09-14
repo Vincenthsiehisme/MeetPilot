@@ -9,7 +9,7 @@ import {
   resolveListenConfig,
 } from './services/httpGuards';
 import { normalizeTranscribedSegments } from './services/transcribeSegments';
-import { TranscriptSegment, GeminiOutput, ChatMessage } from './types';
+import { TranscriptSegment } from './types';
 
 // 監聽設定在啟動時就解析：HOST 不是本機位址又沒設 Basic Auth 會在這裡直接拋錯，不進 listen
 const listenConfig = resolveListenConfig(process.env);
