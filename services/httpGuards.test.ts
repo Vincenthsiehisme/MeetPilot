@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { resolveListenConfig, checkBasicAuth, createRateLimiter, isLoopbackHost } from './httpGuards';
+import {
+  resolveListenConfig,
+  checkBasicAuth,
+  createRateLimiter,
+  isLoopbackHost,
+  describeBodyParserError,
+} from './httpGuards';
 
 const basicHeader = (user: string, password: string) =>
   `Basic ${Buffer.from(`${user}:${password}`, 'utf8').toString('base64')}`;
@@ -72,6 +78,25 @@ describe('resolveListenConfig', () => {
       'PORT="abc" 不是合法的連接埠（1-65535），請修正 .env'
     );
     expect(() => resolveListenConfig({ PORT: '70000' })).toThrowError('不是合法的連接埠');
+  });
+
+  it('MEETPILOT_API_RATE_LIMIT 只收十進位整數字串，Number() 吃得下的變形一律拋錯', () => {
+    for (const raw of ['6e1', '0x3c', '60.0', '+60']) {
+      expect(() => resolveListenConfig({ MEETPILOT_API_RATE_LIMIT: raw })).toThrowError(
+        `MEETPILOT_API_RATE_LIMIT="${raw}" 必須是正整數（每 IP 每分鐘的請求數），請修正 .env`
+      );
+    }
+    expect(resolveListenConfig({ MEETPILOT_API_RATE_LIMIT: '60' }).apiRateLimitPerMinute).toBe(60);
+  });
+
+  it('PORT 只收十進位整數字串，"3e3" 這種寫法拋錯', () => {
+    expect(() => resolveListenConfig({ PORT: '3e3' })).toThrowError(
+      'PORT="3e3" 不是合法的連接埠（1-65535），請修正 .env'
+    );
+    expect(() => resolveListenConfig({ PORT: '0x3c' })).toThrowError('不是合法的連接埠');
+    expect(() => resolveListenConfig({ PORT: '3000.0' })).toThrowError('不是合法的連接埠');
+    expect(() => resolveListenConfig({ PORT: '+3000' })).toThrowError('不是合法的連接埠');
+    expect(resolveListenConfig({ PORT: '3000' }).port).toBe(3000);
   });
 });
 
@@ -158,5 +183,28 @@ describe('createRateLimiter', () => {
     expect(() => createRateLimiter({ limit: 20, windowMs: 0 })).toThrowError(
       'rate limit 的 windowMs 必須大於 0，收到 0'
     );
+  });
+});
+
+describe('describeBodyParserError', () => {
+  it('JSON 解析失敗回 400 與可讀訊息', () => {
+    expect(describeBodyParserError({ type: 'entity.parse.failed' })).toEqual({
+      status: 400,
+      error: '請求的 JSON 格式錯誤',
+    });
+  });
+
+  it('body 超過上限回 413', () => {
+    expect(describeBodyParserError({ type: 'entity.too.large' })).toEqual({
+      status: 413,
+      error: '請求內容超過 50MB 上限',
+    });
+  });
+
+  it('不是 body parser 的錯回 null，交給下一個 handler', () => {
+    expect(describeBodyParserError(new Error('boom'))).toBeNull();
+    expect(describeBodyParserError({ type: 'something.else' })).toBeNull();
+    expect(describeBodyParserError(undefined)).toBeNull();
+    expect(describeBodyParserError(null)).toBeNull();
   });
 });
