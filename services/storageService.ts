@@ -87,7 +87,15 @@ const withConnection = async <T>(run: (db: IDBDatabase) => Promise<T>): Promise<
   } catch (err) {
     if (!isClosedConnectionError(err)) throw err;
     dropCache(opening);
-    return run(await openDB());
+    // 重開一條再跑一次。第二次若還是連線作廢，那條也不能留在快取裡，
+    // 否則下一個呼叫者要再走完一輪「失敗→清快取→重開」才會自癒。
+    const retryOpening = openDB();
+    try {
+      return await run(await retryOpening);
+    } catch (retryErr) {
+      if (isClosedConnectionError(retryErr)) dropCache(retryOpening);
+      throw retryErr;
+    }
   }
 };
 

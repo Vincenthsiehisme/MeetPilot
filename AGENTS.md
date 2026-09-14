@@ -23,8 +23,8 @@ npm run build           # 前端與 server bundle
 
 ## CodeGraph
 
-索引在 `.codegraph/`（2026-09-14 建，`codegraph init`，34 檔 / 334 nodes / 981 edges）。
-本機產物，不進版控。auto-sync 預設開啟，正常不用手動 `sync`。
+索引在 `.codegraph/`（2026-09-14 建，`codegraph init`）。本機產物，不進版控。
+**auto-sync 不可靠，查之前先 `codegraph sync`**（理由見下面的盲區一）。
 
 定位或理解程式碼**先查拓樸再 grep**：
 
@@ -36,9 +36,33 @@ npm run build           # 前端與 server bundle
 
 **為什麼這個 repo 需要它**：2026-09-14 的修復只靠整檔讀加 grep，漏掉
 `askDocumentStream` 繞過 `withRetry` 與 `postJson`（它自己 `fetch`），導致「撞 429 讀
-`Retry-After`」那條修復沒涵蓋串流問答路徑。事後 `codegraph callees askDocument` 對
-`codegraph callees askDocumentStream` 一比就看得出來：前者列出 `withRetry`、`postJson`，
-後者是 `No callees found`。
+`Retry-After`」那條修復沒涵蓋串流問答路徑。`impact` 與 `callers` 在這種「誰沒走到共用
+路徑」的問題上比 grep 可靠得多。
+
+**但不要用 `callees` 的空來證明「它沒呼叫任何東西」**，理由見下面的盲區。
+
+## CodeGraph 的兩個盲區（實測，別踩）
+
+**一、索引不會自己跟上 worker 在 worktree 做的改動。** 2026-09-14 三個 worktree 的改動
+merge 回主 clone 之後，索引仍停在 34 檔／334 nodes，`postStream`、`withConnection` 這些
+新符號一律 `Symbol not found`，而且**不會報錯**，只會安靜地用舊圖回答。查之前先跑一次：
+
+```bash
+codegraph sync      # 沒東西要同步時很快，有東西時會印 Synced N changed files
+```
+
+**二、匿名 generator function expression 的 body 解析不到。** 寫法決定看不看得見：
+
+| 寫法 | `callees` |
+|---|---|
+| `export async function* generateAudioSlices()`（具名宣告） | 查得到 |
+| `export const askDocument = async () => {}`（arrow） | 查得到 |
+| `export const askDocumentStream = async function* ()`（匿名 generator 指派給 const） | **永遠是空的** |
+
+`askDocumentStream` 現在確實呼叫 `withRetry` 與 `postStream`，`codegraph callees
+askDocumentStream` 照樣回 `No callees found`。所以 `callees` 回空有兩種意思，跟
+`affected` 的兩種空是同一種病：**真的沒呼叫**，或**這個寫法看不見**。要證明「某個函式
+沒走共用路徑」，用 `callers` 從共用函式那頭反查，或直接讀碼。
 
 ## `codegraph affected` 的 filter 與盲區
 

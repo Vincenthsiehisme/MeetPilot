@@ -128,8 +128,16 @@ const App: React.FC = () => {
       commitJobs(() => sorted);
       if (sorted.length > 0 && !activeJobId) setActiveJobId(sorted[0].id);
     };
-    initialize();
-  }, []);
+    // initialize 失敗要有人接：讀不到舊任務時（IndexedDB 被其他分頁擋住、被瀏覽器停用、
+    // 私密視窗）原本只會變成 unhandled rejection，畫面停在空清單，使用者以為紀錄不見了。
+    initialize().catch((err: any) => {
+      console.error('讀取本機任務紀錄失敗', err);
+      showAlert(
+        '讀取本機紀錄失敗',
+        `無法讀取先前的任務紀錄（${err?.message ?? err}）。這次的畫面會是空的，但資料沒有被刪除；排除問題後重新整理即可。`
+      );
+    });
+  }, [showAlert]);
 
   const updateJobInStateAndDB = useCallback(async (jobId: string, updates: Partial<Job>) => {
     const current = jobsRef.current.find(j => j.id === jobId);

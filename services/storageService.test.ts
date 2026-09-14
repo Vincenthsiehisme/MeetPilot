@@ -344,6 +344,24 @@ describe('storageService jobs 寫入佇列', () => {
     expect(fake.puts).toEqual([]);
   });
 
+  it('重開後第二次也失敗時，那條作廢的連線不留在快取，下一次呼叫直接重開', async () => {
+    // 第二次失敗若把新連線留在快取，下一個呼叫者要再走完一輪「失敗→清快取→重開」才會自癒
+    fake.txErrors = [
+      new DOMException('closed', 'InvalidStateError'),
+      new DOMException('closed', 'InvalidStateError')
+    ];
+    await expect(storage.saveJobToDB(makeJob('job_1'))).rejects.toThrow('closed');
+    expect(fake.opens).toBe(2);
+
+    // 第二次呼叫：快取已空，第一次 transaction 就該成功，不必再賠一輪
+    const p2 = storage.saveJobToDB(makeJob('job_2'));
+    await tick();
+    expect(fake.opens).toBe(3);
+    expect(fake.txs).toHaveLength(1);
+    fake.txs[0].oncomplete!();
+    await expect(p2).resolves.toBeUndefined();
+  });
+
   it('非 InvalidStateError 的錯誤直接上拋，不重開連線', async () => {
     fake.txErrors = [new DOMException('quota', 'QuotaExceededError')];
     const p1 = storage.saveJobToDB(makeJob('job_1'));
