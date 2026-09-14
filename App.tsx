@@ -268,8 +268,8 @@ const App: React.FC = () => {
     } catch (err: any) {
       console.error("Job Failed:", err);
       try {
-        await updateJobInStateAndDB(id, { 
-          status: JobStatus.FAILED, 
+        await updateJobInStateAndDB(id, {
+          status: JobStatus.FAILED,
           error: translateError(err.message)
         });
       } catch (saveErr: any) {

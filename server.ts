@@ -27,7 +27,7 @@ app.use('/api', (req, res, next) => {
   const result = apiRateLimiter.check(clientIp);
   if (!result.allowed) {
     res.setHeader('Retry-After', String(result.retryAfterSeconds));
-    // 訊息要含字面 "429"：前端 geminiService.ts 的 withRetry 靠 msg.includes('429') 決定退避重試
+    // 前端 services/retryPolicy.ts 靠 HttpError.status === 429 加 Retry-After 決定退避；訊息帶 "429" 是給人看的，也讓 translateError 分類得到
     return res.status(429).json({ error: `請求太頻繁 (HTTP 429)，請 ${result.retryAfterSeconds} 秒後再試` });
   }
   next();

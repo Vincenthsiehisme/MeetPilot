@@ -57,12 +57,11 @@ async function postJson(endpoint: string, body: any): Promise<any> {
 }
 
 async function withRetry<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
-  let lastError: any;
-  for (let i = 0; i < maxRetries; i++) {
+  // 迴圈只會靠 return 或 throw 離開：最後一圈 delay 必為 null 一定 throw，所以迴圈後面不需要再丟一次
+  for (let i = 0; ; i++) {
     try {
       return await fn();
     } catch (err: any) {
-      lastError = err;
       // 最後一次不重試，直接把錯誤丟給呼叫者
       const delay = i < maxRetries - 1 ? retryDelayMs(err, i) : null;
       if (delay === null) throw err;
@@ -70,7 +69,6 @@ async function withRetry<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
       await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
-  throw lastError;
 }
 
 // sliceDurationSeconds：這片音訊的實際長度（秒，含 overlap，相對切片起點）。server 用它把 LLM 回的
