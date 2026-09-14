@@ -168,3 +168,15 @@ export const getAllFileIds = (): Promise<string[]> =>
     request.onsuccess = () => resolve(request.result as string[]);
     request.onerror = () => reject(request.error);
   }));
+
+/**
+ * 把 IndexedDB 裡的東西撈出來給 migration 用（SDD 1.5 第一段）。
+ *
+ * server 讀不到 IndexedDB，所以搬遷一定要由前端撈出來送上去。
+ * blobIds 一起回傳是為了讓 server 能明確報告「哪幾場會的音檔還留在這台瀏覽器」：
+ * 音檔這一期不搬，但不搬必須講出來，否則使用者清掉 IndexedDB 之後才會發現那幾場會重跑不了。
+ */
+export const exportAllForMigration = async (): Promise<{ jobs: Job[]; blobIds: string[] }> => {
+  const [jobs, blobIds] = await Promise.all([getAllJobsFromDB(), getAllFileIds()]);
+  return { jobs, blobIds };
+};
