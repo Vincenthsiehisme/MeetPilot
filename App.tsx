@@ -119,13 +119,17 @@ const App: React.FC = () => {
       // 不會因為打掃掛掉就整頁空白，還被告知「讀取失敗」
       const sorted = loadedJobs.sort((a, b) => b.createdAt - a.createdAt);
       commitJobs(() => sorted);
+      // activeJobId 在這裡是 mount 當下的值（effect 的 deps 只有 showAlert），
+      // 刻意吃舊值：這段只在初始化跑一次，要的就是「畫面上還沒有選中的任務才自動選第一個」
       if (sorted.length > 0 && !activeJobId) setActiveJobId(sorted[0].id);
 
-      // 2. 清理孤立檔案
+      // 2. 清理孤立檔案。每刪一個之前重讀 jobsRef，不用開頭那份快照：
+      // 打掃期間使用者可能上傳新檔，addJob 是先 saveFileBlob 才把 job 進 state，
+      // 拿舊快照會把剛上傳的檔案當成孤兒刪掉，那個任務接著就「音檔資源遺失」直接失敗。
+      // 殘留窗口只剩 saveFileBlob 完成到 commitJobs 之間那一瞬間。
       const fileIds = await getAllFileIds();
-      const jobIds = new Set(loadedJobs.map(j => j.id));
       for (const fId of fileIds) {
-        if (!jobIds.has(fId)) {
+        if (!jobsRef.current.some(j => j.id === fId)) {
           await deleteFileBlob(fId);
         }
       }

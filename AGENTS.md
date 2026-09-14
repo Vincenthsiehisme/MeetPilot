@@ -60,9 +60,12 @@ codegraph sync      # 沒東西要同步時很快，有東西時會印 Synced N 
 | `export const askDocumentStream = async function* ()`（匿名 generator） | **空的** |
 | `export async function* generateAudioSlices()`（具名 generator） | **只有預設參數與型別，body 的呼叫一個都沒有** |
 
-具名 generator 最危險：它會回東西（`generateAudioSlices` 回 `SLICE_OVERLAP_SECONDS` 與
-`TranscriptSegment`，都來自 signature），body 裡的 `getAudioDuration`、`extractAudio`、
-`resolveDuration` 全部缺席。**非空不代表 body 被解析過**，這份文件最初就是踩這個坑寫錯的。
+具名 generator 最危險：它會回東西，讓人以為 body 被解析過。`generateAudioSlices` 的兩筆是
+`SLICE_OVERLAP_SECONDS`（來自 `audioService.ts:150` 的預設參數）與 `TranscriptSegment`
+（**那個檔案裡一次都沒出現過**，`grep -c` 為 0、`git log -S` 查無歷史，是圖上憑空多出來的
+邊），而 body 裡的 `getAudioDuration`、`extractAudio`、`resolveDuration` 全部缺席。
+**非空不代表 body 被解析過，回傳的東西也不保證真的在那個檔案裡**；這份文件最初寫錯兩次，
+都是拿沒看內容的 `callees` 筆數當證據。
 
 所以 `callees` 對 generator 沒有意義，空和非空都不能當證據。要確認某個函式有沒有走共用
 路徑，只有讀碼算數。`callers` 從共用函式那頭反查可以縮小範圍，但**它只到檔案層級**：
