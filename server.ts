@@ -9,10 +9,14 @@ import {
   resolveListenConfig,
 } from './services/httpGuards';
 import { normalizeTranscribedSegments } from './services/transcribeSegments';
+import { createLlmLogger, resolveLlmLogPath, LlmCallKind } from './services/llmTelemetry';
 import { TranscriptSegment } from './types';
 
 // 監聽設定在啟動時就解析：HOST 不是本機位址又沒設 Basic Auth 會在這裡直接拋錯，不進 listen
 const listenConfig = resolveListenConfig(process.env);
+
+// Gemini 呼叫紀錄也在啟動時開檔：log 路徑不可寫要在這裡爆，不要等到第一次轉錄才發現沒留下任何紀錄
+const llmLogger = createLlmLogger(resolveLlmLogPath(process.env));
 
 const app = express();
 
@@ -161,7 +165,7 @@ function handleApiError(err: any, res: express.Response) {
 // Generate content with automatic retry and model fallback for high availability
 async function generateContentWithFallback(
   ai: GoogleGenAI,
-  request: { contents: any; config?: any; preferredModel?: string }
+  request: { kind: LlmCallKind; contents: any; config?: any; preferredModel?: string }
 ): Promise<any> {
   const models = request.preferredModel
     ? [request.preferredModel, 'gemini-3.8-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest'].filter(
@@ -171,13 +175,26 @@ async function generateContentWithFallback(
 
   let lastError: any;
 
-  for (const model of models) {
+  // 用索引跑，modelIndex 要進紀錄：>0 代表當時首選模型不能用，退到了 fallback 鏈後面
+  for (let modelIndex = 0; modelIndex < models.length; modelIndex++) {
+    const model = models[modelIndex];
     for (let attempt = 0; attempt < 2; attempt++) {
+      const startedAt = Date.now();
       try {
         const response = await ai.models.generateContent({
           model,
           contents: request.contents,
           config: request.config,
+        });
+        llmLogger.log({
+          kind: request.kind,
+          model,
+          modelIndex,
+          attempt: attempt + 1,
+          streamed: false,
+          latencyMs: Date.now() - startedAt,
+          outcome: 'ok',
+          response,
         });
         return response;
       } catch (err: any) {
@@ -190,6 +207,17 @@ async function generateContentWithFallback(
           msg.includes('429') ||
           msg.includes('resource_exhausted') ||
           msg.includes('overloaded');
+
+        llmLogger.log({
+          kind: request.kind,
+          model,
+          modelIndex,
+          attempt: attempt + 1,
+          streamed: false,
+          latencyMs: Date.now() - startedAt,
+          outcome: isTransient ? 'transient' : 'fatal',
+          error: err,
+        });
 
         console.warn(`[Gemini Request] Model ${model} (attempt ${attempt + 1}) failed:`, err?.message || err);
 
@@ -265,6 +293,7 @@ Output JSON format:
     };
 
     const response = await generateContentWithFallback(ai, {
+      kind: 'transcribe',
       preferredModel: 'gemini-3.8-flash',
       contents: { parts },
       config: promptConfig,
@@ -312,6 +341,7 @@ app.post('/api/gemini/polish', async (req, res) => {
     const fullText = formatTranscriptForAI(transcript);
 
     const response = await generateContentWithFallback(ai, {
+      kind: 'polish',
       preferredModel: 'gemini-3.8-flash',
       contents: `請將以下會議逐字稿進行「全文修潤」。
       
@@ -353,6 +383,7 @@ app.post('/api/gemini/analyze', async (req, res) => {
 `.trim();
 
     const response = await generateContentWithFallback(ai, {
+      kind: 'analyze',
       preferredModel: 'gemini-3.8-flash',
       contents: `請將這份會議記錄整理成結構化的「議題討論紀錄」。
 這是一份逐字稿，可能包含口語贅字。請在分析時自動進行潤飾與歸納。
@@ -438,8 +469,15 @@ app.post('/api/gemini/chat-stream', async (req, res) => {
     const models = ['gemini-3.8-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest'];
     let responseStream: any = null;
     let lastErr: any;
+    // 這條路徑不走 generateContentWithFallback，紀錄要自己埋，而且跨「建立」與「消費」兩段：
+    // 成功建立的那個 model 與起算時間要傳到下面
+    let streamModel = '';
+    let streamModelIndex = -1;
+    let streamStartedAt = 0;
 
-    for (const model of models) {
+    for (let modelIndex = 0; modelIndex < models.length; modelIndex++) {
+      const model = models[modelIndex];
+      const startedAt = Date.now();
       try {
         const chat = ai.chats.create({
           model,
@@ -447,11 +485,24 @@ app.post('/api/gemini/chat-stream', async (req, res) => {
           config: chatConfig,
         });
         responseStream = await chat.sendMessageStream({ message: question });
+        streamModel = model;
+        streamModelIndex = modelIndex;
+        streamStartedAt = startedAt;
         break;
       } catch (err: any) {
         lastErr = err;
         const msg = (err?.message || '').toLowerCase();
         const isTransient = msg.includes('503') || msg.includes('unavailable') || msg.includes('high demand') || msg.includes('429');
+        llmLogger.log({
+          kind: 'chat-stream',
+          model,
+          modelIndex,
+          attempt: 1,
+          streamed: true,
+          latencyMs: Date.now() - startedAt,
+          outcome: isTransient ? 'transient' : 'fatal',
+          error: err,
+        });
         if (!isTransient) throw err;
       }
     }
@@ -462,11 +513,48 @@ app.post('/api/gemini/chat-stream', async (req, res) => {
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
-    for await (const chunk of responseStream) {
-      if (chunk.text) {
-        res.write(`data: ${JSON.stringify({ text: chunk.text })}\n\n`);
+    let firstChunkAt: number | null = null;
+    // Gemini 在串流尾端才給完整的 usageMetadata，留住最後一個帶它的 chunk
+    let usageChunk: unknown = null;
+
+    // 消費串流的錯誤在這裡就記，不留給外層 catch：外層也接得到上面建立階段的錯，
+    // 在那裡記會把已經記過的那一筆再記第二次
+    try {
+      for await (const chunk of responseStream) {
+        if (firstChunkAt === null) firstChunkAt = Date.now();
+        if (chunk.usageMetadata) usageChunk = chunk;
+        if (chunk.text) {
+          res.write(`data: ${JSON.stringify({ text: chunk.text })}\n\n`);
+        }
       }
+    } catch (err) {
+      llmLogger.log({
+        kind: 'chat-stream',
+        model: streamModel,
+        modelIndex: streamModelIndex,
+        attempt: 1,
+        streamed: true,
+        latencyMs: Date.now() - streamStartedAt,
+        ttfbMs: firstChunkAt === null ? null : firstChunkAt - streamStartedAt,
+        // 斷在中途不算可重試：部分內容已經送出去了
+        outcome: 'fatal',
+        error: err,
+      });
+      throw err;
     }
+
+    llmLogger.log({
+      kind: 'chat-stream',
+      model: streamModel,
+      modelIndex: streamModelIndex,
+      attempt: 1,
+      streamed: true,
+      latencyMs: Date.now() - streamStartedAt,
+      ttfbMs: firstChunkAt === null ? null : firstChunkAt - streamStartedAt,
+      outcome: 'ok',
+      response: usageChunk,
+    });
+
     res.write(`data: [DONE]\n\n`);
     res.end();
   } catch (err: any) {
