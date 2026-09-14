@@ -23,6 +23,10 @@ dist-ssr
 *.sln
 *.sw?
 
+# 一期的 SQLite 資料庫（MEETPILOT_DB 預設 data/meetpilot.db）與它的 WAL 檔。
+# 使用者的會議資料，不進版控。
+data/
+
 # 本機環境變數（含 GEMINI_API_KEY 與 Basic Auth 密碼），只追蹤 .env.example
 .env
 

@@ -10,6 +10,9 @@ import {
 } from './services/httpGuards';
 import { normalizeTranscribedSegments } from './services/transcribeSegments';
 import { createLlmLogger, resolveLlmLogPath, LlmCallKind } from './services/llmTelemetry';
+import { openMeetingDb, resolveDbPath } from './services/meetingDb';
+import { createMeetingStore } from './services/meetingStore';
+import { MigrationRecord, isRejected, toMigrationRecord } from './services/jobMigration';
 import { TranscriptSegment } from './types';
 
 // 監聽設定在啟動時就解析：HOST 不是本機位址又沒設 Basic Auth 會在這裡直接拋錯，不進 listen
@@ -17,6 +20,11 @@ const listenConfig = resolveListenConfig(process.env);
 
 // Gemini 呼叫紀錄也在啟動時開檔：log 路徑不可寫要在這裡爆，不要等到第一次轉錄才發現沒留下任何紀錄
 const llmLogger = createLlmLogger(resolveLlmLogPath(process.env));
+
+// 一期的結構化儲存。同樣在啟動時開：資料庫開不起來（路徑不可寫、schema 版本比程式碼新）
+// 要在這裡爆，不要等到使用者送出第一場會才發現存不進去
+const meetingDb = openMeetingDb(resolveDbPath(process.env));
+const meetingStore = createMeetingStore(meetingDb);
 
 const app = express();
 
@@ -239,6 +247,89 @@ app.get('/api/health', (req, res) => {
     status: 'ok',
     hasKey: !!process.env.GEMINI_API_KEY,
   });
+});
+
+// Meeting 相關的錯誤自己接：handleApiError 是為 Gemini 的錯誤形狀寫的（會去解析 err.message 裡的 JSON），
+// 用在這裡會把 store 的錯誤印成 Gemini 錯誤，出事時找錯地方
+function handleStoreError(err: unknown, res: express.Response) {
+  const message = err instanceof Error ? err.message : String(err);
+  console.error('[MeetPilot Store Error]:', message);
+  res.status(500).json({ error: message });
+}
+
+// Migration：瀏覽器 IndexedDB 的 Job 搬進 server 端 SQLite（SDD 1.5 第一段）。
+// server 讀不到 IndexedDB，所以資料一定是前端撈出來送上來的。
+app.post('/api/meetings/import', (req, res) => {
+  try {
+    const { jobs, blobIds = [] } = req.body ?? {};
+    if (!Array.isArray(jobs)) {
+      return res.status(400).json({ error: 'jobs 必須是陣列' });
+    }
+    // blobIds 壞掉不能當成空陣列：那會回報「沒有音檔留在瀏覽器」，是最危險的一種假回報
+    if (!Array.isArray(blobIds) || !blobIds.every((id: unknown) => typeof id === 'string')) {
+      return res.status(400).json({ error: 'blobIds 必須是字串陣列' });
+    }
+
+    const records: MigrationRecord[] = [];
+    const rejected: { jobId: string | null; reason: string }[] = [];
+    const notes: { jobId: string; note: string }[] = [];
+
+    for (const raw of jobs) {
+      const outcome = toMigrationRecord(raw);
+      if (isRejected(outcome)) {
+        rejected.push({ jobId: outcome.jobId, reason: outcome.reason });
+        continue;
+      }
+      records.push(outcome.record);
+      for (const note of outcome.notes) notes.push({ jobId: outcome.record.meeting.meeting_id, note });
+    }
+
+    const report = meetingStore.importMigrated(records);
+
+    // 音檔這一期不搬：它只在「轉錄或分析失敗」的 Meeting 上還留著，而重跑需要的是 server 端的新流程。
+    // 但不能安靜地不搬，否則使用者清掉 IndexedDB 之後才發現那幾場會再也重跑不了。
+    //
+    // 全部列出來、逐筆標出它屬於哪一群，不做交集過濾：被拒收的那幾筆正是之後要重跑的，
+    // 把它們濾掉等於在最需要提醒的地方不提醒
+    const importedSet = new Set(report.imported);
+    const skippedSet = new Set(report.skippedExisting);
+    const rejectedSet = new Set(rejected.map(r => r.jobId).filter((id): id is string => id !== null));
+    const audioStillInBrowser = blobIds.map((meetingId: string) => ({
+      meetingId,
+      // orphan：這個音檔在 IndexedDB 裡，但沒有對應的 job 被送上來
+      group: importedSet.has(meetingId) ? 'imported'
+        : skippedSet.has(meetingId) ? 'skippedExisting'
+        : rejectedSet.has(meetingId) ? 'rejected'
+        : 'orphan',
+    }));
+
+    res.json({ ...report, rejected, notes, audioStillInBrowser });
+  } catch (err) {
+    handleStoreError(err, res);
+  }
+});
+
+app.get('/api/meetings', (req, res) => {
+  try {
+    res.json({ meetings: meetingStore.listMeetings() });
+  } catch (err) {
+    handleStoreError(err, res);
+  }
+});
+
+app.get('/api/meetings/:id', (req, res) => {
+  try {
+    const meeting = meetingStore.getMeeting(req.params.id);
+    if (!meeting) return res.status(404).json({ error: `找不到 Meeting ${req.params.id}` });
+    res.json({
+      meeting,
+      transcript: meetingStore.getTranscript(req.params.id),
+      analysis: meetingStore.getAnalysis(req.params.id),
+      tags: meetingStore.getTags(req.params.id),
+    });
+  } catch (err) {
+    handleStoreError(err, res);
+  }
 });
 
 // 1. Transcribe Audio Slice

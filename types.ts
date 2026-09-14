@@ -1,4 +1,4 @@
-
+import { MeetingStatus } from './services/meetingState';
 export enum JobStatus {
   PENDING = 'PENDING',
   RUNNING = 'RUNNING',
@@ -54,6 +54,28 @@ export interface Job {
     logs?: string[];
   }[];
   notified?: boolean; // 是否已發送通知
+}
+
+/**
+ * Meeting：一場實際會議在系統中的唯一代表（SDD 1.1）。
+ *
+ * 它取代以「一個音檔」為單位的 Job。Job 這個型別暫時留著，因為 migration 要讀舊資料，
+ * 而且瀏覽器 IndexedDB 裡的既有記錄仍是 Job 形狀。新的碼一律用 Meeting。
+ */
+export interface Meeting {
+  meeting_id: string;
+  title: string | null;
+  status: MeetingStatus;
+  created_at: number;
+  updated_at: number;
+  source_file_name: string | null;
+  source_file_size: number | null;
+  /** 這筆是原生建立的，還是從 IndexedDB 搬過來的。rehearsal 逐筆比對時要分得開 */
+  origin: 'native' | 'migrated';
+  error: string | null;
+  processed_slices: number | null;
+  total_slices: number | null;
+  meeting_context: string | null;
 }
 
 export interface ChatMessage {
