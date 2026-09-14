@@ -36,6 +36,8 @@ type FakeIDB = {
   opens: number;
   // 測試把它設 true，下一次 open 就以 onerror 收場
   failNextOpen: boolean;
+  // 測試把它設 true，下一次 open 直接同步拋錯（IndexedDB 被停用時的 SecurityError）
+  throwNextOpen: boolean;
   open: (name: string, version: number) => FakeRequest;
 };
 
@@ -47,8 +49,13 @@ const makeFakeIDB = (): FakeIDB => {
     dbs: [],
     opens: 0,
     failNextOpen: false,
+    throwNextOpen: false,
     open: () => {
       fake.opens += 1;
+      if (fake.throwNextOpen) {
+        fake.throwNextOpen = false;
+        throw new Error('SecurityError');
+      }
       const db: FakeDB = {
         closed: false,
         onversionchange: null,
@@ -223,6 +230,23 @@ describe('storageService jobs 寫入佇列', () => {
     expect(fake.opens).toBe(2);
 
     fake.txs[1].oncomplete!();
+    await expect(p2).resolves.toBeUndefined();
+  });
+
+  it('open 同步拋錯時呼叫者拿到 reject，下一次呼叫會重新 open', async () => {
+    fake.throwNextOpen = true;
+    const p1 = storage.saveJobToDB(makeJob('job_1'));
+    await expect(p1).rejects.toThrow('SecurityError');
+    expect(fake.opens).toBe(1);
+    expect(fake.puts).toEqual([]);
+
+    const job2 = makeJob('job_2');
+    const p2 = storage.saveJobToDB(job2);
+    await tick();
+    expect(fake.opens).toBe(2);
+    expect(fake.puts).toEqual([job2]);
+
+    fake.txs[0].oncomplete!();
     await expect(p2).resolves.toBeUndefined();
   });
 

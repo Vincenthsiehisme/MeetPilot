@@ -10,13 +10,15 @@ const STORE_FILES = "files";
 // 這裡快取整個 promise，連線還在開的時候進來的呼叫也共用同一條，不會開出第二條。
 let dbPromise: Promise<IDBDatabase> | null = null;
 
+// 只清掉自己這條：連線已經被換成新的時，不能把新的那條一起清掉
+const dropCache = (opening: Promise<IDBDatabase>) => {
+  if (dbPromise === opening) dbPromise = null;
+};
+
 const openDB = (): Promise<IDBDatabase> => {
   if (dbPromise) return dbPromise;
 
   const opening = new Promise<IDBDatabase>((resolve, reject) => {
-    // 只清掉自己這條：連線已經被換成新的時，不能把新的那條一起清掉
-    const dropCache = () => { if (dbPromise === opening) dbPromise = null; };
-
     const request = indexedDB.open(DB_NAME, DB_VERSION);
     request.onupgradeneeded = () => {
       const db = request.result;
@@ -29,20 +31,21 @@ const openDB = (): Promise<IDBDatabase> => {
       // 所以收到就主動關掉並清快取，下一次操作重開一條。
       db.onversionchange = () => {
         db.close();
-        dropCache();
+        dropCache(opening);
       };
       // 連線被瀏覽器強制關閉（例如儲存空間被清掉）時，快取裡那條已經不能用了
-      db.onclose = () => { dropCache(); };
+      db.onclose = () => { dropCache(opening); };
       resolve(db);
     };
-    request.onerror = () => {
-      // 失敗的 promise 留在快取會讓之後每次操作都拿到同一個錯誤，這裡清掉讓下一次重開
-      dropCache();
-      reject(request.error);
-    };
+    request.onerror = () => reject(request.error);
   });
 
   dbPromise = opening;
+  // 失敗就清快取統一在 promise 這層做，不放在 request.onerror：indexedDB.open() 本身也可能同步拋錯
+  // （IndexedDB 被停用時的 SecurityError、indexedDB 是 undefined 的 TypeError），那種情況 executor
+  // 直接 reject，根本走不到 onerror。失敗的 promise 留在快取會讓之後每次操作都拿到同一個錯誤，
+  // 重新整理前都不會再試。
+  opening.catch(() => dropCache(opening));
   return opening;
 };
 
