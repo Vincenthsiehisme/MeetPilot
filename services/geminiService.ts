@@ -77,11 +77,14 @@ async function withRetry<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
   throw lastError;
 }
 
+// sliceDurationSeconds：這片音訊的實際長度（秒，含 overlap，相對切片起點）。server 用它把 LLM 回的
+// start/end 夾回切片範圍；undefined 代表前端解不出長度（raw-file fallback），server 那邊就不 clamp。
 export const transcribeSlice = async (
   base64Data: string, 
   offsetSeconds: number,
   previousContext: string = "",
-  mimeType: string = "audio/wav"
+  mimeType: string = "audio/wav",
+  sliceDurationSeconds?: number
 ): Promise<TranscriptSegment[]> => {
   return withRetry(async () => {
     const data = await postJson('/api/gemini/transcribe', {
@@ -89,6 +92,7 @@ export const transcribeSlice = async (
       offsetSeconds,
       previousContext,
       mimeType,
+      sliceDurationSeconds,
     });
     return data.segments || [];
   });

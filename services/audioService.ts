@@ -12,6 +12,8 @@ export interface AudioSlice {
   startTime: number;
   index: number;
   mimeType?: string;
+  // 這片的實際長度（秒，含 overlap）。解碼切片路徑會填；raw-file fallback 解不出長度時不填
+  durationSeconds?: number;
 }
 
 export interface LiveRecordingOptions {
