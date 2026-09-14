@@ -25,3 +25,8 @@ dist-ssr
 
 # 本機環境變數（含 GEMINI_API_KEY 與 Basic Auth 密碼），只追蹤 .env.example
 .env
+
+# CodeGraph 的本機索引（2026-09-14 起用）。`codegraph init` 建的 SQLite 圖，
+# 每台機器自己建、內容跟著本機檔案狀態變，不是原始碼。
+# 圖是從碼重建出來的，刪掉跑一次 `codegraph init` 就回來，沒有任何東西會遺失。
+.codegraph/
