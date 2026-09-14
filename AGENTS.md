@@ -23,8 +23,8 @@ npm run build           # 前端與 server bundle
 
 ## CodeGraph
 
-索引在 `.codegraph/`（2026-09-14 建，`codegraph init`，34 檔 / 334 nodes / 981 edges）。
-本機產物，不進版控。auto-sync 預設開啟，正常不用手動 `sync`。
+索引在 `.codegraph/`（2026-09-14 建，`codegraph init`）。本機產物，不進版控。
+**auto-sync 不可靠，查之前先 `codegraph sync`**（理由見下面的盲區一）。
 
 定位或理解程式碼**先查拓樸再 grep**：
 
@@ -36,9 +36,40 @@ npm run build           # 前端與 server bundle
 
 **為什麼這個 repo 需要它**：2026-09-14 的修復只靠整檔讀加 grep，漏掉
 `askDocumentStream` 繞過 `withRetry` 與 `postJson`（它自己 `fetch`），導致「撞 429 讀
-`Retry-After`」那條修復沒涵蓋串流問答路徑。事後 `codegraph callees askDocument` 對
-`codegraph callees askDocumentStream` 一比就看得出來：前者列出 `withRetry`、`postJson`，
-後者是 `No callees found`。
+`Retry-After`」那條修復沒涵蓋串流問答路徑。`impact` 與 `callers` 在這種「誰沒走到共用
+路徑」的問題上比 grep 可靠得多。
+
+**但不要用 `callees` 的空來證明「它沒呼叫任何東西」**，理由見下面的盲區。
+
+## CodeGraph 的兩個盲區（實測，別踩）
+
+**一、索引不會自己跟上 worker 在 worktree 做的改動。** 2026-09-14 三個 worktree 的改動
+merge 回主 clone 之後，索引仍停在 34 檔／334 nodes，`postStream`、`withConnection` 這些
+新符號一律 `Symbol not found`，而且**不會報錯**，只會安靜地用舊圖回答。查之前先跑一次：
+
+```bash
+codegraph sync      # 沒東西要同步時很快，有東西時會印 Synced N changed files
+```
+
+**二、generator 函式的 body 呼叫看不見，具名或匿名都一樣。** 實測（2026-09-14）：
+
+| 寫法 | `callees` 回什麼 |
+|---|---|
+| `function withRetry()`、`async function postStream()`（一般宣告） | body 的呼叫查得到 |
+| `export const askDocument = async () => {}`（arrow） | body 的呼叫查得到 |
+| `export const askDocumentStream = async function* ()`（匿名 generator） | **空的** |
+| `export async function* generateAudioSlices()`（具名 generator） | **只有預設參數與型別，body 的呼叫一個都沒有** |
+
+具名 generator 最危險：它會回東西，讓人以為 body 被解析過。`generateAudioSlices` 的兩筆是
+`SLICE_OVERLAP_SECONDS`（來自 `audioService.ts:150` 的預設參數）與 `TranscriptSegment`
+（**那個檔案裡一次都沒出現過**，`grep -c` 為 0、`git log -S` 查無歷史，是圖上憑空多出來的
+邊），而 body 裡的 `getAudioDuration`、`extractAudio`、`resolveDuration` 全部缺席。
+**非空不代表 body 被解析過，回傳的東西也不保證真的在那個檔案裡**；這份文件最初寫錯兩次，
+都是拿沒看內容的 `callees` 筆數當證據。
+
+所以 `callees` 對 generator 沒有意義，空和非空都不能當證據。要確認某個函式有沒有走共用
+路徑，只有讀碼算數。`callers` 從共用函式那頭反查可以縮小範圍，但**它只到檔案層級**：
+`codegraph callers postStream` 回的是 `file geminiService.ts`，不會指名 `askDocumentStream`。
 
 ## `codegraph affected` 的 filter 與盲區
 

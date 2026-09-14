@@ -115,21 +115,38 @@ const App: React.FC = () => {
         }
       }
 
-      // 2. 清理孤立檔案
+      // 讀到的任務先進畫面，再打掃：孤兒檔清理失敗時使用者至少看得到自己的紀錄，
+      // 不會因為打掃掛掉就整頁空白，還被告知「讀取失敗」
+      const sorted = loadedJobs.sort((a, b) => b.createdAt - a.createdAt);
+      commitJobs(() => sorted);
+      // activeJobId 在這裡是 mount 當下的值（effect 的 deps 只有 showAlert），
+      // 刻意吃舊值：這段只在初始化跑一次，要的就是「畫面上還沒有選中的任務才自動選第一個」
+      if (sorted.length > 0 && !activeJobId) setActiveJobId(sorted[0].id);
+
+      // 2. 清理孤立檔案。每刪一個之前重讀 jobsRef，不用開頭那份快照：
+      // 打掃期間使用者可能上傳新檔，addJob 是先 saveFileBlob 才把 job 進 state，
+      // 拿舊快照會把剛上傳的檔案當成孤兒刪掉，那個任務接著就「音檔資源遺失」直接失敗。
+      // 殘留窗口只剩 saveFileBlob 完成到 commitJobs 之間那一瞬間。
       const fileIds = await getAllFileIds();
-      const jobIds = new Set(loadedJobs.map(j => j.id));
       for (const fId of fileIds) {
-        if (!jobIds.has(fId)) {
+        if (!jobsRef.current.some(j => j.id === fId)) {
           await deleteFileBlob(fId);
         }
       }
-
-      const sorted = loadedJobs.sort((a, b) => b.createdAt - a.createdAt);
-      commitJobs(() => sorted);
-      if (sorted.length > 0 && !activeJobId) setActiveJobId(sorted[0].id);
     };
-    initialize();
-  }, []);
+    // initialize 失敗要有人接：讀不到舊任務時（IndexedDB 被其他分頁擋住、被瀏覽器停用、
+    // 私密視窗）原本只會變成 unhandled rejection，畫面停在空清單，使用者以為紀錄不見了。
+    initialize().catch((err: any) => {
+      console.error('讀取本機任務紀錄失敗', err);
+      // err 不一定是 Error（IndexedDB 的事件物件、被 reject 的字串都可能），
+      // 直接內插會印出 [object Object]，而這句話是給使用者看的
+      const reason = err instanceof Error ? err.message : String(err);
+      showAlert(
+        '讀取本機紀錄失敗',
+        `無法讀取先前的任務紀錄（${reason}）。已讀到的紀錄仍會顯示；資料沒有被刪除，排除問題後重新整理即可。`
+      );
+    });
+  }, [showAlert]);
 
   const updateJobInStateAndDB = useCallback(async (jobId: string, updates: Partial<Job>) => {
     const current = jobsRef.current.find(j => j.id === jobId);
