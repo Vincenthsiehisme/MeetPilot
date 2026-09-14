@@ -17,6 +17,17 @@ describe('retryDelayMs', () => {
     expect(retryDelayMs(err, 0, noJitter)).toBe(60000);
   });
 
+  it('Retry-After 為 0 時夾到 1 秒下限', () => {
+    // 反向代理可能把 Retry-After 改寫成 0；照做等於只等 jitter 就再撞一次限流
+    const err = new HttpError(429, '請求太頻繁', 0);
+    expect(retryDelayMs(err, 0, noJitter)).toBe(1000);
+  });
+
+  it('Retry-After 剛好 1 秒時不被下限動到', () => {
+    const err = new HttpError(429, '請求太頻繁', 1);
+    expect(retryDelayMs(err, 0, noJitter)).toBe(1000);
+  });
+
   it('429 沒有 Retry-After 時退回既有的遞增退避', () => {
     const err = new HttpError(429, '請求太頻繁 (HTTP 429)');
     expect(retryDelayMs(err, 0, noJitter)).toBe(8000);
