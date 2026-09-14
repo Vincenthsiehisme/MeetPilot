@@ -6,17 +6,44 @@ const DB_VERSION = 1;
 const STORE_JOBS = "jobs";
 const STORE_FILES = "files";
 
+// 共用一條連線：原本每個操作各開一條且從不關，一個長時間跑的分頁會一路累積連線。
+// 這裡快取整個 promise，連線還在開的時候進來的呼叫也共用同一條，不會開出第二條。
+let dbPromise: Promise<IDBDatabase> | null = null;
+
 const openDB = (): Promise<IDBDatabase> => {
-  return new Promise((resolve, reject) => {
+  if (dbPromise) return dbPromise;
+
+  const opening = new Promise<IDBDatabase>((resolve, reject) => {
+    // 只清掉自己這條：連線已經被換成新的時，不能把新的那條一起清掉
+    const dropCache = () => { if (dbPromise === opening) dbPromise = null; };
+
     const request = indexedDB.open(DB_NAME, DB_VERSION);
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains(STORE_JOBS)) db.createObjectStore(STORE_JOBS, { keyPath: "id" });
       if (!db.objectStoreNames.contains(STORE_FILES)) db.createObjectStore(STORE_FILES);
     };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      const db = request.result;
+      // 其他分頁要升級 schema 時會發 versionchange，這條連線不關就會把對方擋在 blocked，
+      // 所以收到就主動關掉並清快取，下一次操作重開一條。
+      db.onversionchange = () => {
+        db.close();
+        dropCache();
+      };
+      // 連線被瀏覽器強制關閉（例如儲存空間被清掉）時，快取裡那條已經不能用了
+      db.onclose = () => { dropCache(); };
+      resolve(db);
+    };
+    request.onerror = () => {
+      // 失敗的 promise 留在快取會讓之後每次操作都拿到同一個錯誤，這裡清掉讓下一次重開
+      dropCache();
+      reject(request.error);
+    };
   });
+
+  dbPromise = opening;
+  return opening;
 };
 
 // jobs store 的序列化寫入佇列：同一時間只有一筆交易在飛，後來的照呼叫順序排隊。
