@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mergeSliceTranscript } from './transcriptMerge';
+import { mergeSliceTranscript, SLICE_OVERLAP_SECONDS } from './transcriptMerge';
 import { TranscriptSegment } from '../types';
 
 const seg = (start: number, end: number, text: string): TranscriptSegment => ({ start, end, text, speaker: 'A' });
@@ -91,6 +91,23 @@ describe('mergeSliceTranscript', () => {
     expect(mergeSliceTranscript(existing, incoming, 600, false, 0.5, 30)).toEqual([
       seg(600, 640, 'overshoot'), seg(630, 636, 'b')
     ]);
+  });
+
+  it('overlapSeconds 預設值就是 SLICE_OVERLAP_SECONDS（15），省略第 6 參數跟明傳 15 一樣', () => {
+    // 常數被改值或 default 沒接上常數時，這條會壞；App.tsx 與 generateAudioSlices 都靠這個值對齊
+    expect(SLICE_OVERLAP_SECONDS).toBe(15);
+
+    const existing = [seg(600, 640, 'overshoot')];
+    const incoming = [
+      seg(600, 612, 'in-overlap'),  // end 612 <= 600 + 15 + 0.5，丟
+      seg(612, 620, 'must-keep'),
+      seg(620, 630, 'next')
+    ];
+    const expected = [
+      seg(600, 640, 'overshoot'), seg(612, 620, 'must-keep'), seg(620, 630, 'next')
+    ];
+    expect(mergeSliceTranscript(existing, incoming, 600, false)).toEqual(expected);
+    expect(mergeSliceTranscript(existing, incoming, 600, false, 0.5, 15)).toEqual(expected);
   });
 
   it('不 mutate 輸入陣列', () => {
