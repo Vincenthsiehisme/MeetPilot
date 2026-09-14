@@ -1,4 +1,4 @@
-import { GeminiOutput, TranscriptSegment, ChatMessage, SubAgentType } from "../types";
+import { GeminiOutput, TranscriptSegment, ChatMessage } from "../types";
 import { HttpError } from "./httpError";
 import { retryDelayMs } from "./retryPolicy";
 
@@ -142,88 +142,6 @@ export const analyzeTranscript = async (
       meetingContext,
     });
     return data.analysis;
-  });
-};
-
-/**
- * 分段節錄摘要 (Segmented Summary)
- * 針對目前的對話片段進行簡短總結
- */
-export const getSegmentedSummary = async (
-  transcript: TranscriptSegment[], 
-  meetingTags: string[] = [], 
-  meetingContext: string = ""
-): Promise<string> => {
-  if (!transcript || transcript.length === 0) return "";
-
-  return withRetry(async () => {
-    const data = await postJson('/api/gemini/segmented-summary', {
-      transcript,
-      meetingTags,
-      meetingContext,
-    });
-    return data.summary || "";
-  });
-};
-
-/**
- * 即時策略建議 (Live Strategy)
- * 根據目前的對話內容，即時產出對應策略或行動建議
- */
-export const getLiveStrategy = async (
-  transcript: TranscriptSegment[], 
-  agentType: SubAgentType = SubAgentType.PROJECT_MANAGER,
-  meetingTags: string[] = [],
-  meetingContext: string = "",
-  previousStrategies: string[] = [],
-  consensus: string[] = []
-): Promise<string[]> => {
-  if (!transcript || transcript.length === 0) return [];
-
-  return withRetry(async () => {
-    const data = await postJson('/api/gemini/live-strategy', {
-      transcript,
-      agentType,
-      meetingTags,
-      meetingContext,
-      previousStrategies,
-      consensus,
-    });
-    return data.strategies || [];
-  });
-};
-
-/**
- * 提取共識 (Consensus Extraction)
- * 識別會議中已達成的共識，作為長期記憶
- */
-export const getConsensus = async (
-  transcript: TranscriptSegment[],
-  currentConsensus: string[] = []
-): Promise<string[]> => {
-  if (!transcript || transcript.length < 10) return currentConsensus;
-
-  return withRetry(async () => {
-    const data = await postJson('/api/gemini/consensus', {
-      transcript,
-      currentConsensus,
-    });
-    return data.consensus || currentConsensus;
-  });
-};
-
-export const askDocument = async (
-  transcript: TranscriptSegment[], 
-  history: ChatMessage[], 
-  question: string
-): Promise<string> => {
-  return withRetry(async () => {
-    const data = await postJson('/api/gemini/chat', {
-      transcript,
-      history,
-      question,
-    });
-    return data.answer || "無法生成回應";
   });
 };
 

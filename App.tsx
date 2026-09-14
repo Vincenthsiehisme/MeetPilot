@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { Job, JobStatus, StepStatus, TranscriptSegment, GeminiOutput, SubAgentType } from './types';
+import { Job, JobStatus, StepStatus, TranscriptSegment, GeminiOutput } from './types';
 import JobDashboard from './components/JobDashboard';
 import JobDetail from './components/JobDetail';
 import FileUpload from './components/FileUpload';

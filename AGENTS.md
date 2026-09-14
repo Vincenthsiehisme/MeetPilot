@@ -41,7 +41,7 @@ npm run build           # 前端與 server bundle
 
 **但不要用 `callees` 的空來證明「它沒呼叫任何東西」**，理由見下面的盲區。
 
-## CodeGraph 的兩個盲區（實測，別踩）
+## CodeGraph 的三個盲區（實測，別踩）
 
 **一、索引不會自己跟上 worker 在 worktree 做的改動。** 2026-09-14 三個 worktree 的改動
 merge 回主 clone 之後，索引仍停在 34 檔／334 nodes，`postStream`、`withConnection` 這些
@@ -56,7 +56,7 @@ codegraph sync      # 沒東西要同步時很快，有東西時會印 Synced N 
 | 寫法 | `callees` 回什麼 |
 |---|---|
 | `function withRetry()`、`async function postStream()`（一般宣告） | body 的呼叫查得到 |
-| `export const askDocument = async () => {}`（arrow） | body 的呼叫查得到 |
+| `export const polishTranscript = async () => {}`（arrow） | body 的呼叫查得到（`withRetry`、`postJson`） |
 | `export const askDocumentStream = async function* ()`（匿名 generator） | **空的** |
 | `export async function* generateAudioSlices()`（具名 generator） | **只有預設參數與型別，body 的呼叫一個都沒有** |
 
@@ -70,6 +70,13 @@ codegraph sync      # 沒東西要同步時很快，有東西時會印 Synced N 
 所以 `callees` 對 generator 沒有意義，空和非空都不能當證據。要確認某個函式有沒有走共用
 路徑，只有讀碼算數。`callers` 從共用函式那頭反查可以縮小範圍，但**它只到檔案層級**：
 `codegraph callers postStream` 回的是 `file geminiService.ts`，不會指名 `askDocumentStream`。
+
+**三、符號查詢是模糊比對，查一個不存在的名字可能拿到別人的答案。** 2026-09-14 刪掉
+`askDocument` 之後，`codegraph callers askDocument` 仍回 3 筆，內容其實是
+`askDocumentStream` 的呼叫者（名字是它的前綴）。對照組 `getAgentById` 整個檔被刪，回的是
+乾淨的 `Symbol not found`。**所以 `callers` 非空不保證那個符號還存在**，用它判斷死碼時，
+名字互為前綴的一組符號會互相污染。判死碼一律再跑一次
+`grep -rn --include=*.ts --include=*.tsx '<符號名>' .` 交叉驗證。
 
 ## `codegraph affected` 的 filter 與盲區
 
