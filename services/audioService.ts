@@ -1,6 +1,7 @@
 
 import { extractAudio } from './ffmpegService';
 import { resolveDuration } from './audioDuration';
+import { SLICE_OVERLAP_SECONDS } from './transcriptMerge';
 
 /**
  * 負責處理前端音訊切片與重取樣
@@ -12,6 +13,8 @@ export interface AudioSlice {
   startTime: number;
   index: number;
   mimeType?: string;
+  // 這片的實際長度（秒，含 overlap）。解碼切片路徑會填；raw-file fallback 解不出長度時不填
+  durationSeconds?: number;
 }
 
 export interface LiveRecordingOptions {
@@ -144,7 +147,7 @@ async function bufferToWavBase64(buffer: AudioBuffer): Promise<string> {
 export async function* generateAudioSlices(
   file: File, 
   sliceDurationMinutes: number = 10, 
-  overlapSeconds: number = 15
+  overlapSeconds: number = SLICE_OVERLAP_SECONDS
 ): AsyncGenerator<AudioSlice> {
   const MAX_INLINE_DATA_SIZE = 14 * 1024 * 1024; // 14MB Limit for Gemini inlineData to account for Base64 size expansion (33%)
   let totalDuration = 0;
@@ -210,6 +213,7 @@ export async function* generateAudioSlices(
         else mimeType = 'audio/mp3'; // safe fallback
       }
       
+      // 這條路徑是整檔直傳，長度正是解不出來才走到這裡，所以 durationSeconds 不填（合法的空）
       yield {
         data: base64,
         startTime: 0,
@@ -257,7 +261,9 @@ export async function* generateAudioSlices(
         data: base64,
         startTime: currentStart,
         index: index++,
-        mimeType: 'audio/wav'
+        mimeType: 'audio/wav',
+        // end 已被 totalDuration 夾過，最後一片會短於 sliceDuration + overlap，要回報實際長度
+        durationSeconds: end - currentStart
       };
 
       currentStart += sliceDuration;

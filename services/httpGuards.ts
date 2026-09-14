@@ -22,6 +22,13 @@ const DEFAULT_HOST = '127.0.0.1';
 const DEFAULT_PORT = 3000;
 // 200 分鐘錄音的正常流程約 20 片轉錄加一次摘要，可能同一分鐘內回來，20 會撞到；60 仍擋得住掃描與猜密碼
 const DEFAULT_API_RATE_LIMIT = 60;
+// 只接受十進位整數字串。Number() 連 "6e1"、"0x3c"、"60.0"、"+60" 都收，設定看起來生效、
+// 實際值卻不是寫的那個（"0x3c" 會變 60），這種誤差要在啟動時就爆出來。
+const DECIMAL_INTEGER = /^\d+$/;
+
+function parseDecimalInteger(raw: string): number {
+  return DECIMAL_INTEGER.test(raw) ? Number(raw) : NaN;
+}
 
 export function isLoopbackHost(host: string): boolean {
   return LOOPBACK_HOSTS.has(host);
@@ -38,13 +45,14 @@ export function resolveListenConfig(env: NodeJS.ProcessEnv): ListenConfig {
   const host = readEnv(env, 'HOST') ?? DEFAULT_HOST;
 
   const rawPort = readEnv(env, 'PORT');
-  const port = rawPort === undefined ? DEFAULT_PORT : Number(rawPort);
+  const port = rawPort === undefined ? DEFAULT_PORT : parseDecimalInteger(rawPort);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error(`PORT="${rawPort}" 不是合法的連接埠（1-65535），請修正 .env`);
   }
 
   const rawRateLimit = readEnv(env, 'MEETPILOT_API_RATE_LIMIT');
-  const apiRateLimitPerMinute = rawRateLimit === undefined ? DEFAULT_API_RATE_LIMIT : Number(rawRateLimit);
+  const apiRateLimitPerMinute =
+    rawRateLimit === undefined ? DEFAULT_API_RATE_LIMIT : parseDecimalInteger(rawRateLimit);
   if (!Number.isInteger(apiRateLimitPerMinute) || apiRateLimitPerMinute < 1) {
     throw new Error(`MEETPILOT_API_RATE_LIMIT="${rawRateLimit}" 必須是正整數（每 IP 每分鐘的請求數），請修正 .env`);
   }
@@ -159,4 +167,23 @@ export function createRateLimiter(options: RateLimiterOptions): RateLimiter {
       return { allowed: false, retryAfterSeconds: Math.max(1, Math.ceil(remainingMs / 1000)) };
     },
   };
+}
+
+export interface BodyParserErrorResponse {
+  status: number;
+  error: string;
+}
+
+// body parser（express.json / express.urlencoded）解析失敗時 Express 預設回 HTML 錯誤頁。
+// 前端 postJson 拿到 `<` 開頭的內容會當成連線異常，看不出是 JSON 壞掉還是超過上限，
+// 所以把這兩種錯誤翻成前端讀得懂的 JSON；不是 body parser 的錯就回 null 交給下一個 handler。
+export function describeBodyParserError(err: unknown): BodyParserErrorResponse | null {
+  const type = (err as { type?: unknown } | null | undefined)?.type;
+  if (type === 'entity.parse.failed') {
+    return { status: 400, error: '請求的 JSON 格式錯誤' };
+  }
+  if (type === 'entity.too.large') {
+    return { status: 413, error: '請求內容超過 50MB 上限' };
+  }
+  return null;
 }

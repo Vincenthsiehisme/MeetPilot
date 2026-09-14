@@ -1,4 +1,17 @@
 import { GeminiOutput, TranscriptSegment, ChatMessage, SubAgentType } from "../types";
+import { HttpError } from "./httpError";
+import { retryDelayMs } from "./retryPolicy";
+
+// Retry-After 只認非負整數秒數字串。server.ts 的 429 一律送 String(retryAfterSeconds)，
+// 不會出現 RFC 的 HTTP-date 格式，所以這裡不做日期解析；解不出來就當 server 沒給，
+// 退回 retryPolicy 既有的固定退避，不自己編一個時間出來。
+function parseRetryAfterSeconds(response: Response): number | undefined {
+  const raw = response.headers.get('Retry-After');
+  if (raw === null) return undefined;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return undefined;
+  return Number(trimmed);
+}
 
 async function postJson(endpoint: string, body: any): Promise<any> {
   const response = await fetch(endpoint, {
@@ -27,7 +40,8 @@ async function postJson(endpoint: string, body: any): Promise<any> {
         errorMsg = text.slice(0, 200);
       }
     }
-    throw new Error(errorMsg);
+    // message 內容維持原樣：App.tsx 的 translateError 只看 message 字串做分類
+    throw new HttpError(response.status, errorMsg, parseRetryAfterSeconds(response));
   }
 
   const trimmed = text.trim();
@@ -43,45 +57,28 @@ async function postJson(endpoint: string, body: any): Promise<any> {
 }
 
 async function withRetry<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
-  let lastError: any;
-  for (let i = 0; i < maxRetries; i++) {
+  // 迴圈只會靠 return 或 throw 離開：最後一圈 delay 必為 null 一定 throw，所以迴圈後面不需要再丟一次
+  for (let i = 0; ; i++) {
     try {
       return await fn();
     } catch (err: any) {
-      lastError = err;
-      const msg = (err.message || "").toLowerCase();
-      // 判斷重試邏輯：僅對短暫性伺服器過載、高需求 (503)、HTML代理錯誤或網路錯誤重試
-      const isRateLimit = msg.includes('429') && !msg.includes('prepayment') && !msg.includes('depleted');
-      const isServerError =
-        msg.includes('500') ||
-        msg.includes('502') ||
-        msg.includes('503') ||
-        msg.includes('overloaded') ||
-        msg.includes('high demand') ||
-        msg.includes('unavailable') ||
-        msg.includes('html') ||
-        msg.includes('網頁內容') ||
-        msg.includes('短暫無回應');
-      const isNetworkError = msg.includes('fetch') || msg.includes('networkerror') || msg.includes('failed to fetch');
-      
-      if ((isRateLimit || isServerError || isNetworkError) && i < maxRetries - 1) {
-        const baseDelay = isRateLimit ? 8000 * (i + 1) : 2500 * (i + 1); 
-        const delay = baseDelay + Math.random() * 1500;
-        console.warn(`[AI 重試] 發生短暫錯誤 (${err.message})，正在進行第 ${i + 1} 次重試...`);
-        await new Promise(resolve => setTimeout(resolve, delay));
-        continue;
-      }
-      throw err;
+      // 最後一次不重試，直接把錯誤丟給呼叫者
+      const delay = i < maxRetries - 1 ? retryDelayMs(err, i) : null;
+      if (delay === null) throw err;
+      console.warn(`[AI 重試] 發生短暫錯誤 (${err.message})，正在進行第 ${i + 1} 次重試...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
-  throw lastError;
 }
 
+// sliceDurationSeconds：這片音訊的實際長度（秒，含 overlap，相對切片起點）。server 用它把 LLM 回的
+// start/end 夾回切片範圍；undefined 代表前端解不出長度（raw-file fallback），server 那邊就不 clamp。
 export const transcribeSlice = async (
   base64Data: string, 
   offsetSeconds: number,
   previousContext: string = "",
-  mimeType: string = "audio/wav"
+  mimeType: string = "audio/wav",
+  sliceDurationSeconds?: number
 ): Promise<TranscriptSegment[]> => {
   return withRetry(async () => {
     const data = await postJson('/api/gemini/transcribe', {
@@ -89,6 +86,7 @@ export const transcribeSlice = async (
       offsetSeconds,
       previousContext,
       mimeType,
+      sliceDurationSeconds,
     });
     return data.segments || [];
   });

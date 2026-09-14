@@ -1,5 +1,9 @@
 import { TranscriptSegment } from '../types';
 
+// 切片 overlap 秒數的唯一來源：generateAudioSlices 切出來的重疊區、mergeSliceTranscript 去重的上限、
+// App.tsx 傳給兩者的值都從這裡拿，三處對不上就會掉字或重複
+export const SLICE_OVERLAP_SECONDS = 15;
+
 /**
  * 契約（T0 定，T2 實作）：把一個切片的轉錄結果接到既有逐字稿後面，去掉 overlap 重複。
  *
@@ -25,7 +29,7 @@ export function mergeSliceTranscript(
   sliceStartTime: number,
   isFirstSlice: boolean,
   tolerance: number = 0.5,
-  overlapSeconds: number = 15
+  overlapSeconds: number = SLICE_OVERLAP_SECONDS
 ): TranscriptSegment[] {
   if (isFirstSlice) {
     return [...existing, ...incoming];

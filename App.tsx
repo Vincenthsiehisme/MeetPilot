@@ -7,7 +7,7 @@ import FileUpload from './components/FileUpload';
 import ConfirmModal from './components/ConfirmModal';
 import { transcribeSlice, analyzeTranscript } from './services/geminiService';
 import { generateAudioSlices, getAudioDuration } from './services/audioService';
-import { mergeSliceTranscript } from './services/transcriptMerge';
+import { mergeSliceTranscript, SLICE_OVERLAP_SECONDS } from './services/transcriptMerge';
 import { 
   saveJobToDB, 
   getAllJobsFromDB, 
@@ -19,7 +19,6 @@ import {
 } from './services/storageService';
 
 const STALE_JOB_THRESHOLD = 5 * 60 * 1000;
-const SLICE_OVERLAP_SECONDS = 15; // generateAudioSlices 與 mergeSliceTranscript 必須用同一個值
 
 const translateError = (error: string) => {
   const e = (error || '').toLowerCase();
@@ -78,6 +77,20 @@ const App: React.FC = () => {
     const next = updater(jobsRef.current);
     jobsRef.current = next;
     setJobs(next);
+  }, []);
+
+  // 搬到 processJob 前面並包 useCallback：processJob 的 catch 要用它報「狀態寫不進去」，
+  // 而原本的定義在 processJob 之後，是 const（TDZ）又每次 render 換新 function，
+  // 放進 processJob 的 deps 會讓 processJob 每次 render 都重建、觸發單併發 effect 重跑
+  const showAlert = useCallback((title: string, message: string) => {
+    setConfirmConfig({
+      isOpen: true,
+      title,
+      message,
+      onConfirm: () => setConfirmConfig(prev => ({ ...prev, isOpen: false })),
+      hideCancel: true,
+      isDestructive: false
+    });
   }, []);
 
   // 初始化與清理孤立檔案
@@ -215,7 +228,7 @@ const App: React.FC = () => {
           contextText = contextSegments.map(s => `${s.speaker || 'Unknown'}: ${s.text}`).join('\n').slice(-1000);
         }
 
-        const sliceTranscript = await transcribeSlice(slice.data, slice.startTime, contextText, slice.mimeType || 'audio/wav');
+        const sliceTranscript = await transcribeSlice(slice.data, slice.startTime, contextText, slice.mimeType || 'audio/wav', slice.durationSeconds);
         
         // 智慧接合：以既有逐字稿已涵蓋到的時間為準去掉 overlap 重複（規則見 transcriptMerge.ts）
         fullTranscript = mergeSliceTranscript(fullTranscript, sliceTranscript, slice.startTime, slice.index === 0, 0.5, SLICE_OVERLAP_SECONDS);
@@ -254,14 +267,25 @@ const App: React.FC = () => {
 
     } catch (err: any) {
       console.error("Job Failed:", err);
-      await updateJobInStateAndDB(id, { 
-        status: JobStatus.FAILED, 
-        error: translateError(err.message)
-      });
+      try {
+        await updateJobInStateAndDB(id, {
+          status: JobStatus.FAILED,
+          error: translateError(err.message)
+        });
+      } catch (saveErr: any) {
+        // 標記 FAILED 的那次寫入自己也失敗（IndexedDB 滿了、被瀏覽器關掉、私密視窗）：
+        // 這個 await 原本沒人接，會變成 unhandled rejection，畫面上什麼都看不到，
+        // 而任務在 DB 裡還停在 RUNNING，重新整理後看起來像還在處理。不吞錯，兩個錯誤都留下再告訴使用者
+        console.error(`任務狀態寫入失敗 (jobId: ${id})`, { originalError: err, saveError: saveErr });
+        showAlert(
+          '任務狀態儲存失敗',
+          `「${job.fileName}」處理失敗（${err?.message ?? err}），但失敗狀態沒能寫進資料庫（${saveErr?.message ?? saveErr}）。重新整理後這個任務可能仍顯示處理中，請手動重試或刪除該任務。`
+        );
+      }
     } finally {
       isProcessingRef.current = false;
     }
-  }, [updateJobStep, updateJobInStateAndDB]);
+  }, [updateJobStep, updateJobInStateAndDB, showAlert]);
 
   // 單併發控制
   useEffect(() => {
@@ -293,17 +317,6 @@ const App: React.FC = () => {
         if (activeJobId === id) setActiveJobId(null);
         setConfirmConfig(prev => ({ ...prev, isOpen: false }));
       }
-    });
-  };
-
-  const showAlert = (title: string, message: string) => {
-    setConfirmConfig({
-      isOpen: true,
-      title,
-      message,
-      onConfirm: () => setConfirmConfig(prev => ({ ...prev, isOpen: false })),
-      hideCancel: true,
-      isDestructive: false
     });
   };
 
