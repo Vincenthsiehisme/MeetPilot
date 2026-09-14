@@ -6,13 +6,6 @@ export enum JobStatus {
   FAILED = 'FAILED'
 }
 
-export enum SubAgentType {
-  BUSINESS_NEGOTIATOR = 'BUSINESS_NEGOTIATOR',
-  METRICS_EXPERT = 'METRICS_EXPERT',
-  PROJECT_MANAGER = 'PROJECT_MANAGER',
-  FIRST_PRINCIPLES_AUDITOR = 'FIRST_PRINCIPLES_AUDITOR'
-}
-
 export enum StepStatus {
   IDLE = 'IDLE',
   PROCESSING = 'PROCESSING',
@@ -50,12 +43,8 @@ export interface Job {
   transcript?: TranscriptSegment[];
   polishedContent?: string; // 新增：儲存 AI 修潤後的完整文章
   analysis?: GeminiOutput;
-  strategies?: string[]; // 新增：即時策略建議
-  agentType?: SubAgentType; // 新增：使用的子代理類型
   meetingTags?: string[]; // 新增：會議標籤 (Context Tags)
   meetingContext?: string; // 新增：一句話補充背景
-  segmentedSummaries?: string[]; // 新增：分段節錄摘要
-  consensus?: string[]; // 新增：已達成的共識 (長期記憶)
   processedSlices?: number;
   totalSlices?: number;
   etaSeconds?: number;
