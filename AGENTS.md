@@ -51,18 +51,22 @@ merge 回主 clone 之後，索引仍停在 34 檔／334 nodes，`postStream`、
 codegraph sync      # 沒東西要同步時很快，有東西時會印 Synced N changed files
 ```
 
-**二、匿名 generator function expression 的 body 解析不到。** 寫法決定看不看得見：
+**二、generator 函式的 body 呼叫看不見，具名或匿名都一樣。** 實測（2026-09-14）：
 
-| 寫法 | `callees` |
+| 寫法 | `callees` 回什麼 |
 |---|---|
-| `export async function* generateAudioSlices()`（具名宣告） | 查得到 |
-| `export const askDocument = async () => {}`（arrow） | 查得到 |
-| `export const askDocumentStream = async function* ()`（匿名 generator 指派給 const） | **永遠是空的** |
+| `function withRetry()`、`async function postStream()`（一般宣告） | body 的呼叫查得到 |
+| `export const askDocument = async () => {}`（arrow） | body 的呼叫查得到 |
+| `export const askDocumentStream = async function* ()`（匿名 generator） | **空的** |
+| `export async function* generateAudioSlices()`（具名 generator） | **只有預設參數與型別，body 的呼叫一個都沒有** |
 
-`askDocumentStream` 現在確實呼叫 `withRetry` 與 `postStream`，`codegraph callees
-askDocumentStream` 照樣回 `No callees found`。所以 `callees` 回空有兩種意思，跟
-`affected` 的兩種空是同一種病：**真的沒呼叫**，或**這個寫法看不見**。要證明「某個函式
-沒走共用路徑」，用 `callers` 從共用函式那頭反查，或直接讀碼。
+具名 generator 最危險：它會回東西（`generateAudioSlices` 回 `SLICE_OVERLAP_SECONDS` 與
+`TranscriptSegment`，都來自 signature），body 裡的 `getAudioDuration`、`extractAudio`、
+`resolveDuration` 全部缺席。**非空不代表 body 被解析過**，這份文件最初就是踩這個坑寫錯的。
+
+所以 `callees` 對 generator 沒有意義，空和非空都不能當證據。要確認某個函式有沒有走共用
+路徑，只有讀碼算數。`callers` 從共用函式那頭反查可以縮小範圍，但**它只到檔案層級**：
+`codegraph callers postStream` 回的是 `file geminiService.ts`，不會指名 `askDocumentStream`。
 
 ## `codegraph affected` 的 filter 與盲區
 

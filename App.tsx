@@ -115,6 +115,12 @@ const App: React.FC = () => {
         }
       }
 
+      // 讀到的任務先進畫面，再打掃：孤兒檔清理失敗時使用者至少看得到自己的紀錄，
+      // 不會因為打掃掛掉就整頁空白，還被告知「讀取失敗」
+      const sorted = loadedJobs.sort((a, b) => b.createdAt - a.createdAt);
+      commitJobs(() => sorted);
+      if (sorted.length > 0 && !activeJobId) setActiveJobId(sorted[0].id);
+
       // 2. 清理孤立檔案
       const fileIds = await getAllFileIds();
       const jobIds = new Set(loadedJobs.map(j => j.id));
@@ -123,18 +129,17 @@ const App: React.FC = () => {
           await deleteFileBlob(fId);
         }
       }
-
-      const sorted = loadedJobs.sort((a, b) => b.createdAt - a.createdAt);
-      commitJobs(() => sorted);
-      if (sorted.length > 0 && !activeJobId) setActiveJobId(sorted[0].id);
     };
     // initialize 失敗要有人接：讀不到舊任務時（IndexedDB 被其他分頁擋住、被瀏覽器停用、
     // 私密視窗）原本只會變成 unhandled rejection，畫面停在空清單，使用者以為紀錄不見了。
     initialize().catch((err: any) => {
       console.error('讀取本機任務紀錄失敗', err);
+      // err 不一定是 Error（IndexedDB 的事件物件、被 reject 的字串都可能），
+      // 直接內插會印出 [object Object]，而這句話是給使用者看的
+      const reason = err instanceof Error ? err.message : String(err);
       showAlert(
         '讀取本機紀錄失敗',
-        `無法讀取先前的任務紀錄（${err?.message ?? err}）。這次的畫面會是空的，但資料沒有被刪除；排除問題後重新整理即可。`
+        `無法讀取先前的任務紀錄（${reason}）。已讀到的紀錄仍會顯示；資料沒有被刪除，排除問題後重新整理即可。`
       );
     });
   }, [showAlert]);
