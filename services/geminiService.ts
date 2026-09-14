@@ -13,6 +13,30 @@ function parseRetryAfterSeconds(response: Response): number | undefined {
   return Number(trimmed);
 }
 
+// 把非 2xx 回應翻成 HttpError。抽成同步純函式是為了讓 JSON 與串流兩條路徑共用同一套訊息規則：
+// 兩邊撞到同一個 429 時使用者看到的字要一樣，限流退避也才吃得到同一個 Retry-After。
+// message 內容維持原樣：App.tsx 的 translateError 與 TranscriptView 只看 message 字串做分類。
+function errorFromResponse(response: Response, text: string): HttpError {
+  let errorMsg = `HTTP ${response.status} ${response.statusText}`;
+  try {
+    const errJson = JSON.parse(text);
+    if (errJson.error) {
+      errorMsg = errJson.error;
+    } else if (errJson.message) {
+      errorMsg = errJson.message;
+    }
+  } catch {
+    if (text.includes('503') || text.includes('high demand') || text.includes('UNAVAILABLE')) {
+      errorMsg = 'AI 服務目前需求量極大 (503 High Demand)，系統正在自動重試...';
+    } else if (text.trim().startsWith('<')) {
+      errorMsg = `伺服器短暫無回應 (HTTP ${response.status})，請稍候重試。`;
+    } else if (text) {
+      errorMsg = text.slice(0, 200);
+    }
+  }
+  return new HttpError(response.status, errorMsg, parseRetryAfterSeconds(response));
+}
+
 async function postJson(endpoint: string, body: any): Promise<any> {
   const response = await fetch(endpoint, {
     method: 'POST',
@@ -23,25 +47,7 @@ async function postJson(endpoint: string, body: any): Promise<any> {
   const text = await response.text();
 
   if (!response.ok) {
-    let errorMsg = `HTTP ${response.status} ${response.statusText}`;
-    try {
-      const errJson = JSON.parse(text);
-      if (errJson.error) {
-        errorMsg = errJson.error;
-      } else if (errJson.message) {
-        errorMsg = errJson.message;
-      }
-    } catch {
-      if (text.includes('503') || text.includes('high demand') || text.includes('UNAVAILABLE')) {
-        errorMsg = 'AI 服務目前需求量極大 (503 High Demand)，系統正在自動重試...';
-      } else if (text.trim().startsWith('<')) {
-        errorMsg = `伺服器短暫無回應 (HTTP ${response.status})，請稍候重試。`;
-      } else if (text) {
-        errorMsg = text.slice(0, 200);
-      }
-    }
-    // message 內容維持原樣：App.tsx 的 translateError 只看 message 字串做分類
-    throw new HttpError(response.status, errorMsg, parseRetryAfterSeconds(response));
+    throw errorFromResponse(response, text);
   }
 
   const trimmed = text.trim();
@@ -54,6 +60,23 @@ async function postJson(endpoint: string, body: any): Promise<any> {
   } catch (parseErr: any) {
     throw new Error(`回應格式解析錯誤: ${parseErr.message}`);
   }
+}
+
+// 串流端點的建立連線階段。錯誤走跟 postJson 同一套 errorFromResponse，串流問答才吃得到
+// 限流退避（限流掛在整個 /api，這條路徑一樣會被擋）。成功時原樣回傳 Response，
+// body 留給呼叫端當 stream 讀 —— 這裡絕對不能先讀掉 body。
+async function postStream(endpoint: string, body: any): Promise<Response> {
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    throw errorFromResponse(response, await response.text());
+  }
+
+  return response;
 }
 
 async function withRetry<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
@@ -209,20 +232,9 @@ export const askDocumentStream = async function* (
   history: ChatMessage[], 
   question: string
 ) {
-  const response = await fetch('/api/gemini/chat-stream', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ transcript, history, question }),
-  });
-
-  if (!response.ok) {
-    let errorMsg = `HTTP ${response.status}`;
-    try {
-      const err = await response.json();
-      if (err.error) errorMsg = err.error;
-    } catch {}
-    throw new Error(errorMsg);
-  }
+  // 只有建立連線這一段重試：一旦開始 yield，重試就會把同一則回覆的開頭再送一次，
+  // 使用者會在同一段文字裡看到重複的字。所以下面讀 stream 的迴圈出錯一律往外丟，不重試。
+  const response = await withRetry(() => postStream('/api/gemini/chat-stream', { transcript, history, question }));
 
   const reader = response.body?.getReader();
   if (!reader) throw new Error("瀏覽器不支援串流讀取");

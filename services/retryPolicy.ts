@@ -9,6 +9,9 @@ const TRANSIENT_BASE_MS = 2500;
 const JITTER_MS = 1500;
 // Retry-After 上限 60 秒：server 若給出離譜的值，不讓單次重試把整個工作卡住
 const RETRY_AFTER_CAP_SECONDS = 60;
+// Retry-After 下限 1 秒：反向代理可能把它改寫成 0，照做等於只等 jitter（≤1.5 秒）就立刻再撞一次限流，
+// 三次重試會在兩秒內燒完。夾到 1 秒，至少讓限流桶有時間補回額度。
+const RETRY_AFTER_FLOOR_SECONDS = 1;
 
 /**
  * 回傳這次錯誤該等多久再重試（毫秒）；回 null 代表不該重試，呼叫端直接把錯誤丟出去。
@@ -41,7 +44,8 @@ export function retryDelayMs(err: unknown, attempt: number, random: () => number
     // server 有給 Retry-After 就照它的時間退避，別再自己猜比它短或長的值
     const retryAfterSeconds = err instanceof HttpError ? err.retryAfterSeconds : undefined;
     if (retryAfterSeconds !== undefined) {
-      return Math.min(retryAfterSeconds, RETRY_AFTER_CAP_SECONDS) * 1000 + jitter;
+      const clamped = Math.min(Math.max(retryAfterSeconds, RETRY_AFTER_FLOOR_SECONDS), RETRY_AFTER_CAP_SECONDS);
+      return clamped * 1000 + jitter;
     }
     return RATE_LIMIT_BASE_MS * (attempt + 1) + jitter;
   }
