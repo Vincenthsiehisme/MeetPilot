@@ -3,7 +3,13 @@ import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
 import { getAgentById } from './services/agents';
-import { checkBasicAuth, createRateLimiter, resolveListenConfig } from './services/httpGuards';
+import {
+  checkBasicAuth,
+  createRateLimiter,
+  describeBodyParserError,
+  resolveListenConfig,
+} from './services/httpGuards';
+import { normalizeTranscribedSegments } from './services/transcribeSegments';
 import { TranscriptSegment, GeminiOutput, ChatMessage, SubAgentType } from './types';
 
 // 監聽設定在啟動時就解析：HOST 不是本機位址又沒設 Basic Auth 會在這裡直接拋錯，不進 listen
@@ -43,6 +49,14 @@ if (listenConfig.basicAuth) {
 // 只掛在 /api 底下，通過限流與認證後才解析 body；/api 以外沒有路由讀 req.body
 app.use('/api', express.json({ limit: '50mb' }));
 app.use('/api', express.urlencoded({ limit: '50mb', extended: true }));
+
+// body parser 的錯要自己接：Express 預設回 HTML 錯誤頁，前端 postJson 看到 `<` 開頭會當成連線異常，
+// 使用者只看到「無法連線」，不知道是送出的 JSON 壞掉還是超過 50MB。其他錯誤原樣往下丟。
+app.use('/api', (err: unknown, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  const described = describeBodyParserError(err);
+  if (!described) return next(err);
+  res.status(described.status).json({ error: described.error });
+});
 
 // Lazy GoogleGenAI client
 let aiClient: GoogleGenAI | null = null;
@@ -203,7 +217,7 @@ app.get('/api/health', (req, res) => {
 // 1. Transcribe Audio Slice
 app.post('/api/gemini/transcribe', async (req, res) => {
   try {
-    const { base64Data, offsetSeconds = 0, previousContext = '', mimeType = 'audio/wav' } = req.body;
+    const { base64Data, offsetSeconds = 0, previousContext = '', mimeType = 'audio/wav', sliceDurationSeconds } = req.body;
     if (!base64Data) {
       return res.status(400).json({ error: 'Missing base64Data' });
     }
@@ -279,12 +293,7 @@ Output JSON format:
       }];
     }
 
-    const segments = rawSegments.map((s: any) => ({
-      start: typeof s.start === 'number' ? s.start + offsetSeconds : offsetSeconds,
-      end: typeof s.end === 'number' ? s.end + offsetSeconds : offsetSeconds + 5,
-      text: s.text || '',
-      speaker: s.speaker || 'Speaker 1',
-    }));
+    const segments = normalizeTranscribedSegments(rawSegments, offsetSeconds, sliceDurationSeconds);
 
     res.json({ segments });
   } catch (err: any) {
