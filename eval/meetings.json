@@ -1,0 +1,27 @@
+[
+  {
+    "id": "M1",
+    "sources": ["廠商來訪.m4a_transcript.txt"],
+    "label": "AI 客服廠商 A 的產品交流會"
+  },
+  {
+    "id": "M2",
+    "sources": ["新錄音 3.m4a_transcript.txt"],
+    "label": "門市文字客服派單平台 POC 規格會"
+  },
+  {
+    "id": "M3",
+    "sources": ["新錄音 8.m4a_transcript.txt"],
+    "label": "活動產品成本包裝與銷售機制會"
+  },
+  {
+    "id": "M4",
+    "sources": ["新錄音 6_01.m4a_transcript.txt", "新錄音 6_02.m4a_transcript.txt"],
+    "label": "AI 客服廠商 B 的簡報與平台 demo（同一場會，錄音切成兩檔）"
+  },
+  {
+    "id": "M5",
+    "sources": ["新錄音 7.m4a_transcript.txt"],
+    "label": "FDE 職位面試"
+  }
+]
