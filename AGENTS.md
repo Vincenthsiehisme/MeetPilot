@@ -60,6 +60,11 @@ codegraph sync      # 沒東西要同步時很快，有東西時會印 Synced N 
 | `export const askDocumentStream = async function* ()`（匿名 generator） | **空的** |
 | `export async function* generateAudioSlices()`（具名 generator） | **只有預設參數與型別，body 的呼叫一個都沒有** |
 
+**2026-09-14（W2）更新：`generateAudioSlices` 與 `services/audioService.ts` 已經刪掉**（切片搬到
+server 端 ffmpeg）。下面這段的結論仍然成立，但那個具名 generator 的對照組**已經沒辦法重跑**；
+repo 現存的 generator 只剩 `askDocumentStream` 一個（匿名）。下次要驗具名 generator 的行為，
+得自己寫一個來試。
+
 具名 generator 最危險：它會回東西，讓人以為 body 被解析過。`generateAudioSlices` 的兩筆是
 `SLICE_OVERLAP_SECONDS`（來自 `audioService.ts:150` 的預設參數）與 `TranscriptSegment`
 （**那個檔案裡一次都沒出現過**，`grep -c` 為 0、`git log -S` 查無歷史，是圖上憑空多出來的
@@ -98,24 +103,55 @@ codegraph affected --stdin --quiet --filter "services/*.test.ts"
 | `services/transcribeSegments.ts` | `transcribeSegments.test.ts` | — |
 | `services/retryPolicy.ts` | `retryPolicy.test.ts` | — |
 | `services/httpError.ts` | `retryPolicy.test.ts` | — |
-| `services/audioDuration.ts` | `audioDuration.test.ts` | — |
 | `services/printDocument.ts` | `printDocument.test.ts` | — |
 | `services/escapeHtml.ts` | `escapeHtml.test.ts`、`printDocument.test.ts` | — |
-| `services/storageService.ts` | **（空）** | **假的空。有 7 條測試**，但 `storageService.test.ts` 用 `vi.resetModules()` ＋ `await import('./storageService')` 動態載入（為了清模組層的連線快取），圖上沒有 import 邊 |
+| `services/storageService.ts` | **（空）** | **假的空。有測試**，但 `storageService.test.ts` 用 `vi.resetModules()` ＋ `await import('./storageService')` 動態載入（為了清模組層的連線快取），圖上沒有 import 邊 |
 | `services/geminiService.ts` | （空） | 真的空，沒有測試 import 它 |
-| `services/audioService.ts` | （空） | 真的空 |
 | `server.ts` | （空） | 真的空 |
 | `App.tsx` | （空） | 真的空 |
+
+`services/audioService.ts` 與 `services/audioDuration.ts` 已於 W2 刪除，原本那兩列拿掉。
+W2 新增的 `audioSlicer`、`audioFileStore`、`transcriptionPipeline`、`transcriptionQueue`、
+`geminiServerClient`、`meetingClient`、`meetingAdapter` 各有同名測試，**尚未逐檔實測 affected 的覆蓋**，
+別假設它們都查得到。
 
 所以改到後面五個檔案時，`affected` 回空**不代表不用跑測試**，三條 gate 一律照跑。
 改 `storageService.ts` 一定要手動指定 `services/storageService.test.ts`。
 
+## gate 守不到哪裡（2026-09-15 實測）
+
+**`npx tsc --noEmit` 對 `App.tsx` 與整個 `components/` 幾乎沒有型別覆蓋。**
+
+`package.json` 沒有 `@types/react`，`node_modules/react` 也沒有自帶 `.d.ts`，而 tsconfig 沒開
+`strict`（`noImplicitAny` 關著）。所以 `import ... from 'react'` 整個解析成 `any`，
+於是每一個 `useState` 回來的值、以及由它推導出去的每一個東西，在 `App.tsx` 裡都是 `any`。
+
+實測（2026-09-15，W2 期間）：把 `useState({a:1})` 的結果賦值給 `number` **不報錯**；
+把字串傳給一個明確吃物件的函式參數也**不報錯**；但把同一個呼叫的參數明確標成型別之後就報錯，
+代表函式簽名本身是好的，失效的是呼叫端的推導。
+
+**後果**：W2 期間前端的每一條缺陷都是 reviewer 抓到的，沒有一條被 gate 攔下。
+所以「可測的邏輯抽進 `services/` 的純函式再測」在這個 repo **不是風格偏好，是唯一的防線**。
+改 `App.tsx` 或 `components/` 時不要靠 tsc 給你安全感。
+
+修法是把 `@types/react` 與 `@types/react-dom` 加進 devDependencies，但加上去會一次噴出一批
+既有的型別錯誤，要排時間，**當成獨立一包做，不要夾在別的任務裡順手加**。
+
 ## 這個 repo 的已知地雷
 
-- `server.ts` 的 middleware 順序有意義：限流 → Basic Auth → body parser → body parser 錯誤處理 → 路由。
-  往上搬 body parser 會讓未認證請求先吃 50MB。
-- overlap 秒數的唯一來源是 `services/transcriptMerge.ts` 的 `SLICE_OVERLAP_SECONDS`，
-  `App.tsx` 與 `generateAudioSlices` 都 import 它。不要在任何地方寫回字面 15。
+- `server.ts` 的 middleware 順序有意義：限流 → Basic Auth → **音檔路由** → body parser →
+  body parser 錯誤處理 → 其餘路由。往上搬 body parser 會讓未認證請求先吃 50MB；
+  往下搬音檔路由會讓 100 分鐘的音檔先被讀進記憶體。
+- overlap 秒數的唯一來源是 `services/transcriptMerge.ts` 的 `SLICE_OVERLAP_SECONDS`。
+  W2 之後 import 它的只有 `services/transcriptionPipeline.ts`（前端已經不切片）；
+  `services/audioSlicer.ts` **不 import 它**，overlap 是 `planSlices(total, sliceDuration, overlapSeconds)`
+  的參數，由 pipeline 傳進去。切片邊界與去重上限因此保證同源。不要在任何地方寫回字面 15。
+- **`PUT /api/meetings/:id/audio` 必須掛在 body parser 之前**，body 直接 pipe 進檔案。
+  往後搬會讓 100 分鐘的音檔先被讀進記憶體，那正是 W2 要解掉的東西。限流與 Basic Auth 仍要在
+  它前面：middleware 的順序是限流 → Basic Auth → **音檔路由** → body parser → body parser 錯誤處理 → 其餘路由。
+- server 端切片需要 `ffmpeg` 與 `ffprobe`（`MEETPILOT_FFMPEG` / `MEETPILOT_FFPROBE`，不設走 PATH）。
+  沒裝的時候三條 gate 照樣全綠（測試一律走注入的假 runner），**但那不等於轉錄驗過**，
+  兩者不要混為一談。
 - `services/httpGuards.ts` 的環境變數只收十進位整數（`/^\d+$/`）。`Number()` 會放行
   `6e1`、`0x3c`，設定看起來生效但值不是寫的那個。
 - 不設 `trust proxy` 是刻意的（理由在 README），反向代理後全員共用一個限流桶。

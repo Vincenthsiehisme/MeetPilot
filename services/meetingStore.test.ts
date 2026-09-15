@@ -207,6 +207,101 @@ describe('transcript 與 analysis', () => {
   });
 });
 
+describe('切片進度與續傳游標', () => {
+  it('setSliceProgress 只動進度，不動狀態', () => {
+    newMeeting();
+    store.setSliceProgress('m-1', 0, 7, T0 + 1);
+    const m = store.getMeeting('m-1');
+    expect(m?.total_slices).toBe(7);
+    expect(m?.processed_slices).toBe(0);
+    expect(m?.status).toBe('CREATED');
+  });
+
+  it('逐字稿與游標同一步寫入：不會出現「存了逐字稿但游標沒動」', () => {
+    newMeeting();
+    store.saveTranscriptProgress(
+      'm-1', { segments: [{ start: 0, end: 3, text: '第一片' }], polished_content: null }, 1, 3, T0 + 1,
+    );
+    expect(store.getTranscript('m-1')?.segments).toHaveLength(1);
+    expect(store.getMeeting('m-1')?.processed_slices).toBe(1);
+    expect(store.getMeeting('m-1')?.total_slices).toBe(3);
+  });
+
+  it('這一片沒轉出內容時只推進游標，不用空逐字稿蓋掉前面幾片', () => {
+    newMeeting();
+    store.saveTranscriptProgress(
+      'm-1', { segments: [{ start: 0, end: 3, text: '第一片' }], polished_content: null }, 1, 3, T0 + 1,
+    );
+    store.saveTranscriptProgress('m-1', { segments: [], polished_content: null }, 2, 3, T0 + 2);
+    expect(store.getTranscript('m-1')?.segments).toHaveLength(1);
+    expect(store.getMeeting('m-1')?.processed_slices).toBe(2);
+  });
+
+  it('Meeting 不存在時拋錯，不靜默建一筆進度', () => {
+    expect(() => store.setSliceProgress('nope', 0, 1, T0)).toThrow(/找不到 Meeting nope/);
+    expect(() => store.saveTranscriptProgress('nope', { segments: [], polished_content: null }, 1, 1, T0))
+      .toThrow(/找不到 Meeting nope/);
+  });
+});
+
+describe('resetTranscriptionProgress', () => {
+  it('清掉逐字稿並把續傳游標歸零：重新上傳的音檔不能接在舊音檔的逐字稿後面', () => {
+    newMeeting();
+    store.saveTranscriptProgress(
+      'm-1', { segments: [{ start: 0, end: 3, text: '舊音檔的內容' }], polished_content: '舊潤稿' }, 2, 3, T0 + 1,
+    );
+
+    store.resetTranscriptionProgress('m-1', T0 + 2);
+
+    expect(store.getTranscript('m-1')).toBeNull();
+    expect(store.getMeeting('m-1')?.processed_slices).toBeNull();
+    expect(store.getMeeting('m-1')?.total_slices).toBeNull();
+    expect(store.getMeeting('m-1')?.updated_at).toBe(T0 + 2);
+  });
+
+  it('分析也一起刪掉：不能讓新音檔配著舊音檔的結論', () => {
+    newMeeting();
+    store.saveTranscriptProgress(
+      'm-1', { segments: [{ start: 0, end: 3, text: '舊音檔的內容' }], polished_content: null }, 1, 1, T0 + 1,
+    );
+    store.saveAnalysis('m-1', {
+      contract_version: 2 as const,
+      overview: '舊音檔的結論',
+      topics: [{ title: 'a', content: 'b' }],
+      decisions: ['d'],
+      action_items: [{ text: 't', source_meeting_id: 'm-1', created_at: T0, status: 'unknown' as const }],
+    }, T0 + 1);
+
+    store.resetTranscriptionProgress('m-1', T0 + 2);
+
+    expect(store.getAnalysis('m-1')).toBeNull();
+  });
+
+  it('本來就沒有逐字稿時照樣跑得完，不拋錯', () => {
+    newMeeting();
+    expect(() => store.resetTranscriptionProgress('m-1', T0 + 1)).not.toThrow();
+  });
+
+  it('Meeting 不存在時拋錯', () => {
+    expect(() => store.resetTranscriptionProgress('nope', T0)).toThrow(/找不到 Meeting nope/);
+  });
+});
+
+describe('setTags', () => {
+  it('寫進去再讀出來是排序過的同一組', () => {
+    newMeeting();
+    store.setTags('m-1', ['採購', '雙週會']);
+    expect(store.getTags('m-1')).toEqual(['採購', '雙週會']);
+  });
+
+  it('重設整組而不是累加：留著舊標籤會讓 prompt 帶到已經不成立的背景', () => {
+    newMeeting();
+    store.setTags('m-1', ['採購']);
+    store.setTags('m-1', ['人事']);
+    expect(store.getTags('m-1')).toEqual(['人事']);
+  });
+});
+
 describe('importMigrated', () => {
   it('匯入後 meeting、逐字稿、分析、標籤都在', () => {
     const report = store.importMigrated([migrated('job-1')]);

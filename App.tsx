@@ -1,24 +1,51 @@
-
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { Job, JobStatus, StepStatus, TranscriptSegment, GeminiOutput } from './types';
+import { Job, JobStatus } from './types';
 import JobDashboard from './components/JobDashboard';
 import JobDetail from './components/JobDetail';
 import FileUpload from './components/FileUpload';
 import ConfirmModal from './components/ConfirmModal';
-import { transcribeSlice, analyzeTranscript } from './services/geminiService';
-import { generateAudioSlices, getAudioDuration } from './services/audioService';
-import { mergeSliceTranscript, SLICE_OVERLAP_SECONDS } from './services/transcriptMerge';
-import { 
-  saveJobToDB, 
-  getAllJobsFromDB, 
-  saveFileBlob, 
-  getFileBlob, 
-  deleteFileBlob, 
+import { HttpError } from './services/httpError';
+import { MEETING_POLL_INTERVAL_MS, MeetingDetailResponse, MeetingView } from './services/meetingApi';
+import {
+  deleteMeeting,
+  getMeetingDetail,
+  importLegacyJobs,
+  listMeetings,
+  patchAnalysis,
+  patchTranscript,
+  retryMeeting,
+  submitAudio
+} from './services/meetingClient';
+import {
+  AudioBackupTarget,
+  SelectionRef,
+  audioSubmitFailureMessage,
+  buildAudioBackupTargets,
+  buildDashboardView,
+  editBlockedReason,
+  geminiOutputToAnalysisV2,
+  hasMeetingsInProgress,
+  isMeetingInProgress,
+  loadDetailForSelection,
+  meetingDetailToJob,
+  needsAudioUpload,
+  summarizeImportResponse
+} from './services/meetingAdapter';
+import { downloadBlob } from './services/exportUtils';
+import {
+  getAllJobsFromDB,
   deleteJobFromDB,
-  getAllFileIds
+  deleteFileBlob,
+  exportAllForMigration,
+  getFileBlob
 } from './services/storageService';
 
-const STALE_JOB_THRESHOLD = 5 * 60 * 1000;
+/** 選中的是哪一邊的紀錄。server 的 meeting_id 與本機的 job id 可能長得一樣，來源要自己記 */
+type Selection = NonNullable<SelectionRef>;
+
+// err 不一定是 Error（IndexedDB 的事件物件、被 reject 的字串都可能），直接內插會印出 [object Object]，
+// 而這些字串全都是要給使用者看的
+const errorText = (err: any): string => (err instanceof Error ? err.message : String(err));
 
 const translateError = (error: string) => {
   const e = (error || '').toLowerCase();
@@ -43,15 +70,32 @@ const translateError = (error: string) => {
   if (e.includes('unexpected token') || e.includes('<!doctype') || e.includes('is not valid json') || e.includes('網頁內容') || e.includes('html')) {
     return '【連線異常】伺服器回應了非預期的網頁格式，可能連線短暫中斷或正在重啟，請點擊重試。';
   }
-  if (e.includes('decode') || e.includes('解碼')) {
-    return '【媒體格式錯誤】瀏覽器無法解碼。若是大型 MOV 影片或 iPhone M4A 錄音，請嘗試轉檔 (如轉為 MP3) 後再上傳。';
+  // server 整個連不上跟 server 回錯是兩件事，講一樣的話會讓人往 API 金鑰的方向查
+  if (e.includes('failed to fetch') || e.includes('networkerror') || e.includes('load failed')) {
+    return '【連不上伺服器】無法連到處理服務，請確認 server 有在跑、網路正常後重試。';
   }
   return `【處理失敗】${error}`;
 };
 
 const App: React.FC = () => {
-  const [jobs, setJobs] = useState<Job[]>([]);
-  const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  // meetings 是 server 清單的快取。null 代表「還沒成功讀到過」，空陣列代表「讀到了，一場都沒有」，
+  // 兩者在畫面上要講的話不一樣，不能合併成同一個值。
+  const [meetings, setMeetings] = useState<MeetingView[] | null>(null);
+  const [serverError, setServerError] = useState<string | null>(null);
+  const [localJobs, setLocalJobs] = useState<Job[]>([]);
+  const [selection, setSelection] = useState<Selection | null>(null);
+  // 非同步回應要比對「現在」選中誰，不是送出請求那一刻的閉包值，所以額外記一份 ref。
+  // 兩邊一定要一起改，所以一律走 selectRecord，不要直接呼叫 setSelection。
+  const selectionRef = useRef<Selection | null>(null);
+  const [activeServerJob, setActiveServerJob] = useState<Job | null>(null);
+  // 原始的 detail 也留著：寫回 analysis 時要拿原本那份 AnalysisV2 把 metadata 接回去，
+  // activeServerJob 裡的是降成 v1 的顯示用版本，接不回來
+  const [activeDetail, setActiveDetail] = useState<MeetingDetailResponse | null>(null);
+  const [detailError, setDetailError] = useState<string | null>(null);
+  // 正在跑的長動作（上傳、搬遷）。有值時 header 會顯示，免得使用者以為按鈕沒反應又按一次
+  const [busyMessage, setBusyMessage] = useState<string | null>(null);
+  // 搬遷之後「被退件、音檔只剩瀏覽器這一份」的那幾場。列在本機那一區給使用者逐筆下載
+  const [audioBackupTargets, setAudioBackupTargets] = useState<AudioBackupTarget[]>([]);
   const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(true);
   const [confirmConfig, setConfirmConfig] = useState<{
     isOpen: boolean;
@@ -68,297 +112,401 @@ const App: React.FC = () => {
     isDestructive: true,
     hideCancel: false
   });
-  const isProcessingRef = useRef<boolean>(false);
-  // jobs 的同步鏡像：持久化要在 setJobs updater 外面算出新 job，所以所有 jobs 變更都走 commitJobs，
-  // 讓 ref 與 state 同步，之後才能拿最新的 job 出來 await 寫入。
-  const jobsRef = useRef<Job[]>([]);
 
-  const commitJobs = useCallback((updater: (prev: Job[]) => Job[]) => {
-    const next = updater(jobsRef.current);
-    jobsRef.current = next;
-    setJobs(next);
+  const selectRecord = useCallback((next: Selection | null) => {
+    selectionRef.current = next;
+    setSelection(next);
   }, []);
 
-  // 搬到 processJob 前面並包 useCallback：processJob 的 catch 要用它報「狀態寫不進去」，
-  // 而原本的定義在 processJob 之後，是 const（TDZ）又每次 render 換新 function，
-  // 放進 processJob 的 deps 會讓 processJob 每次 render 都重建、觸發單併發 effect 重跑
+  const closeConfirm = useCallback(() => setConfirmConfig(prev => ({ ...prev, isOpen: false })), []);
+
   const showAlert = useCallback((title: string, message: string) => {
     setConfirmConfig({
       isOpen: true,
       title,
       message,
-      onConfirm: () => setConfirmConfig(prev => ({ ...prev, isOpen: false })),
+      onConfirm: closeConfirm,
       hideCancel: true,
       isDestructive: false
     });
+  }, [closeConfirm]);
+
+  const refreshMeetings = useCallback(async (): Promise<void> => {
+    try {
+      const list = await listMeetings();
+      setMeetings(list);
+      setServerError(null);
+    } catch (err: any) {
+      // 讀不到就把上一次的清單留著，另外把失敗講出來。清空清單等於告訴使用者「你的會議不見了」，
+      // 那是這一包最該擋掉的壞法。
+      console.error('讀取伺服器會議清單失敗', err);
+      setServerError(errorText(err));
+    }
   }, []);
 
-  // 初始化與清理孤立檔案
+  const refreshActiveDetail = useCallback((meetingId: string): Promise<void> =>
+    loadDetailForSelection(
+      meetingId,
+      getMeetingDetail,
+      () => selectionRef.current,
+      {
+        onDetail: detail => {
+          try {
+            // 先轉再寫入 state：meetingDetailToJob 撞到不認得的狀態會拋錯，
+            // 讓它在這裡被接住，不要留下半套的畫面
+            const job = meetingDetailToJob(detail);
+            setActiveServerJob(job);
+            setActiveDetail(detail);
+            setDetailError(null);
+          } catch (err: any) {
+            console.error('會議內容轉換失敗', err);
+            setDetailError(errorText(err));
+          }
+        },
+        onError: err => {
+          console.error('讀取會議內容失敗', err);
+          setDetailError(errorText(err));
+        }
+      }
+    ), []);
+
+  // 開場：server 清單與本機舊紀錄各讀各的，一邊失敗不影響另一邊
   useEffect(() => {
-    const initialize = async () => {
-      let loadedJobs = await getAllJobsFromDB();
-      const now = Date.now();
-      let hasUpdates = false;
-
-      // 1. 處理中斷的任務（逾時標記回 Pending）
-      loadedJobs = loadedJobs.map(job => {
-        if (job.status === JobStatus.RUNNING && (now - job.updatedAt > STALE_JOB_THRESHOLD)) {
-          hasUpdates = true;
-          return { ...job, status: JobStatus.PENDING, updatedAt: now };
-        }
-        return job;
-      });
-
-      if (hasUpdates) {
-        for (const job of loadedJobs.filter(j => j.status === JobStatus.PENDING)) {
-          await saveJobToDB(job);
-        }
-      }
-
-      // 讀到的任務先進畫面，再打掃：孤兒檔清理失敗時使用者至少看得到自己的紀錄，
-      // 不會因為打掃掛掉就整頁空白，還被告知「讀取失敗」
-      const sorted = loadedJobs.sort((a, b) => b.createdAt - a.createdAt);
-      commitJobs(() => sorted);
-      // activeJobId 在這裡是 mount 當下的值（effect 的 deps 只有 showAlert），
-      // 刻意吃舊值：這段只在初始化跑一次，要的就是「畫面上還沒有選中的任務才自動選第一個」
-      if (sorted.length > 0 && !activeJobId) setActiveJobId(sorted[0].id);
-
-      // 2. 清理孤立檔案。每刪一個之前重讀 jobsRef，不用開頭那份快照：
-      // 打掃期間使用者可能上傳新檔，addJob 是先 saveFileBlob 才把 job 進 state，
-      // 拿舊快照會把剛上傳的檔案當成孤兒刪掉，那個任務接著就「音檔資源遺失」直接失敗。
-      // 殘留窗口只剩 saveFileBlob 完成到 commitJobs 之間那一瞬間。
-      const fileIds = await getAllFileIds();
-      for (const fId of fileIds) {
-        if (!jobsRef.current.some(j => j.id === fId)) {
-          await deleteFileBlob(fId);
-        }
-      }
-    };
-    // initialize 失敗要有人接：讀不到舊任務時（IndexedDB 被其他分頁擋住、被瀏覽器停用、
-    // 私密視窗）原本只會變成 unhandled rejection，畫面停在空清單，使用者以為紀錄不見了。
-    initialize().catch((err: any) => {
-      console.error('讀取本機任務紀錄失敗', err);
-      // err 不一定是 Error（IndexedDB 的事件物件、被 reject 的字串都可能），
-      // 直接內插會印出 [object Object]，而這句話是給使用者看的
-      const reason = err instanceof Error ? err.message : String(err);
-      showAlert(
-        '讀取本機紀錄失敗',
-        `無法讀取先前的任務紀錄（${reason}）。已讀到的紀錄仍會顯示；資料沒有被刪除，排除問題後重新整理即可。`
-      );
-    });
-  }, [showAlert]);
-
-  const updateJobInStateAndDB = useCallback(async (jobId: string, updates: Partial<Job>) => {
-    const current = jobsRef.current.find(j => j.id === jobId);
-    if (!current) return;
-    const updated: Job = { ...current, ...updates, updatedAt: Date.now() };
-    commitJobs(prev => prev.map(j => (j.id === jobId ? updated : j)));
-    await saveJobToDB(updated);
-  }, [commitJobs]);
-
-  const updateJobStep = useCallback(async (jobId: string, stepIdx: number, status: StepStatus, customData?: any) => {
-    const current = jobsRef.current.find(j => j.id === jobId);
-    if (!current) return;
-    const newSteps = [...current.steps];
-    newSteps[stepIdx] = { ...newSteps[stepIdx], status, ...customData };
-    const updated: Job = { ...current, steps: newSteps, ...customData, updatedAt: Date.now() };
-    commitJobs(prev => prev.map(j => (j.id === jobId ? updated : j)));
-    await saveJobToDB(updated);
-  }, [commitJobs]);
-
-  const addJob = async (file: File) => {
-    const now = Date.now();
-    const jobId = `job_${now}`;
-    const newJob: Job = {
-      id: jobId,
-      fileName: file.name,
-      fileSize: file.size,
-      createdAt: now,
-      updatedAt: now,
-      status: JobStatus.PENDING,
-      currentStep: 0,
-      processedSlices: 0,
-      steps: [
-        { name: '音訊預處理與降噪', status: StepStatus.IDLE },
-        { name: 'AI 語音轉錄 (Smart Verbatim)', status: StepStatus.IDLE },
-        { name: 'Gemini 中文分析摘要', status: StepStatus.IDLE }
-      ]
-    };
-    await saveFileBlob(jobId, file);
-    await saveJobToDB(newJob);
-    commitJobs(prev => [newJob, ...prev]);
-    setActiveJobId(jobId);
-    if (!isSidebarOpen) setIsSidebarOpen(true); // 自動展開側邊欄以便查看新任務
-  };
-
-  const processJob = useCallback(async (job: Job) => {
-    if (isProcessingRef.current) return;
-    isProcessingRef.current = true;
-    const { id } = job;
-    
-    try {
-      const blob = await getFileBlob(id);
-      if (!blob) throw new Error("音檔資源遺失或已被清理");
-      const file = new File([blob], job.fileName);
-
-      await updateJobStep(id, 0, StepStatus.PROCESSING, { status: JobStatus.RUNNING, currentStep: 0 });
-      
-      let duration = 0;
-      try {
-        duration = await getAudioDuration(file);
-      } catch (e) {
-        console.warn("無法取得音訊時長", e);
-      }
-      
-      const sliceDurationMin = 10;
-      // metadata duration 可能是 Infinity/NaN（見 services/audioDuration.ts），不能拿去除；那時先當 1 片，進度文字用 Math.max 撐著
-      const expectedSlices = Number.isFinite(duration) && duration > 0 ? Math.ceil(duration / (sliceDurationMin * 60)) : 1;
-      
-      const sliceGenerator = generateAudioSlices(file, sliceDurationMin, SLICE_OVERLAP_SECONDS);
-      
-      await updateJobStep(id, 0, StepStatus.SUCCESS, { 
-        totalSlices: expectedSlices,
-        currentStep: 1
-      });
-
-      let fullTranscript: TranscriptSegment[] = job.transcript || [];
-      
-      for await (const slice of sliceGenerator) {
-        const currentJobs = await getAllJobsFromDB();
-        if (!currentJobs.find(j => j.id === id)) return;
-
-        if (slice.index < (job.processedSlices || 0)) continue;
-
-        await updateJobStep(id, 1, StepStatus.PROCESSING, {
-          steps: [
-            { name: `音訊預處理完成`, status: StepStatus.SUCCESS },
-            { name: `正在轉錄片段 ${slice.index + 1}/${Math.max(slice.index + 1, expectedSlices)}...`, status: StepStatus.PROCESSING },
-            { name: 'Gemini 中文分析摘要', status: StepStatus.IDLE }
-          ]
-        });
-
-        // 提取上下文：從目前的 fullTranscript 中取出最後 1000 個字
-        // 這有助於 AI 在處理切片開頭時，知道誰在說話以及語氣連貫性
-        let contextText = "";
-        if (fullTranscript.length > 0) {
-          const contextSegments = fullTranscript.slice(-10); // 取最後 10 句
-          contextText = contextSegments.map(s => `${s.speaker || 'Unknown'}: ${s.text}`).join('\n').slice(-1000);
-        }
-
-        const sliceTranscript = await transcribeSlice(slice.data, slice.startTime, contextText, slice.mimeType || 'audio/wav', slice.durationSeconds);
-        
-        // 智慧接合：以既有逐字稿已涵蓋到的時間為準去掉 overlap 重複（規則見 transcriptMerge.ts）
-        fullTranscript = mergeSliceTranscript(fullTranscript, sliceTranscript, slice.startTime, slice.index === 0, 0.5, SLICE_OVERLAP_SECONDS);
-
-        await updateJobInStateAndDB(id, { 
-          transcript: fullTranscript,
-          processedSlices: slice.index + 1
-        });
-      }
-
-      await updateJobStep(id, 1, StepStatus.SUCCESS, { 
-        currentStep: 2,
-        steps: [
-          { name: `音訊預處理完成`, status: StepStatus.SUCCESS },
-          { name: `轉錄已完成 (${expectedSlices} 個片段)`, status: StepStatus.SUCCESS },
-          { name: '正在生成中文摘要與行動建議...', status: StepStatus.PROCESSING }
-        ]
-      });
-
-      const analysis = await analyzeTranscript(
-        fullTranscript, 
-        job.meetingTags || [], 
-        job.meetingContext || ""
-      );
-      await updateJobStep(id, 2, StepStatus.SUCCESS, { 
-        analysis, 
-        status: JobStatus.COMPLETED,
-        steps: [
-          { name: `音訊預處理完成`, status: StepStatus.SUCCESS },
-          { name: `轉錄已完成`, status: StepStatus.SUCCESS },
-          { name: '中文分析報告已產出', status: StepStatus.SUCCESS }
-        ]
-      });
-
-      await deleteFileBlob(id);
-
-    } catch (err: any) {
-      console.error("Job Failed:", err);
-      try {
-        await updateJobInStateAndDB(id, {
-          status: JobStatus.FAILED,
-          error: translateError(err.message)
-        });
-      } catch (saveErr: any) {
-        // 標記 FAILED 的那次寫入自己也失敗（IndexedDB 滿了、被瀏覽器關掉、私密視窗）：
-        // 這個 await 原本沒人接，會變成 unhandled rejection，畫面上什麼都看不到，
-        // 而任務在 DB 裡還停在 RUNNING，重新整理後看起來像還在處理。不吞錯，兩個錯誤都留下再告訴使用者
-        console.error(`任務狀態寫入失敗 (jobId: ${id})`, { originalError: err, saveError: saveErr });
+    refreshMeetings();
+    getAllJobsFromDB()
+      .then(jobs => setLocalJobs([...jobs].sort((a, b) => b.createdAt - a.createdAt)))
+      .catch((err: any) => {
+        console.error('讀取本機任務紀錄失敗', err);
         showAlert(
-          '任務狀態儲存失敗',
-          `「${job.fileName}」處理失敗（${err?.message ?? err}），但失敗狀態沒能寫進資料庫（${saveErr?.message ?? saveErr}）。重新整理後這個任務可能仍顯示處理中，請手動重試或刪除該任務。`
+          '讀取本機紀錄失敗',
+          `無法讀取這台瀏覽器裡的舊紀錄（${errorText(err)}）。伺服器上的會議不受影響；資料沒有被刪除，排除問題後重新整理即可。`
         );
-      }
-    } finally {
-      isProcessingRef.current = false;
-    }
-  }, [updateJobStep, updateJobInStateAndDB, showAlert]);
+      });
+  }, [refreshMeetings, showAlert]);
 
-  // 單併發控制
+  // 選到 server 的會議才去拉內容。本機紀錄的內容本來就在手上，不用再讀一次
   useEffect(() => {
-    if (isProcessingRef.current) return;
-    
-    const runningJob = jobs.find(j => j.status === JobStatus.RUNNING);
-    if (runningJob) {
-      processJob(runningJob);
+    if (selection === null || selection.source !== 'server') {
+      setActiveServerJob(null);
+      setActiveDetail(null);
+      setDetailError(null);
       return;
     }
+    setActiveServerJob(null);
+    setActiveDetail(null);
+    setDetailError(null);
+    refreshActiveDetail(selection.id);
+  }, [selection, refreshActiveDetail]);
 
-    const pendingJobs = jobs.filter(j => j.status === JobStatus.PENDING).sort((a, b) => a.createdAt - b.createdAt);
-    if (pendingJobs.length > 0) {
-      processJob(pendingJobs[0]);
+  // 進度用 polling，不做 SSE。只有「還有會議沒跑完」時才排下一拍，全部結束就不再排。
+  // 用 setTimeout 不用 setInterval：每次拿到新的 meetings 這個 effect 就重跑一次，
+  // setInterval 會在重跑時被清掉再重建，實際行為本來就是一次一拍，寫成 setTimeout 才符實。
+  useEffect(() => {
+    if (meetings === null || !hasMeetingsInProgress(meetings)) return;
+    const timer = setTimeout(() => {
+      refreshMeetings();
+      if (selection !== null && selection.source === 'server') {
+        refreshActiveDetail(selection.id);
+      }
+    }, MEETING_POLL_INTERVAL_MS);
+    return () => clearTimeout(timer);
+  }, [meetings, selection, refreshMeetings, refreshActiveDetail]);
+
+  /**
+   * 送出音檔。targetMeetingId 給了就是對既有的那場補送，沒給才建立新的一場。
+   *
+   * 補送這條路絕對不能再 POST 一次：上傳失敗留下的 CREATED 會議要能被救回來，
+   * 每失敗一次多一筆殭屍會議的話，那幾筆永遠不會有人去補音檔。
+   */
+  const submitAudioFile = async (file: File, targetMeetingId: string | null) => {
+    setBusyMessage(`正在上傳「${file.name}」…`);
+    // server 上到底有沒有那場會。補送本來就有；新建這條要等 onCreated 才算數 ——
+    // createMeeting 自己失敗時那場會根本不存在，這個旗標決定失敗訊息該講哪一句
+    let meetingExists = targetMeetingId !== null;
+    try {
+      await submitAudio(
+        file,
+        targetMeetingId === null ? null : { meetingId: targetMeetingId },
+        created => {
+          meetingExists = true;
+          // 上傳是整條裡最久的一段。建立完就先把那場會放進畫面，
+          // 上傳失敗時使用者才找得到它去補音檔
+          selectRecord({ source: 'server', id: created.meeting_id });
+          if (!isSidebarOpen) setIsSidebarOpen(true);
+          refreshMeetings();
+        }
+      );
+      await refreshMeetings();
+    } catch (err: any) {
+      console.error('建立會議或上傳音檔失敗', err);
+      showAlert(
+        '音檔沒有上傳成功',
+        audioSubmitFailureMessage(translateError(errorText(err)), meetingExists)
+      );
+      await refreshMeetings();
+    } finally {
+      setBusyMessage(null);
     }
-  }, [jobs, processJob]);
+  };
 
-  const activeJob = jobs.find(j => j.id === activeJobId);
+  const addMeeting = (file: File) => submitAudioFile(file, null);
 
-  const handleDeleteJob = (id: string) => {
+  const handleRetryMeeting = async (meetingId: string) => {
+    try {
+      await retryMeeting(meetingId);
+      await refreshMeetings();
+      if (selection !== null && selection.source === 'server' && selection.id === meetingId) {
+        await refreshActiveDetail(meetingId);
+      }
+    } catch (err: any) {
+      console.error('重跑會議失敗', err);
+      showAlert('重試失敗', translateError(errorText(err)));
+    }
+  };
+
+  const showLocalRetryNotice = () =>
+    showAlert(
+      '本機紀錄不能重跑',
+      '瀏覽器端的轉錄已經移除。請先把這筆搬到伺服器，再從伺服器那一區重跑。'
+    );
+
+  const handleMigrate = () => {
     setConfirmConfig({
       isOpen: true,
-      title: '刪除任務',
-      message: '確定要永久刪除此任務與相關檔案嗎？此操作無法復原。',
+      title: '把本機紀錄搬到伺服器',
+      message:
+        `把這台瀏覽器裡的 ${localJobs.length} 筆舊紀錄送到伺服器。\n\n`
+        + '音檔這一期不搬，搬完會告訴你哪幾場的音檔還只留在瀏覽器。\n'
+        + '本機紀錄不會被刪除，搬完你可以自己決定要不要清掉。',
+      isDestructive: false,
       onConfirm: async () => {
-        await deleteJobFromDB(id);
-        await deleteFileBlob(id);
-        commitJobs(prev => prev.filter(j => j.id !== id));
-        if (activeJobId === id) setActiveJobId(null);
-        setConfirmConfig(prev => ({ ...prev, isOpen: false }));
+        closeConfirm();
+        setBusyMessage('正在把本機紀錄送到伺服器…');
+        try {
+          const payload = await exportAllForMigration();
+          const summary = summarizeImportResponse(await importLegacyJobs(payload));
+          // 報告裡叫使用者去側邊欄下載，清單就得在那之前備好，否則那句話又變成空頭支票
+          setAudioBackupTargets(buildAudioBackupTargets(summary.unrecoverableMeetingIds, localJobs));
+          showAlert('搬遷結果', summary.message);
+          await refreshMeetings();
+        } catch (err: any) {
+          console.error('搬遷本機紀錄失敗', err);
+          showAlert('搬遷失敗', translateError(errorText(err)));
+        } finally {
+          setBusyMessage(null);
+        }
       }
     });
   };
 
-  const handleClearAllFinished = () => {
-    const finishedIds = jobs
+  const handleDeleteLocalJob = (id: string) => {
+    setConfirmConfig({
+      isOpen: true,
+      title: '刪除本機紀錄',
+      message: '確定要從這台瀏覽器永久刪除這筆紀錄與它的音檔嗎？這筆還沒搬到伺服器，刪掉就沒了。',
+      isDestructive: true,
+      onConfirm: async () => {
+        closeConfirm();
+        try {
+          await deleteJobFromDB(id);
+          await deleteFileBlob(id);
+          setLocalJobs(prev => prev.filter(j => j.id !== id));
+          if (selection !== null && selection.source === 'local' && selection.id === id) {
+            selectRecord(null);
+          }
+        } catch (err: any) {
+          console.error('刪除本機紀錄失敗', err);
+          showAlert('刪除失敗', `這筆紀錄沒有被刪除（${errorText(err)}）。`);
+        }
+      }
+    });
+  };
+
+  const handleClearFinishedLocalJobs = () => {
+    const finishedIds = localJobs
       .filter(j => j.status === JobStatus.COMPLETED || j.status === JobStatus.FAILED)
       .map(j => j.id);
-    
     if (finishedIds.length === 0) return;
 
     setConfirmConfig({
       isOpen: true,
-      title: '清除完成任務',
-      message: `確定要清除這 ${finishedIds.length} 個已完成或失敗的任務紀錄嗎？`,
+      title: '清除本機已結束的紀錄',
+      message: `確定要從這台瀏覽器刪除這 ${finishedIds.length} 筆紀錄嗎？沒搬到伺服器的部分刪掉就沒了。`,
+      isDestructive: true,
       onConfirm: async () => {
-        for (const id of finishedIds) {
-          await deleteJobFromDB(id);
-          await deleteFileBlob(id);
+        closeConfirm();
+        try {
+          for (const id of finishedIds) {
+            await deleteJobFromDB(id);
+            await deleteFileBlob(id);
+          }
+          setLocalJobs(prev => prev.filter(j => !finishedIds.includes(j.id)));
+          if (selection !== null && selection.source === 'local' && finishedIds.includes(selection.id)) {
+            selectRecord(null);
+          }
+        } catch (err: any) {
+          console.error('清除本機紀錄失敗', err);
+          showAlert('清除失敗', `部分紀錄可能沒有被刪除（${errorText(err)}）。重新整理後再看一次實際結果。`);
         }
-        commitJobs(prev => prev.filter(j => !finishedIds.includes(j.id)));
-        if (activeJobId && finishedIds.includes(activeJobId)) setActiveJobId(null);
-        setConfirmConfig(prev => ({ ...prev, isOpen: false }));
       }
     });
   };
+
+  const showLocalEditNotice = () =>
+    showAlert(
+      '本機紀錄不能編輯',
+      '這筆只存在這台瀏覽器，內容唯讀。搬到伺服器之後才能編輯逐字稿與會議記錄。'
+    );
+
+  // 409 是「正在跑，等它結束或失敗再刪」，server 那句話講了為什麼不能刪、什麼時候可以刪。
+  // 套 translateError 會把它歸到「【處理失敗】」去，那句話就沒了
+  const deleteFailureMessage = (err: any): string =>
+    err instanceof HttpError && err.status === 409 ? err.message : translateError(errorText(err));
+
+  const handleDeleteMeeting = (meetingId: string) => {
+    setConfirmConfig({
+      isOpen: true,
+      title: '刪除這場會議',
+      message: '確定要從伺服器永久刪除這場會議嗎？逐字稿、分析與音檔都會一起刪掉，無法復原。',
+      isDestructive: true,
+      onConfirm: async () => {
+        closeConfirm();
+        try {
+          await deleteMeeting(meetingId);
+          if (selection !== null && selection.source === 'server' && selection.id === meetingId) {
+            selectRecord(null);
+          }
+          await refreshMeetings();
+        } catch (err: any) {
+          console.error('刪除會議失敗', err);
+          showAlert('沒有刪除這場會議', deleteFailureMessage(err));
+        }
+      }
+    });
+  };
+
+  const handleClearFinishedMeetings = () => {
+    const finished = (meetings ?? []).filter(m => !isMeetingInProgress(m));
+    if (finished.length === 0) return;
+
+    setConfirmConfig({
+      isOpen: true,
+      title: '清除已結束的會議',
+      message: `確定要從伺服器刪除這 ${finished.length} 場已結束或失敗的會議嗎？逐字稿、分析與音檔都會一起刪掉，無法復原。`,
+      isDestructive: true,
+      onConfirm: async () => {
+        closeConfirm();
+        setBusyMessage(`正在刪除 ${finished.length} 場會議…`);
+        // 逐筆記下失敗的那幾場。中途壞掉就整批當成功，使用者會以為清乾淨了，
+        // 下次看到那幾場還在只會覺得是 bug
+        const failures: string[] = [];
+        for (const meeting of finished) {
+          try {
+            await deleteMeeting(meeting.meeting_id);
+          } catch (err: any) {
+            console.error('刪除會議失敗', meeting.meeting_id, err);
+            failures.push(`${meeting.source_file_name ?? meeting.meeting_id}：${deleteFailureMessage(err)}`);
+          }
+        }
+        setBusyMessage(null);
+        await refreshMeetings();
+        if (failures.length > 0) {
+          showAlert(
+            '有幾場沒有刪掉',
+            `已刪除 ${finished.length - failures.length} 場，以下 ${failures.length} 場還在：\n`
+            + failures.map(f => `・${f}`).join('\n')
+          );
+        }
+      }
+    });
+  };
+
+  /**
+   * JobDetail 的編輯寫回 server。
+   *
+   * 寫完重新拉一次 detail，不只更新本地 state：畫面上顯示的要是 server 真的存下來的東西，
+   * 不是前端以為它存進去的東西。
+   */
+  const handleUpdateActiveMeeting = async (updates: Partial<Job>) => {
+    if (selection === null || selection.source !== 'server') {
+      showLocalEditNotice();
+      return;
+    }
+    const meetingId = selection.id;
+
+    // 手上這份 detail 必須就是選中那場的。切會議時舊請求晚回來的路徑已經在 loadDetailForSelection
+    // 擋掉了，這裡是第二道：拿 A 的 analysis 去接 B 的 metadata 不會有任何錯誤訊息
+    if (activeDetail !== null && activeDetail.meeting.meeting_id !== meetingId) {
+      showAlert('沒有存檔', '畫面上的內容還在切換中，為了不把別場會議的資料寫進來，這次沒有送出。請再試一次。');
+      return;
+    }
+
+    const blocked = activeDetail === null ? null : editBlockedReason(activeDetail.meeting.status);
+    if (blocked !== null) {
+      showAlert('現在不能存檔', blocked);
+      return;
+    }
+
+    setBusyMessage('正在儲存…');
+    try {
+      if (updates.transcript !== undefined) {
+        await patchTranscript(meetingId, { segments: updates.transcript });
+      }
+      if (updates.polishedContent !== undefined) {
+        await patchTranscript(meetingId, { polished_content: updates.polishedContent });
+      }
+      if (updates.analysis !== undefined) {
+        // 沒有原本那份 v2 就接不回 metadata。硬造一份會把每一筆待辦的來源與建立時間洗掉，
+        // 寧可明確失敗
+        if (activeDetail === null || activeDetail.analysis === null) {
+          throw new Error('讀不到這場會議原本的分析內容，沒有存檔。重新整理後再試一次。');
+        }
+        await patchAnalysis(
+          meetingId,
+          geminiOutputToAnalysisV2(updates.analysis, activeDetail.analysis, meetingId, Date.now())
+        );
+      }
+      await refreshActiveDetail(meetingId);
+      await refreshMeetings();
+    } catch (err: any) {
+      console.error('寫回會議內容失敗', err);
+      showAlert('儲存失敗', translateError(errorText(err)));
+    } finally {
+      setBusyMessage(null);
+    }
+  };
+
+  const downloadLocalAudio = async (target: AudioBackupTarget) => {
+    try {
+      const blob = await getFileBlob(target.meetingId);
+      if (blob === null) {
+        showAlert('這個音檔已經不在瀏覽器裡', `找不到「${target.fileName}」的音檔，它可能已經被清掉了。`);
+        return;
+      }
+      // 走 exportUtils 那支共用的：anchor 要掛進 DOM、revoke 要延到下一個 tick 之後，
+      // 理由寫在那邊。這條是本機音檔唯一的出口，不能自己再寫一份比較樂觀的版本
+      downloadBlob(blob, target.fileName);
+    } catch (err: any) {
+      console.error('讀取本機音檔失敗', err);
+      showAlert('下載失敗', `讀不到「${target.fileName}」的音檔（${errorText(err)}）。`);
+    }
+  };
+
+  const dashboard = buildDashboardView(meetings, serverError, localJobs);
+  const activeMeeting = activeDetail === null ? null : activeDetail.meeting;
+  const activeEditBlockedReason = activeMeeting === null ? null : editBlockedReason(activeMeeting.status);
+  const activeNeedsAudio = activeMeeting !== null && needsAudioUpload(activeMeeting);
+  const activeSection = selection === null
+    ? undefined
+    : dashboard.sections.find(s => s.key === selection.source);
+  const listJob = selection === null
+    ? undefined
+    : activeSection?.jobs.find(j => j.id === selection.id);
+  // server 的會議優先顯示 detail（有逐字稿與分析）；detail 還在讀或讀失敗時先顯示清單那一份，
+  // 讀失敗這件事由上方橫幅明講，不靠「看起來正常的畫面」蓋過去
+  const activeJob: Job | null = selection === null
+    ? null
+    : (selection.source === 'server' ? (activeServerJob ?? listJob ?? null) : (listJob ?? null));
 
   return (
     <div className="h-screen bg-slate-50 flex flex-col antialiased overflow-hidden">
@@ -381,7 +529,13 @@ const App: React.FC = () => {
         </div>
         
         <div className="flex items-center gap-3">
-          <FileUpload onFileSelect={addJob} />
+          {busyMessage && (
+            <span className="text-xs text-indigo-600 font-bold flex items-center gap-2">
+              <i className="fa-solid fa-circle-notch fa-spin"></i>
+              {busyMessage}
+            </span>
+          )}
+          <FileUpload onFileSelect={addMeeting} />
         </div>
       </header>
 
@@ -404,17 +558,79 @@ const App: React.FC = () => {
                 <i className="fa-solid fa-chevron-left"></i>
               </button>
             </div>
-            <div className="flex-1 overflow-y-auto p-4">
-              <JobDashboard 
-                jobs={jobs} 
-                activeJobId={activeJobId} 
-                onSelectJob={(id) => {
-                  setActiveJobId(id);
-                }}
-                onDeleteJob={handleDeleteJob}
-                onRetry={(id) => updateJobInStateAndDB(id, { status: JobStatus.PENDING, error: undefined })}
-                onClearAllFinished={handleClearAllFinished}
-              />
+            <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-6">
+              {dashboard.serverNotice && (
+                <div className="bg-amber-50 border border-amber-200 text-amber-800 text-[11px] leading-relaxed p-3 rounded-lg">
+                  <i className="fa-solid fa-triangle-exclamation mr-1"></i>
+                  {dashboard.serverNotice}
+                </div>
+              )}
+
+              {dashboard.sections.map(section => (
+                <section key={section.key} className="flex flex-col gap-2">
+                  <div className={`rounded-lg px-3 py-2 ${
+                    section.key === 'local' ? 'bg-amber-50 border border-amber-200' : 'bg-slate-50 border border-slate-200'
+                  }`}>
+                    <h3 className={`text-xs font-bold flex items-center gap-2 ${
+                      section.key === 'local' ? 'text-amber-800' : 'text-slate-700'
+                    }`}>
+                      <i className={`fa-solid ${section.key === 'local' ? 'fa-hard-drive' : 'fa-server'}`}></i>
+                      {section.title}（{section.jobs.length}）
+                    </h3>
+                    <p className={`text-[10px] leading-relaxed mt-1 ${
+                      section.key === 'local' ? 'text-amber-700' : 'text-slate-500'
+                    }`}>
+                      {section.hint}
+                    </p>
+                    {section.key === 'local' && (
+                      <button
+                        onClick={handleMigrate}
+                        disabled={busyMessage !== null}
+                        className="mt-2 w-full bg-amber-600 hover:bg-amber-700 disabled:bg-amber-300 text-white text-[11px] font-bold px-3 py-1.5 rounded-lg transition-colors"
+                      >
+                        <i className="fa-solid fa-upload mr-1"></i>
+                        把這 {section.jobs.length} 筆搬到伺服器
+                      </button>
+                    )}
+                    {section.key === 'local' && audioBackupTargets.length > 0 && (
+                      <div className="mt-2 pt-2 border-t border-amber-200">
+                        <p className="text-[10px] text-amber-800 font-bold leading-relaxed">
+                          <i className="fa-solid fa-circle-exclamation mr-1"></i>
+                          這 {audioBackupTargets.length} 場沒搬成功，音檔只剩這台瀏覽器這一份。
+                          清掉瀏覽器資料之前先存下來。
+                        </p>
+                        <ul className="mt-1.5 flex flex-col gap-1">
+                          {audioBackupTargets.map(target => (
+                            <li key={target.meetingId} className="flex items-center justify-between gap-2">
+                              <span className="text-[10px] text-amber-900 truncate flex-1" title={target.fileName}>
+                                {target.fileName}
+                              </span>
+                              <button
+                                onClick={() => downloadLocalAudio(target)}
+                                className="shrink-0 bg-white hover:bg-amber-100 border border-amber-300 text-amber-800 text-[10px] font-bold px-2 py-0.5 rounded transition-colors"
+                              >
+                                <i className="fa-solid fa-download mr-1"></i>
+                                下載音檔
+                              </button>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+
+                  <JobDashboard
+                    jobs={section.jobs}
+                    activeJobId={selection !== null && selection.source === section.key ? selection.id : null}
+                    onSelectJob={(id) => selectRecord({ source: section.key, id })}
+                    onDeleteJob={section.key === 'local' ? handleDeleteLocalJob : handleDeleteMeeting}
+                    onRetry={section.key === 'local' ? showLocalRetryNotice : handleRetryMeeting}
+                    onClearAllFinished={section.key === 'local'
+                      ? handleClearFinishedLocalJobs
+                      : handleClearFinishedMeetings}
+                  />
+                </section>
+              ))}
             </div>
           </div>
         </aside>
@@ -422,13 +638,58 @@ const App: React.FC = () => {
         <main className="flex-1 min-w-0 flex flex-col h-full bg-slate-50 relative">
           <div className="flex-1 p-0 sm:p-4 h-full overflow-hidden flex flex-col">
             <div className="w-full flex-1 bg-white sm:rounded-2xl border-x sm:border border-slate-200 shadow-sm overflow-hidden flex flex-col">
+              {detailError && (
+                <div className="bg-rose-50 border-b border-rose-200 text-rose-700 text-xs p-3 shrink-0">
+                  <i className="fa-solid fa-triangle-exclamation mr-1"></i>
+                  讀取會議內容失敗（{detailError}）。下面是清單上的摘要，逐字稿與會議記錄暫時讀不到。
+                </div>
+              )}
+              {activeNeedsAudio && (
+                <div className="bg-indigo-50 border-b border-indigo-200 text-indigo-900 text-xs p-3 shrink-0 flex flex-wrap items-center gap-3">
+                  <span className="flex-1 min-w-[12rem] leading-relaxed">
+                    <i className="fa-solid fa-circle-info mr-1"></i>
+                    這場會議已經建立，但伺服器上還沒有音檔（多半是上次上傳中斷）。
+                    補上音檔就會從頭開始跑，不用重新建立一場。
+                  </span>
+                  <label className="shrink-0 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold px-3 py-1.5 rounded-lg cursor-pointer transition-colors">
+                    <i className="fa-solid fa-cloud-arrow-up mr-1"></i>
+                    補上音檔
+                    <input
+                      type="file"
+                      accept="audio/*,video/*,.mov,.m4a,.mp4,.mp3,.wav,.webm"
+                      className="hidden"
+                      disabled={busyMessage !== null}
+                      onChange={(e) => {
+                        const file = e.target.files?.[0];
+                        // 對既有的 meeting_id 補送，不走建立新會議那條
+                        if (file && activeMeeting) submitAudioFile(file, activeMeeting.meeting_id);
+                        e.target.value = '';
+                      }}
+                    />
+                  </label>
+                </div>
+              )}
+              {activeEditBlockedReason !== null && (
+                <div className="bg-slate-100 border-b border-slate-300 text-slate-700 text-xs p-3 shrink-0">
+                  <i className="fa-solid fa-lock mr-1"></i>
+                  {activeEditBlockedReason}
+                </div>
+              )}
+              {selection !== null && selection.source === 'local' && (
+                <div className="bg-amber-50 border-b border-amber-200 text-amber-800 text-xs p-3 shrink-0">
+                  <i className="fa-solid fa-hard-drive mr-1"></i>
+                  這是只存在本機瀏覽器、尚未搬到伺服器的舊紀錄，內容唯讀。
+                </div>
+              )}
               {activeJob ? (
                 <div className="flex-1 overflow-y-auto">
                   <JobDetail 
                     job={activeJob} 
-                    onUpdateJob={(updates) => updateJobInStateAndDB(activeJob.id, updates)}
+                    onUpdateJob={handleUpdateActiveMeeting}
                     onAlert={showAlert}
-                    onRetry={(id) => updateJobInStateAndDB(id, { status: JobStatus.PENDING, error: undefined })}
+                    onRetry={selection !== null && selection.source === 'server'
+                      ? handleRetryMeeting
+                      : showLocalRetryNotice}
                   />
                 </div>
               ) : (
@@ -438,10 +699,10 @@ const App: React.FC = () => {
                   </div>
                   <h2 className="text-xl font-bold text-slate-800 mb-2 tracking-tight">準備就緒</h2>
                   <p className="text-slate-500 max-w-sm mb-8 leading-relaxed text-sm">
-                    請從上方按鈕開始「建立新任務」來處理您的語音內容。
+                    上傳音檔後由伺服器轉錄與分析，這個分頁可以關掉，處理不會中斷。
                   </p>
                   <div className="flex gap-4 items-center">
-                    <FileUpload onFileSelect={addJob} />
+                    <FileUpload onFileSelect={addMeeting} />
                   </div>
                 </div>
               )}
@@ -457,7 +718,7 @@ const App: React.FC = () => {
         onConfirm={confirmConfig.onConfirm}
         isDestructive={confirmConfig.isDestructive}
         hideCancel={confirmConfig.hideCancel}
-        onCancel={() => setConfirmConfig(prev => ({ ...prev, isOpen: false }))}
+        onCancel={closeConfirm}
       />
     </div>
   );

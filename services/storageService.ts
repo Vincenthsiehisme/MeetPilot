@@ -101,6 +101,8 @@ const withConnection = async <T>(run: (db: IDBDatabase) => Promise<T>): Promise<
 
 // jobs store 的序列化寫入佇列：同一時間只有一筆交易在飛，後來的照呼叫順序排隊。
 // 任一筆失敗只 reject 給它自己的呼叫者，鏈本身吞掉結果繼續往下，後面的不會永遠卡住。
+// 前端已經不寫新的 Job（轉錄整條在 server），現在只剩刪除走這條佇列；佇列留著是因為
+// 連續刪多筆時仍然會同時開多筆交易。
 let jobWriteChain: Promise<void> = Promise.resolve();
 
 const enqueueJobWrite = <T>(task: () => Promise<T>): Promise<T> => {
@@ -109,14 +111,6 @@ const enqueueJobWrite = <T>(task: () => Promise<T>): Promise<T> => {
   return run;
 };
 
-const putJob = (job: Job): Promise<void> =>
-  withConnection(db => new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(STORE_JOBS, "readwrite");
-    tx.objectStore(STORE_JOBS).put(job);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  }));
-
 const deleteJob = (id: string): Promise<void> =>
   withConnection(db => new Promise<void>((resolve, reject) => {
     const tx = db.transaction(STORE_JOBS, "readwrite");
@@ -124,8 +118,6 @@ const deleteJob = (id: string): Promise<void> =>
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   }));
-
-export const saveJobToDB = (job: Job): Promise<void> => enqueueJobWrite(() => putJob(job));
 
 export const deleteJobFromDB = (id: string): Promise<void> => enqueueJobWrite(() => deleteJob(id));
 
@@ -137,14 +129,13 @@ export const getAllJobsFromDB = (): Promise<Job[]> =>
     request.onerror = () => reject(request.error);
   }));
 
-export const saveFileBlob = (id: string, blob: Blob): Promise<void> =>
-  withConnection(db => new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(STORE_FILES, "readwrite");
-    tx.objectStore(STORE_FILES).put(blob, id);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  }));
-
+/**
+ * 讀回一個還留在瀏覽器的音檔。
+ *
+ * 前端不再把音檔寫進 IndexedDB（上傳直接送 server），但**讀還是要留著**：搬遷報告會告訴使用者
+ * 「這幾場被退件、音檔只剩瀏覽器這一份」，沒有這支就等於叫他自己去開 DevTools 撈，
+ * 那不是提示是空頭支票。呼叫端在本機那一區提供實際的下載動作。
+ */
 export const getFileBlob = (id: string): Promise<Blob | null> =>
   withConnection(db => new Promise<Blob | null>((resolve, reject) => {
     const tx = db.transaction(STORE_FILES, "readonly");
