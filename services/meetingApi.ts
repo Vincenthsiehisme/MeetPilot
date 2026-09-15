@@ -1,0 +1,163 @@
+/**
+ * 前端與 server 之間的 HTTP 契約（W2）。
+ *
+ * 這個檔由 coordinator 擁有，T1 與 T2 只讀不改：兩邊各自寫一份型別的話，
+ * 對不上的那一刻不會有任何錯誤，只會在執行時變成「欄位是 undefined」。
+ *
+ * 只放型別與常數，不放任何實作，也不 import 任何帶 node 依賴的模組
+ * （`meetingStore.ts` 會把 `node:sqlite` 帶進前端 bundle，所以逐字稿的形狀在這裡自己寫一份）。
+ */
+import { Job, Meeting, TranscriptSegment } from '../types';
+import { AnalysisV2 } from './analysisContract';
+
+/** 音檔上傳的 Content-Type。刻意不是 JSON：這條路徑不經 body parser，body 直接 pipe 進檔案 */
+export const AUDIO_CONTENT_TYPE = 'application/octet-stream';
+
+/**
+ * 前端 polling 的間隔。
+ *
+ * **每一拍會打兩支 API**（清單一次、開著的那場詳情一次），3 秒一拍就是 40 次/分鐘，
+ * 而 `/api` 的限流預設是每分鐘 60 次、同一個 IP 共用一個桶。所以開第二個分頁看同一台 server
+ * 就會撞 429。這個數字不是「還很寬鬆」，是「只剩一個分頁的餘裕」，要加 polling 對象之前先算。
+ */
+export const MEETING_POLL_INTERVAL_MS = 3000;
+
+/** `POST /api/meetings` */
+export interface CreateMeetingRequest {
+  fileName: string;
+  fileSize: number;
+  title?: string;
+  meetingContext?: string;
+  tags?: string[];
+}
+
+/**
+ * API 回出去的 Meeting。
+ *
+ * `Meeting` 是資料庫那一列的形狀，`has_audio` 不在裡面——它是 server 當下去看檔案系統的結果
+ * （`audioStore.exists`），不是欄位。分開兩個型別是刻意的：把它塞進 `Meeting` 會讓從資料庫
+ * 讀出來的物件型別上宣稱有這個欄位、實際上沒有。
+ *
+ * **為什麼前端非要它不可**：`CREATED` 現在是兩種完全不同的處境合用一個狀態——
+ * 「建立了還沒上傳，等使用者給音檔」與「retry 之後在佇列裡排隊，音檔好好地在 server 上」。
+ * 光看狀態分不出來，而兩者要做的事相反：前者要顯示上傳入口、不該 polling、該能被批次清除；
+ * 後者正在跑，顯示上傳入口是假話（照做會把 retry 刻意保留的逐字稿與游標刪掉）。
+ */
+export interface MeetingView extends Meeting {
+  /** server 端這場會的音檔現在在不在。`CREATED` 的兩種處境靠它分開 */
+  has_audio: boolean;
+}
+
+/** `POST /api/meetings` 201、`PUT /api/meetings/:id/audio` 202、`POST /api/meetings/:id/retry` 202 */
+export interface MeetingResponse {
+  meeting: MeetingView;
+}
+
+/** `GET /api/meetings` */
+export interface MeetingListResponse {
+  meetings: MeetingView[];
+}
+
+/** `GET /api/meetings/:id`。transcript 與 analysis 還沒產出時是 null，不是空物件 */
+export interface MeetingDetailResponse {
+  meeting: MeetingView;
+  transcript: { segments: TranscriptSegment[]; polished_content: string | null } | null;
+  analysis: AnalysisV2 | null;
+  tags: string[];
+}
+
+/**
+ * 處理中的狀態。這幾個狀態下 server 自己正在寫這場會的資料，所以外面的寫入一律擋掉。
+ *
+ * 不擋的後果不是衝突而是**安靜消失**：pipeline 在迴圈外讀一份逐字稿快照，每轉完一片就把
+ * 那份快照加上新片寫回去，所以轉錄途中存進來的潤稿或人工修正會在下一片寫回時被蓋掉，
+ * 而 server 那一刻回的是 200。使用者看到「已儲存」，然後內容自己不見。
+ */
+export const BUSY_STATUSES = ['TRANSCRIBING', 'ANALYZING', 'LINKING'] as const;
+
+/**
+ * `PATCH /api/meetings/:id/transcript`
+ *
+ * 兩個欄位都是選填，只更新有給的那些。`polished_content: null` 是「把潤稿清掉」，
+ * 跟「沒給這個欄位」是兩件事：JSON 裡它們長得不一樣，用 `?? 原值` 把兩者併掉
+ * 會讓「清除潤稿」這個動作安靜失效。
+ *
+ * 狀態在 `BUSY_STATUSES` 裡時回 **409**，理由見那個常數。`PATCH .../analysis` 同。
+ */
+export interface PatchTranscriptRequest {
+  segments?: TranscriptSegment[];
+  polished_content?: string | null;
+}
+
+export interface PatchTranscriptResponse {
+  transcript: { segments: TranscriptSegment[]; polished_content: string | null };
+}
+
+/** `PATCH /api/meetings/:id/analysis`。整份覆寫，前端送的是編輯後的完整 v2 */
+export interface PatchAnalysisRequest {
+  analysis: AnalysisV2;
+}
+
+export interface PatchAnalysisResponse {
+  analysis: AnalysisV2;
+}
+
+/**
+ * `DELETE /api/meetings/:id`
+ *
+ * 正在跑的（`TRANSCRIBING` / `ANALYZING` / `LINKING`）回 409 而不是排隊刪除：
+ * 序列佇列一次只跑一場，等它結束是有限的等待，而「刪到一半被 pipeline 寫回去」
+ * 沒有任何症狀，事後也看不出來發生過。
+ */
+export interface DeleteMeetingResponse {
+  deleted: true;
+  meetingId: string;
+}
+
+/** `POST /api/meetings/import`（W1 既有） */
+export interface ImportRequest {
+  jobs: Job[];
+  blobIds: string[];
+}
+
+/** 音檔留在瀏覽器的那幾筆屬於哪一群。rejected 那群最要緊，那正是之後要重跑的 */
+export type AudioResidencyGroup = 'imported' | 'skippedExisting' | 'rejected' | 'orphan';
+
+export interface ImportResponse {
+  imported: string[];
+  skippedExisting: string[];
+  rejected: { jobId: string | null; reason: string }[];
+  notes: { jobId: string; note: string }[];
+  audioStillInBrowser: { meetingId: string; group: AudioResidencyGroup }[];
+}
+
+/**
+ * `PUT /api/meetings/:id/audio` 兩種 409 的訊息正本。
+ *
+ * server 與前端共用同一份字面值。server 發、前端認：這兩種 409 的共同點是**音檔已經在
+ * server 上或正在進去的路上**，所以失敗訊息後面不能再接「這場會還沒有音檔，去補上音檔」
+ * 那段建議——那是假話，而且叫使用者再做一次剛被拒絕的動作。
+ * 各留一份字面值的話，改了 server 這邊前端會安靜地認不出來，回頭接上那段假話。
+ */
+export const audioUploadInFlightError = (meetingId: string): string =>
+  `Meeting ${meetingId} 已經有一個上傳正在進行，等它結束再送`;
+
+export const audioUploadQueuedError = (meetingId: string): string =>
+  `Meeting ${meetingId} 已經在佇列裡，等它跑完或失敗再重送音檔`;
+
+/** 前端用來認出上面那兩種 409 的線索。比對 meeting_id 以外的部分，前綴（例如「【處理失敗】」）不影響 */
+export const AUDIO_ALREADY_ON_SERVER_HINTS = [
+  '已經有一個上傳正在進行',
+  '已經在佇列裡',
+] as const;
+
+/**
+ * 所有錯誤回應的形狀。server 的 `handleStoreError` 與 `handleApiError` 都送這個。
+ *
+ * `rawError` 只有 Gemini 那條路徑（`handleApiError`）會帶，是既有行為。寫進契約是因為它確實
+ * 送得出去，不寫等於契約說謊；前端不讀它，新的程式碼也不要開始讀。
+ */
+export interface ApiErrorResponse {
+  error: string;
+  rawError?: string;
+}

@@ -1,0 +1,203 @@
+/**
+ * server 端音訊切片（W2 T1，SDD 1.1）。
+ *
+ * 為什麼不沿用搬家前那套瀏覽器切片（W2 之前的 `generateAudioSlices`，已隨前端流程一起刪掉）：
+ * 那條路徑是整檔 `arrayBuffer()` → 整檔 `decodeAudioData()` → `OfflineAudioContext` 整檔重取樣，
+ * 記憶體佔用跟會議長度成正比，106 分鐘的會上傳後分頁直接崩潰。ffmpeg 一次只讀它要的那一段，
+ * 記憶體跟檔案長度無關。
+ *
+ * 兩支執行檔一律經注入的 `CommandRunner` 呼叫，不在這個檔裡直接 spawn：
+ * 測試機器上不一定裝得到 ffmpeg，而「切片規則對不對」與「spawn 出來的東西會不會動」
+ * 是兩件事，後者不該擋住前者的測試。
+ */
+import { spawn } from 'node:child_process';
+
+/** 一片的計畫。時間是相對整個音檔的絕對秒數，durationSeconds 含 overlap */
+export interface SlicePlanEntry {
+  index: number;
+  startSeconds: number;
+  durationSeconds: number;
+}
+
+const isPositiveFinite = (value: unknown): boolean =>
+  typeof value === 'number' && Number.isFinite(value) && value > 0;
+
+/**
+ * 排出整份切片計畫。純函式，不碰任何 I/O。
+ *
+ * 規則跟 `generateAudioSlices` 一致：第 N 片涵蓋 [start_N, start_N + D + O]，
+ * 第 N+1 片從 start_N + D 開始，所以相鄰兩片有 O 秒重疊，`mergeSliceTranscript` 靠這段去重。
+ * 最後一片會被總長度夾短，`durationSeconds` 要回報實際長度——傳錯的話
+ * `normalizeTranscribedSegments` 會把時間夾到不存在的範圍。
+ *
+ * 總長度不是有限正數（0、負數、NaN、Infinity）一律拋錯，不回空陣列：
+ * 回空陣列會讓整場會「轉錄成功但一個字都沒有」，而那跟真的沒人說話長得一樣。
+ */
+export function planSlices(
+  totalDurationSeconds: number,
+  sliceDurationSeconds: number,
+  overlapSeconds: number,
+): SlicePlanEntry[] {
+  if (!isPositiveFinite(totalDurationSeconds)) {
+    throw new Error(`planSlices: 音訊總長度必須是有限正數，收到 ${JSON.stringify(totalDurationSeconds)}`);
+  }
+  if (!isPositiveFinite(sliceDurationSeconds)) {
+    throw new Error(`planSlices: 切片長度必須是有限正數，收到 ${JSON.stringify(sliceDurationSeconds)}`);
+  }
+  if (typeof overlapSeconds !== 'number' || !Number.isFinite(overlapSeconds) || overlapSeconds < 0) {
+    throw new Error(`planSlices: overlap 必須是有限非負數，收到 ${JSON.stringify(overlapSeconds)}`);
+  }
+
+  const plan: SlicePlanEntry[] = [];
+  let start = 0;
+  while (start < totalDurationSeconds) {
+    const end = Math.min(start + sliceDurationSeconds + overlapSeconds, totalDurationSeconds);
+    plan.push({ index: plan.length, startSeconds: start, durationSeconds: end - start });
+    start += sliceDurationSeconds;
+  }
+  return plan;
+}
+
+export interface CommandResult {
+  /** 被訊號殺掉時是 null，那不是成功，跟非 0 一起處理 */
+  code: number | null;
+  stdout: Buffer;
+  stderr: string;
+}
+
+export type CommandRunner = (executable: string, args: readonly string[]) => Promise<CommandResult>;
+
+// stderr 只留尾端：ffmpeg 正常跑也會印一大段 banner 與 stream 資訊，真正的錯誤在最後幾行。
+// 全部留著會把錯誤訊息灌成幾十 KB，反而看不到重點
+const MAX_STDERR_KEPT = 4000;
+const ERROR_STDERR_TAIL = 600;
+
+const tail = (text: string, length: number): string => {
+  const trimmed = text.trim();
+  return trimmed.length <= length ? trimmed : `…${trimmed.slice(-length)}`;
+};
+
+/** 真的去 spawn 的 runner。正式啟動用這支，測試注入假的 */
+export const spawnCommandRunner: CommandRunner = (executable, args) =>
+  new Promise<CommandResult>((resolve, reject) => {
+    const child = spawn(executable, [...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const chunks: Buffer[] = [];
+    let stderr = '';
+
+    child.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString('utf8');
+      if (stderr.length > MAX_STDERR_KEPT) stderr = stderr.slice(-MAX_STDERR_KEPT);
+    });
+    // spawn 本身失敗（找不到執行檔、沒有執行權限）走 error，不會有 close
+    child.on('error', reject);
+    child.on('close', (code) => resolve({ code, stdout: Buffer.concat(chunks), stderr }));
+  });
+
+export interface FfmpegPaths {
+  ffmpeg: string;
+  ffprobe: string;
+}
+
+/** 沒設就走 PATH 上的 ffmpeg / ffprobe。設了空字串等同沒設，不要拿空字串去 spawn */
+export const resolveFfmpegPaths = (env: NodeJS.ProcessEnv): FfmpegPaths => ({
+  ffmpeg: (env.MEETPILOT_FFMPEG ?? '').trim() || 'ffmpeg',
+  ffprobe: (env.MEETPILOT_FFPROBE ?? '').trim() || 'ffprobe',
+});
+
+export interface AudioSlicerOptions {
+  ffmpegPath: string;
+  ffprobePath: string;
+  /** 預設 spawnCommandRunner；測試注入假的 */
+  runner?: CommandRunner;
+}
+
+// 明寫的型別守衛，不靠自動 narrowing：這個 repo 的 tsconfig 沒開 strict（同 jobMigration.ts 的 isRejected）
+const isSpawnNotFound = (err: unknown): boolean =>
+  (err as { code?: unknown } | null | undefined)?.code === 'ENOENT';
+
+export function createAudioSlicer(options: AudioSlicerOptions) {
+  const runner = options.runner ?? spawnCommandRunner;
+
+  const run = async (executable: string, args: readonly string[], what: string): Promise<CommandResult> => {
+    let result: CommandResult;
+    try {
+      result = await runner(executable, args);
+    } catch (err) {
+      if (isSpawnNotFound(err)) {
+        // 原始的 spawn ENOENT 只說「no such file or directory」，看不出缺的是 ffmpeg。
+        // 這是最常見的一種安裝問題，訊息要直接講怎麼解決
+        throw new Error(
+          `找不到 ${executable}：server 端切片需要 ffmpeg 與 ffprobe。請先安裝（macOS：brew install ffmpeg），`
+          + '或用 MEETPILOT_FFMPEG / MEETPILOT_FFPROBE 指定完整路徑',
+        );
+      }
+      throw err;
+    }
+
+    if (result.code !== 0) {
+      throw new Error(`${what}失敗（${executable} 結束碼 ${result.code}）：${tail(result.stderr, ERROR_STDERR_TAIL)}`);
+    }
+    return result;
+  };
+
+  return {
+    /** 用 ffprobe 讀總長度。讀不出有限正數（0、NaN、Infinity）就拋錯，不回 0 也不回 Infinity：
+     *  那兩個值拿去當切片迴圈的上限，一個切不出東西、一個永遠不停 */
+    probeDurationSeconds: async (filePath: string): Promise<number> => {
+      const result = await run(
+        options.ffprobePath,
+        ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', filePath],
+        'ffprobe 讀取音訊長度',
+      );
+      const raw = result.stdout.toString('utf8').trim();
+      const duration = Number(raw);
+      if (!isPositiveFinite(duration)) {
+        throw new Error(
+          `ffprobe 沒有回出有限正數的長度（拿到 ${JSON.stringify(raw)}），無法切片：${filePath}`,
+        );
+      }
+      return duration;
+    },
+
+    /**
+     * 切出一片 16kHz 單聲道 WAV。
+     *
+     * `-ss` 放在 `-i` 前面是 input seeking：ffmpeg 直接跳到那個位置，不用把前面整段解碼過去。
+     * 放在 `-i` 後面會變成逐格解碼到指定時間，長會議的後段切片會慢到不能用。
+     */
+    readSlice: async (filePath: string, startSeconds: number, durationSeconds: number): Promise<Buffer> => {
+      if (!Number.isFinite(startSeconds) || startSeconds < 0) {
+        throw new Error(`readSlice: 起點必須是非負有限數，收到 ${JSON.stringify(startSeconds)}`);
+      }
+      if (!isPositiveFinite(durationSeconds)) {
+        throw new Error(`readSlice: 片長必須是有限正數，收到 ${JSON.stringify(durationSeconds)}`);
+      }
+
+      const result = await run(
+        options.ffmpegPath,
+        [
+          '-ss', String(startSeconds),
+          '-t', String(durationSeconds),
+          '-i', filePath,
+          '-ar', '16000',
+          '-ac', '1',
+          '-f', 'wav',
+          'pipe:1',
+        ],
+        `ffmpeg 切出 ${startSeconds}s 起算 ${durationSeconds}s 的片段`,
+      );
+
+      if (result.stdout.length === 0) {
+        // 結束碼 0 但沒有輸出：這一片會變成「送了空音檔給 Gemini」，回來的空逐字稿
+        // 跟「這段真的沒人說話」分不開，所以在這裡就爆
+        throw new Error(
+          `ffmpeg 在 ${startSeconds}s 起算 ${durationSeconds}s 的片段沒有輸出任何資料：${filePath}`,
+        );
+      }
+      return result.stdout;
+    },
+  };
+}
+
+export type AudioSlicer = ReturnType<typeof createAudioSlicer>;

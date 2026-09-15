@@ -1,13 +1,36 @@
 
 import { Job, TranscriptSegment, ChatMessage } from "../types";
 
-const downloadFile = (content: string, fileName: string, contentType: string) => {
+/**
+ * revoke 要等的時間。
+ *
+ * 瀏覽器是**非同步**去讀這個 blob URL 的：`click()` 只是把下載排進去，真正開始讀檔在之後。
+ * 同一個 tick 就 revoke 會跟下載啟動搶時間，Safari 上會下載到空檔或整個不動。
+ * 多留一秒才收記憶體，跟「檔案沒下載到」比起來不是同一個量級的代價 ——
+ * 尤其這條路徑是本機音檔唯一的出口，那份音檔失敗就真的沒了。
+ */
+const REVOKE_DELAY_MS = 1000;
+
+/**
+ * 把一份 Blob 交給使用者下載。所有下載都走這裡，不要各寫一份。
+ *
+ * anchor 要先掛進 DOM 再 click：部分 Firefox 版本對沒進過文件樹的 detached anchor，
+ * `click()` 不會觸發下載，而且不會報錯 —— 使用者按了沒反應，也不知道要回報什麼。
+ */
+export const downloadBlob = (blob: Blob, fileName: string) => {
+  const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
-  const file = new Blob([content], { type: contentType });
-  a.href = URL.createObjectURL(file);
+  a.href = url;
   a.download = fileName;
+  a.style.display = "none";
+  document.body.appendChild(a);
   a.click();
-  URL.revokeObjectURL(a.href);
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), REVOKE_DELAY_MS);
+};
+
+const downloadFile = (content: string, fileName: string, contentType: string) => {
+  downloadBlob(new Blob([content], { type: contentType }), fileName);
 };
 
 // --- Time Formatters ---

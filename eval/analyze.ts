@@ -3,8 +3,13 @@
  *
  *   npx tsx --env-file-if-exists=.env eval/analyze.ts
  *
- * 沿用 server.ts `/api/gemini/analyze` 的 systemInstruction 與 responseSchema，
- * 所以它測的是「現在這套分析出來的標籤能不能拿來關聯」，不是另一套為評測調過的 prompt。
+ * 沿用正式分析路徑的 systemInstruction 與 responseSchema，所以它測的是「現在這套分析出來的
+ * 標籤能不能拿來關聯」，不是另一套為評測調過的 prompt。
+ *
+ * **正本在 `services/geminiServerClient.ts` 的 `analyzeTranscript`**（W2 之後；在那之前是
+ * `server.ts` 的 `/api/gemini/analyze`，那條路由已經隨前端搬到 server 而刪除）。
+ * 下面這份是複本，兩邊會各自漂移，而這支評測的意義正是「測現在這套 prompt」——
+ * 改動正本時要同一次改這裡，或把它換成 import 同一份常數。
  *
  * 同一場會的多個音檔（錄音被切斷）在這裡依序串接成一份逐字稿再送出。這是 SDD D-001
  * 「最小工作單元是 Meeting 不是 Job」在評測端的落實：不合併的話，同一場會會變成兩個

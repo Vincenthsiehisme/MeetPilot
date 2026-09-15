@@ -12,8 +12,6 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@ffmpeg/ffmpeg": "^0.12.15",
-    "@ffmpeg/util": "^0.12.2",
     "@google/genai": "^1.38.0",
     "express": "^5.2.1",
     "lucide-react": "^1.0.1",

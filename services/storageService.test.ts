@@ -1,14 +1,14 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { Job, JobStatus } from '../types';
 
-// 最小的 IndexedDB 替身：只做 open / transaction / objectStore.put|delete，
+// 最小的 IndexedDB 替身：只做 open / transaction / objectStore.delete，
 // 交易何時 complete 或 error 由測試手動觸發，才能驗證「第二筆在第一筆 oncomplete 之後才開始」。
 // open 的次數、close 與 versionchange 也記下來，才能驗證連線是共用的。
+// 佇列現在只剩刪除在用（前端不再寫新的 Job，轉錄整條在 server），所以這個檔一律用 deleteJobFromDB 驗佇列。
 type FakeTx = {
   oncomplete: (() => void) | null;
   onerror: (() => void) | null;
   error: Error | null;
-  objectStore: (name: string) => { put: (v: unknown) => void; delete: (k: unknown) => void };
+  objectStore: (name: string) => { delete: (k: unknown) => void };
 };
 
 type FakeDB = {
@@ -30,7 +30,6 @@ type FakeRequest = {
 };
 
 type FakeIDB = {
-  puts: unknown[];
   deletes: unknown[];
   txs: FakeTx[];
   dbs: FakeDB[];
@@ -50,7 +49,6 @@ type FakeIDB = {
 
 const makeFakeIDB = (): FakeIDB => {
   const fake: FakeIDB = {
-    puts: [],
     deletes: [],
     txs: [],
     dbs: [],
@@ -79,7 +77,6 @@ const makeFakeIDB = (): FakeIDB => {
             onerror: null,
             error: null,
             objectStore: () => ({
-              put: (v: unknown) => { fake.puts.push(v); },
               delete: (k: unknown) => { fake.deletes.push(k); }
             })
           };
@@ -119,17 +116,6 @@ const makeFakeIDB = (): FakeIDB => {
 
 const tick = () => new Promise<void>(resolve => setTimeout(resolve, 0));
 
-const makeJob = (id: string): Job => ({
-  id,
-  fileName: `${id}.wav`,
-  fileSize: 1,
-  createdAt: 1,
-  updatedAt: 1,
-  status: JobStatus.PENDING,
-  currentStep: 0,
-  steps: []
-});
-
 describe('storageService jobs 寫入佇列', () => {
   let fake: FakeIDB;
   // storageService 把連線快取在模組層，靜態 import 會讓快取跨測試殘留，
@@ -143,31 +129,28 @@ describe('storageService jobs 寫入佇列', () => {
     storage = await import('./storageService');
   });
 
-  it('連續三次寫入照呼叫順序執行，且下一筆在前一筆 oncomplete 之後才開始', async () => {
-    const job1 = makeJob('job_1');
-    const job2 = makeJob('job_2');
-    const job3 = makeJob('job_3');
+  it('連續三次刪除照呼叫順序執行，且下一筆在前一筆 oncomplete 之後才開始', async () => {
     const states: string[] = [];
 
-    const p1 = storage.saveJobToDB(job1).then(() => { states.push('p1'); });
-    const p2 = storage.saveJobToDB(job2).then(() => { states.push('p2'); });
-    const p3 = storage.saveJobToDB(job3).then(() => { states.push('p3'); });
+    const p1 = storage.deleteJobFromDB('job_1').then(() => { states.push('p1'); });
+    const p2 = storage.deleteJobFromDB('job_2').then(() => { states.push('p2'); });
+    const p3 = storage.deleteJobFromDB('job_3').then(() => { states.push('p3'); });
 
     await tick();
-    expect(fake.puts).toEqual([job1]);
+    expect(fake.deletes).toEqual(['job_1']);
     expect(fake.txs).toHaveLength(1);
     expect(states).toEqual([]);
 
     fake.txs[0].oncomplete!();
     await tick();
     expect(states).toEqual(['p1']);
-    expect(fake.puts).toEqual([job1, job2]);
+    expect(fake.deletes).toEqual(['job_1', 'job_2']);
     expect(fake.txs).toHaveLength(2);
 
     fake.txs[1].oncomplete!();
     await tick();
     expect(states).toEqual(['p1', 'p2']);
-    expect(fake.puts).toEqual([job1, job2, job3]);
+    expect(fake.deletes).toEqual(['job_1', 'job_2', 'job_3']);
     expect(fake.txs).toHaveLength(3);
 
     fake.txs[2].oncomplete!();
@@ -176,25 +159,21 @@ describe('storageService jobs 寫入佇列', () => {
   });
 
   it('某一筆失敗 reject 給呼叫者，後面那筆照常開始並完成', async () => {
-    const job1 = makeJob('job_1');
-    const job2 = makeJob('job_2');
-    const job3 = makeJob('job_3');
-
-    const p1 = storage.saveJobToDB(job1);
-    const p2 = storage.saveJobToDB(job2);
-    const p3 = storage.saveJobToDB(job3);
+    const p1 = storage.deleteJobFromDB('job_1');
+    const p2 = storage.deleteJobFromDB('job_2');
+    const p3 = storage.deleteJobFromDB('job_3');
     const p2Rejection = p2.then(() => 'resolved', (e: Error) => e.message);
 
     await tick();
     fake.txs[0].oncomplete!();
     await tick();
-    expect(fake.puts).toEqual([job1, job2]);
+    expect(fake.deletes).toEqual(['job_1', 'job_2']);
 
     fake.txs[1].error = new Error('QuotaExceededError');
     fake.txs[1].onerror!();
     await tick();
     expect(await p2Rejection).toBe('QuotaExceededError');
-    expect(fake.puts).toEqual([job1, job2, job3]);
+    expect(fake.deletes).toEqual(['job_1', 'job_2', 'job_3']);
     expect(fake.txs).toHaveLength(3);
 
     fake.txs[2].oncomplete!();
@@ -202,28 +181,10 @@ describe('storageService jobs 寫入佇列', () => {
     await expect(p3).resolves.toBeUndefined();
   });
 
-  it('deleteJobFromDB 與 saveJobToDB 共用同一條佇列，順序等於呼叫順序', async () => {
-    const job1 = makeJob('job_1');
-    const p1 = storage.saveJobToDB(job1);
-    const p2 = storage.deleteJobFromDB('job_1');
-
-    await tick();
-    expect(fake.puts).toEqual([job1]);
-    expect(fake.deletes).toEqual([]);
-
-    fake.txs[0].oncomplete!();
-    await tick();
-    expect(fake.deletes).toEqual(['job_1']);
-
-    fake.txs[1].oncomplete!();
-    await expect(p1).resolves.toBeUndefined();
-    await expect(p2).resolves.toBeUndefined();
-  });
-
-  it('連續三次寫入共用同一條連線，只 open 一次', async () => {
-    const p1 = storage.saveJobToDB(makeJob('job_1'));
-    const p2 = storage.saveJobToDB(makeJob('job_2'));
-    const p3 = storage.saveJobToDB(makeJob('job_3'));
+  it('連續三次刪除共用同一條連線，只 open 一次', async () => {
+    const p1 = storage.deleteJobFromDB('job_1');
+    const p2 = storage.deleteJobFromDB('job_2');
+    const p3 = storage.deleteJobFromDB('job_3');
 
     await tick();
     fake.txs[0].oncomplete!();
@@ -236,8 +197,8 @@ describe('storageService jobs 寫入佇列', () => {
     expect(fake.opens).toBe(1);
   });
 
-  it('收到 versionchange 就關掉連線，下一次寫入重新 open', async () => {
-    const p1 = storage.saveJobToDB(makeJob('job_1'));
+  it('收到 versionchange 就關掉連線，下一次刪除重新 open', async () => {
+    const p1 = storage.deleteJobFromDB('job_1');
     await tick();
     fake.txs[0].oncomplete!();
     await expect(p1).resolves.toBeUndefined();
@@ -247,7 +208,7 @@ describe('storageService jobs 寫入佇列', () => {
     db.onversionchange!();
     expect(db.closed).toBe(true);
 
-    const p2 = storage.saveJobToDB(makeJob('job_2'));
+    const p2 = storage.deleteJobFromDB('job_2');
     await tick();
     expect(fake.opens).toBe(2);
 
@@ -257,16 +218,15 @@ describe('storageService jobs 寫入佇列', () => {
 
   it('open 同步拋錯時呼叫者拿到 reject，下一次呼叫會重新 open', async () => {
     fake.throwNextOpen = true;
-    const p1 = storage.saveJobToDB(makeJob('job_1'));
+    const p1 = storage.deleteJobFromDB('job_1');
     await expect(p1).rejects.toThrow('SecurityError');
     expect(fake.opens).toBe(1);
-    expect(fake.puts).toEqual([]);
+    expect(fake.deletes).toEqual([]);
 
-    const job2 = makeJob('job_2');
-    const p2 = storage.saveJobToDB(job2);
+    const p2 = storage.deleteJobFromDB('job_2');
     await tick();
     expect(fake.opens).toBe(2);
-    expect(fake.puts).toEqual([job2]);
+    expect(fake.deletes).toEqual(['job_2']);
 
     fake.txs[0].oncomplete!();
     await expect(p2).resolves.toBeUndefined();
@@ -274,32 +234,31 @@ describe('storageService jobs 寫入佇列', () => {
 
   it('open 失敗時呼叫者拿到 reject，下一次呼叫會重新 open', async () => {
     fake.failNextOpen = true;
-    const p1 = storage.saveJobToDB(makeJob('job_1'));
+    const p1 = storage.deleteJobFromDB('job_1');
     await expect(p1).rejects.toThrow('OpenFailed');
     expect(fake.opens).toBe(1);
-    expect(fake.puts).toEqual([]);
+    expect(fake.deletes).toEqual([]);
 
-    const job2 = makeJob('job_2');
-    const p2 = storage.saveJobToDB(job2);
+    const p2 = storage.deleteJobFromDB('job_2');
     await tick();
     expect(fake.opens).toBe(2);
-    expect(fake.puts).toEqual([job2]);
+    expect(fake.deletes).toEqual(['job_2']);
 
     fake.txs[0].oncomplete!();
     await expect(p2).resolves.toBeUndefined();
   });
+
   it('open 被其他分頁擋住時呼叫者拿到 reject，下一次呼叫會重新 open', async () => {
     fake.blockNextOpen = true;
-    const p1 = storage.saveJobToDB(makeJob('job_1'));
+    const p1 = storage.deleteJobFromDB('job_1');
     await expect(p1).rejects.toThrow('其他分頁');
     expect(fake.opens).toBe(1);
-    expect(fake.puts).toEqual([]);
+    expect(fake.deletes).toEqual([]);
 
-    const job2 = makeJob('job_2');
-    const p2 = storage.saveJobToDB(job2);
+    const p2 = storage.deleteJobFromDB('job_2');
     await tick();
     expect(fake.opens).toBe(2);
-    expect(fake.puts).toEqual([job2]);
+    expect(fake.deletes).toEqual(['job_2']);
 
     fake.txs[0].oncomplete!();
     await expect(p2).resolves.toBeUndefined();
@@ -307,7 +266,7 @@ describe('storageService jobs 寫入佇列', () => {
 
   it('blocked 之後才來的 onsuccess 不留下沒人關的連線', async () => {
     fake.blockNextOpen = true;
-    const p1 = storage.saveJobToDB(makeJob('job_1'));
+    const p1 = storage.deleteJobFromDB('job_1');
     await expect(p1).rejects.toThrow('其他分頁');
 
     // 遲到的 onsuccess 在下一個 microtask 才跑
@@ -316,16 +275,15 @@ describe('storageService jobs 寫入佇列', () => {
     expect(fake.dbs[0].closed).toBe(true);
   });
 
-  it('交易開到一半連線被關掉（InvalidStateError）時重開連線再試一次，寫入照樣完成', async () => {
+  it('交易開到一半連線被關掉（InvalidStateError）時重開連線再試一次，刪除照樣完成', async () => {
     fake.txErrors = [new DOMException('closed', 'InvalidStateError')];
-    const job1 = makeJob('job_1');
-    const p1 = storage.saveJobToDB(job1);
+    const p1 = storage.deleteJobFromDB('job_1');
 
     await tick();
     // 第一次 db.transaction() 就丟錯，重開一條連線後才真的開出交易
     expect(fake.opens).toBe(2);
     expect(fake.txs).toHaveLength(1);
-    expect(fake.puts).toEqual([job1]);
+    expect(fake.deletes).toEqual(['job_1']);
 
     fake.txs[0].oncomplete!();
     await expect(p1).resolves.toBeUndefined();
@@ -336,12 +294,12 @@ describe('storageService jobs 寫入佇列', () => {
       new DOMException('closed', 'InvalidStateError'),
       new DOMException('closed', 'InvalidStateError')
     ];
-    const p1 = storage.saveJobToDB(makeJob('job_1'));
+    const p1 = storage.deleteJobFromDB('job_1');
 
     await expect(p1).rejects.toThrow('closed');
     expect(fake.opens).toBe(2);
     expect(fake.txs).toEqual([]);
-    expect(fake.puts).toEqual([]);
+    expect(fake.deletes).toEqual([]);
   });
 
   it('重開後第二次也失敗時，那條作廢的連線不留在快取，下一次呼叫直接重開', async () => {
@@ -350,11 +308,11 @@ describe('storageService jobs 寫入佇列', () => {
       new DOMException('closed', 'InvalidStateError'),
       new DOMException('closed', 'InvalidStateError')
     ];
-    await expect(storage.saveJobToDB(makeJob('job_1'))).rejects.toThrow('closed');
+    await expect(storage.deleteJobFromDB('job_1')).rejects.toThrow('closed');
     expect(fake.opens).toBe(2);
 
     // 第二次呼叫：快取已空，第一次 transaction 就該成功，不必再賠一輪
-    const p2 = storage.saveJobToDB(makeJob('job_2'));
+    const p2 = storage.deleteJobFromDB('job_2');
     await tick();
     expect(fake.opens).toBe(3);
     expect(fake.txs).toHaveLength(1);
@@ -364,28 +322,26 @@ describe('storageService jobs 寫入佇列', () => {
 
   it('非 InvalidStateError 的錯誤直接上拋，不重開連線', async () => {
     fake.txErrors = [new DOMException('quota', 'QuotaExceededError')];
-    const p1 = storage.saveJobToDB(makeJob('job_1'));
+    const p1 = storage.deleteJobFromDB('job_1');
 
     await expect(p1).rejects.toThrow('quota');
     expect(fake.opens).toBe(1);
-    expect(fake.puts).toEqual([]);
+    expect(fake.deletes).toEqual([]);
   });
 
   it('重試發生在佇列的那一格裡，不會插隊也不會卡住後面', async () => {
     fake.txErrors = [new DOMException('closed', 'InvalidStateError')];
-    const job1 = makeJob('job_1');
-    const job2 = makeJob('job_2');
-    const p1 = storage.saveJobToDB(job1);
-    const p2 = storage.saveJobToDB(job2);
+    const p1 = storage.deleteJobFromDB('job_1');
+    const p2 = storage.deleteJobFromDB('job_2');
 
     await tick();
     // 第一筆在重試，第二筆還沒開始
-    expect(fake.puts).toEqual([job1]);
+    expect(fake.deletes).toEqual(['job_1']);
     expect(fake.txs).toHaveLength(1);
 
     fake.txs[0].oncomplete!();
     await tick();
-    expect(fake.puts).toEqual([job1, job2]);
+    expect(fake.deletes).toEqual(['job_1', 'job_2']);
 
     fake.txs[1].oncomplete!();
     await expect(p1).resolves.toBeUndefined();

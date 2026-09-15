@@ -94,7 +94,7 @@ describe('mergeSliceTranscript', () => {
   });
 
   it('overlapSeconds 預設值就是 SLICE_OVERLAP_SECONDS（15），省略第 6 參數跟明傳 15 一樣', () => {
-    // 常數被改值或 default 沒接上常數時，這條會壞；App.tsx 與 generateAudioSlices 都靠這個值對齊
+    // 常數被改值或 default 沒接上常數時，這條會壞；planSlices 與 transcriptionPipeline 都靠這個值對齊
     expect(SLICE_OVERLAP_SECONDS).toBe(15);
 
     const existing = [seg(600, 640, 'overshoot')];
