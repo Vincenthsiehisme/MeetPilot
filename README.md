@@ -97,7 +97,23 @@ server 端一次只跑一場會（序列佇列），理由是 Gemini 的限流�
 { sliceIndex, verdict: 'duplicate' | 'gap' | 'inconclusive', similarity, droppedSegments }
 ```
 
-`verdict` 是 `gap` 不是警告，是**這份逐字稿在那個接縫確實缺了一段**。目前只回報不修補。
+`verdict` 是 `gap` 不是警告，是**那個接縫有一段音檔沒有人轉過**。
+
+**破洞會自動補。** 系統補轉一段跨接縫的橋接音檔，用同一套對齊接回去：橋接的開頭要接得上既有
+逐字稿、結尾要接得上後一片的開頭，**兩端都錨得住才算數**，錨不住就把窗放大重試（120、300、
+600 秒）。補回來的結果記在 `repair`：
+
+```
+repair: { outcome: 'repaired' | 'failed' | 'skipped', attempts, bridgeSeconds? }
+```
+
+- `repaired` — 補回來了
+- `failed` — **試過但補不回來，那一段內容確實不在逐字稿裡**。不補假內容，也不假裝成功
+- `skipped` — 沒試（修復關閉，或這場會的修復額度用完）。這是「還不知道有沒有缺」，跟 `failed` 不一樣
+
+修復要花額外的 Gemini 呼叫，所以有煞車：一場會預設最多 6 次（`MEETPILOT_SEAM_REPAIR_BUDGET`），
+`MEETPILOT_SEAM_REPAIR=off` 整個關掉。**預設是開的**：破洞是內容安靜消失，而音檔在分析成功
+之後就刪了，之後補不回來。
 
 刪除有一道幾何上限：只刪按新片自己的時間戳完全落在重疊區內的段落。超過那條線的音檔前一片
 根本沒有，不可能是重複。代價是接縫偶爾留下一段沒刪乾淨的重複（實測六個接縫有一個），

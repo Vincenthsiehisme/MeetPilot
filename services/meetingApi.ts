@@ -132,6 +132,20 @@ export interface SeamReportEntry {
   similarity: number;
   /** 判定為重複而丟掉的段數 */
   droppedSegments: number;
+  /**
+   * 破洞修復的結果（W2-2b）。只有 `verdict` 是 `gap` 的接縫才有。
+   *
+   * `repaired` 代表補回來了，`failed` 代表**試過但補不回來，那一段內容確實不在逐字稿裡**，
+   * `skipped` 代表沒試（關掉了、或這場會的修復額度用完了）。
+   * 三者不可混為一談：`failed` 是已知的缺口，`skipped` 是還不知道有沒有缺口
+   */
+  repair?: {
+    outcome: 'repaired' | 'failed' | 'skipped';
+    /** 實際送出去的轉錄次數 */
+    attempts: number;
+    /** 成功時用的橋接窗長度（秒） */
+    bridgeSeconds?: number;
+  };
 }
 
 /** `POST /api/meetings/import`（W1 既有） */
