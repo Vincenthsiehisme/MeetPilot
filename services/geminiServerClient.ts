@@ -80,6 +80,13 @@ export function isTransientLlmError(err: any): boolean {
   );
 }
 
+class RetryableLlmResponseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RetryableLlmResponseError';
+  }
+}
+
 export function formatTranscriptForAI(transcript: TranscriptSegment[]): string {
   return transcript.reduce((acc, curr, idx, arr) => {
     const prev = arr[idx - 1];
@@ -222,7 +229,13 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
   // Generate content with automatic retry and model fallback for high availability
   async function generateContentWithFallback(
     ai: GoogleGenAI,
-    request: { kind: LlmCallKind; contents: any; config?: any; preferredModel?: string }
+    request: {
+      kind: LlmCallKind;
+      contents: any;
+      config?: any;
+      preferredModel?: string;
+      validateResponse?: (response: any) => void;
+    }
   ): Promise<any> {
     const models = request.preferredModel
       ? [request.preferredModel, 'gemini-3.8-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest'].filter(
@@ -237,12 +250,16 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
       const model = models[modelIndex];
       for (let attempt = 0; attempt < 2; attempt++) {
         const startedAt = Date.now();
+        let response: any;
         try {
-          const response = await ai.models.generateContent({
+          response = await ai.models.generateContent({
             model,
             contents: request.contents,
             config: request.config,
           });
+          // HTTP 成功不等於有可用輸出。Gemini 實測會只消耗 thinking token、response.text 卻為空；
+          // 若在 fallback 外才檢查，整場會直接 FAILED，而且 retry 永遠只打同一個 model。
+          request.validateResponse?.(response);
           llmLogger.log({
             kind: request.kind,
             model,
@@ -256,7 +273,7 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
           return response;
         } catch (err: any) {
           lastError = err;
-          const isTransient = isTransientLlmError(err);
+          const isTransient = err instanceof RetryableLlmResponseError || isTransientLlmError(err);
 
           llmLogger.log({
             kind: request.kind,
@@ -266,6 +283,7 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
             streamed: false,
             latencyMs: Date.now() - startedAt,
             outcome: isTransient ? 'transient' : 'fatal',
+            response,
             error: err,
           });
 
@@ -343,6 +361,15 @@ Output JSON format:
         preferredModel: 'gemini-3.8-flash',
         contents: { parts },
         config: promptConfig,
+        validateResponse: (candidate) => {
+          if (
+            typeof candidate?.text !== 'string'
+            || candidate.text.trim() === ''
+            || cleanJsonString(candidate.text) === '{}'
+          ) {
+            throw new RetryableLlmResponseError('Gemini 轉錄回應沒有文字內容');
+          }
+        },
       });
 
       const rawText = typeof response.text === 'string' ? response.text : '';
