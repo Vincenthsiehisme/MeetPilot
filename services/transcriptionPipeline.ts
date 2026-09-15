@@ -17,6 +17,7 @@ import { AudioSlicer, planSlices } from './audioSlicer';
 import { GeminiServerClient } from './geminiServerClient';
 import { MeetingStore } from './meetingStore';
 import { SeamReportEntry } from './meetingApi';
+import { DEFAULT_SEAM_REPAIR, RepairResult, SeamRepairConfig, repairSeamGap } from './seamRepair';
 import { SLICE_OVERLAP_SECONDS, mergeSliceTranscript } from './transcriptMerge';
 
 /** 一片 10 分鐘，與搬家前瀏覽器那套的 sliceDurationMin = 10 一致 */
@@ -28,6 +29,8 @@ export interface TranscriptionPipelineDeps {
   audioStore: AudioFileStore;
   slicer: AudioSlicer;
   gemini: GeminiServerClient;
+  /** 破洞修復的設定。不傳就用預設（開啟、一場會最多 6 次額外轉錄） */
+  seamRepair?: SeamRepairConfig;
   /** 測試注入用；正式呼叫不要傳 */
   now?: () => number;
 }
@@ -51,6 +54,7 @@ export function buildPreviousContext(transcript: readonly TranscriptSegment[]): 
 export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
   const { store, audioStore, slicer, gemini } = deps;
   const now = deps.now ?? (() => Date.now());
+  const repairConfig = deps.seamRepair ?? DEFAULT_SEAM_REPAIR;
 
   const transcribe = async (meetingId: string): Promise<void> => {
     const audioPath = audioStore.pathFor(meetingId);
@@ -69,6 +73,8 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
     let transcript: TranscriptSegment[] = existing?.segments ?? [];
     // 續傳時沿用已經記下來的接縫：重跑的那幾片會覆寫自己那幾筆，跑過的不重算
     const seamReport: SeamReportEntry[] = store.getSeamReport(meetingId) ?? [];
+    // 額度跨接縫共用。續傳時重新給滿：這一輪是新的一次執行，沿用上一輪的殘額沒有意義
+    let repairBudgetLeft = repairConfig.budget;
 
     store.setSliceProgress(meetingId, processedSlices, plan.length, now());
 
@@ -85,7 +91,35 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
       });
 
       const merged = mergeSliceTranscript(transcript, segments, slice.startSeconds, slice.index === 0);
-      transcript = merged.segments;
+
+      // 接縫對不上代表前一片沒轉完自己的尾巴，中間那段音檔沒有人轉過。
+      // 補要趁現在：音檔在分析成功之後就刪了（SDD 1.1），之後永遠補不回來
+      let repair: RepairResult | null = null;
+      if (merged.seam?.verdict === 'gap') {
+        repair = await repairSeamGap(
+          transcript,
+          segments,
+          slice.startSeconds,
+          {
+            totalDurationSeconds,
+            transcribeWindow: async (startSeconds, durationSeconds) => {
+              const bridgeWav = await slicer.readSlice(audioPath, startSeconds, durationSeconds);
+              return gemini.transcribeSlice({
+                base64Data: bridgeWav.toString('base64'),
+                offsetSeconds: startSeconds,
+                previousContext: buildPreviousContext(transcript),
+                mimeType: 'audio/wav',
+                sliceDurationSeconds: durationSeconds,
+              });
+            },
+          },
+          { enabled: repairConfig.enabled, budget: repairBudgetLeft },
+        );
+        repairBudgetLeft -= repair.attempts;
+        transcript = repair.segments;
+      } else {
+        transcript = merged.segments;
+      }
 
       if (merged.seam) {
         const entry: SeamReportEntry = {
@@ -93,6 +127,15 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
           verdict: merged.seam.verdict,
           similarity: Number(merged.seam.similarity.toFixed(3)),
           droppedSegments: merged.seam.duplicateSegments,
+          ...(repair
+            ? {
+                repair: {
+                  outcome: repair.outcome,
+                  attempts: repair.attempts,
+                  ...(repair.bridgeSeconds === undefined ? {} : { bridgeSeconds: repair.bridgeSeconds }),
+                },
+              }
+            : {}),
         };
         // 覆寫同一片的舊紀錄，不要疊上去：續傳會重跑最後一片，push 的話同一片會有兩筆，
         // 而且「有幾個破洞」這個數字會跟著錯
@@ -101,11 +144,16 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
         // 破洞要在當下就講出來。安靜吞掉的話，使用者看到的是一份「看起來完整」的逐字稿，
         // 而音檔在分析成功之後就刪了，事後沒有任何辦法知道少了什麼
         if (merged.seam.verdict === 'gap') {
-          console.warn(
-            `[MeetPilot] Meeting ${meetingId} 第 ${slice.index} 片與前一片接不起來`
-            + `（相似度 ${merged.seam.similarity.toFixed(3)}）：兩片之間有內容沒有被轉出來。`
-            + '接縫報告會存進這場會的逐字稿紀錄',
-          );
+          const head = `[MeetPilot] Meeting ${meetingId} 第 ${slice.index} 片與前一片接不起來`
+            + `（相似度 ${merged.seam.similarity.toFixed(3)}）`;
+          if (repair?.outcome === 'repaired') {
+            console.warn(`${head}，已用 ${repair.bridgeSeconds} 秒的橋接補回來（送了 ${repair.attempts} 次轉錄）`);
+          } else if (repair?.outcome === 'failed') {
+            // 這一條是最要緊的：試過、補不回來，那段內容確實不在逐字稿裡
+            console.warn(`${head}，補了 ${repair.attempts} 次都接不上：**這兩片之間有一段內容不在逐字稿裡**`);
+          } else {
+            console.warn(`${head}，沒有嘗試修復（修復關閉或這場會的額度用完）。接縫報告在逐字稿紀錄裡`);
+          }
         }
       }
 

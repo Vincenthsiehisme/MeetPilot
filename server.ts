@@ -9,6 +9,7 @@ import { createGeminiServerClient } from './services/geminiServerClient';
 import { createAudioFileStore, resolveAudioDir } from './services/audioFileStore';
 import { createAudioSlicer, resolveFfmpegPaths } from './services/audioSlicer';
 import { createTranscriptionPipeline, requeueInterruptedMeetings } from './services/transcriptionPipeline';
+import { resolveSeamRepairConfig } from './services/seamRepair';
 import { createTranscriptionQueue } from './services/transcriptionQueue';
 import { createApp } from './services/createApp';
 
@@ -31,8 +32,13 @@ const meetingStore = createMeetingStore(meetingDb);
 const audioStore = createAudioFileStore(resolveAudioDir(process.env));
 const ffmpegPaths = resolveFfmpegPaths(process.env);
 const geminiClient = createGeminiServerClient(llmLogger);
+// 破洞修復的設定同樣在啟動時解析：budget 寫錯值要在這裡爆，不要等到跑了一小時的會
+// 才發現修復從頭到尾沒開過
+const seamRepair = resolveSeamRepairConfig(process.env);
+
 const transcriptionPipeline = createTranscriptionPipeline({
   store: meetingStore,
+  seamRepair,
   audioStore,
   slicer: createAudioSlicer({ ffmpegPath: ffmpegPaths.ffmpeg, ffprobePath: ffmpegPaths.ffprobe }),
   gemini: geminiClient,

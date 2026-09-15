@@ -205,12 +205,15 @@ describe('run：接縫報告落地', () => {
     '招募的進度目前卡在第二輪面談，人資希望我們把時間壓在兩週內。',
   ];
   const disjointGemini = (): GeminiServerClient => fakeGemini({
-    transcribeSlice: async ({ offsetSeconds = 0 }) => [{
-      start: offsetSeconds,
-      end: offsetSeconds + 60,
-      text: DISJOINT_TEXTS[offsetSeconds / 600],
-      speaker: 'Speaker 1',
-    }],
+    transcribeSlice: async ({ offsetSeconds = 0 }) => {
+      // 破洞會觸發修復，而修復的橋接窗 offset 不會落在切片起點上。
+      // 不明寫這一條的話 DISJOINT_TEXTS[0.8] 會是 undefined，測試靠一個 undefined 在跑
+      const index = offsetSeconds / 600;
+      const text = Number.isInteger(index)
+        ? DISJOINT_TEXTS[index]
+        : '橋接窗轉出來的東西跟兩邊都接不上,這場會補不回來。';
+      return [{ start: offsetSeconds, end: offsetSeconds + 60, text, speaker: 'Speaker 1' }];
+    },
   });
 
   it('接不起來的接縫記進 seam_report，逐字稿照樣全收（不吞內容）', async () => {
@@ -251,6 +254,167 @@ describe('run：接縫報告落地', () => {
     expect(report.map(e => e.sliceIndex)).toEqual([1, 2]);
     expect(report.every(e => e.verdict === 'duplicate')).toBe(true);
     expect(report.every(e => e.droppedSegments > 0)).toBe(true);
+  });
+});
+
+describe('run：破洞修復（W2-2b）', () => {
+  const A_TAIL = '那排程這件事情就先這樣,之後每一組自己排自己的批次。';
+  const A_TAIL_RETAKE = '那排程這件事就先這樣,以後每一組自己排自己的批次。';
+  const MISSING = '至於權限要怎麼開,資訊部說要走正式的申請單,我下週跟他們確認。';
+  const B_HEAD = '那倉儲那邊呢,棧板的數量從上個月開始就一直不夠用。';
+  const B_HEAD_RETAKE = '那倉儲那邊呢,棧板數量從上個月開始就一直不夠用。';
+
+  /**
+   * 兩片內容不相干（＝破洞）；橋接窗回得出兩端都錨得住的內容。
+   *
+   * 用**呼叫順序**分辨切片本體與橋接窗，不要用 offset 或 duration：最後一片只有 200 秒、
+   * 而最大的橋接窗夾回檔頭之後 offset 與長度都跟第一片一樣，兩種都會撞在一起
+   * （第一版 fixture 就是這樣寫壞的，把第二片本體當成橋接餵回去，接縫直接變 duplicate）
+   */
+  const gappyGemini = (repairable: boolean, calls: number[] = []): GeminiServerClient => {
+    let n = 0;
+    return fakeGemini({
+      transcribeSlice: async ({ offsetSeconds = 0 }) => {
+        calls.push(offsetSeconds);
+        n += 1;
+        if (n === 1) return [seg(0, 60, '先講第一件事情,關於這季的排程調整。'), seg(60, 120, A_TAIL)];
+        if (n === 2) {
+          return [
+            seg(offsetSeconds, offsetSeconds + 8, B_HEAD),
+            seg(offsetSeconds + 8, offsetSeconds + 20, '採購說最快也要月底才補得到貨。'),
+          ];
+        }
+        if (!repairable) return [seg(offsetSeconds, offsetSeconds + 10, '完全不相干的一段話,跟兩邊都接不上。')];
+        return [
+          seg(offsetSeconds, offsetSeconds + 8, A_TAIL_RETAKE),
+          seg(offsetSeconds + 10, offsetSeconds + 20, MISSING),
+          seg(SLICE_DURATION_SECONDS, SLICE_DURATION_SECONDS + 8, B_HEAD_RETAKE),
+        ];
+      },
+    });
+  };
+
+  const seg = (start: number, end: number, text: string) => ({ start, end, text, speaker: 'Speaker 1' });
+
+  const runWith = async (gemini: GeminiServerClient, seamRepair?: { enabled: boolean; budget: number }) => {
+    newMeeting();
+    const pipeline = createTranscriptionPipeline({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(SLICE_DURATION_SECONDS + 200),
+      gemini,
+      seamRepair,
+      now: () => T0 + 1,
+    });
+    await pipeline.run('m-1');
+    return { report: store.getSeamReport('m-1')!, texts: store.getTranscript('m-1')!.segments.map(s => s.text) };
+  };
+
+  it('補得回來時把缺的內容接進逐字稿，並記成 repaired', async () => {
+    const calls: number[] = [];
+    const { report, texts } = await runWith(gappyGemini(true, calls));
+
+    expect(report[0].verdict).toBe('gap');
+    expect(report[0].repair?.outcome).toBe('repaired');
+    expect(report[0].repair!.attempts).toBeGreaterThan(0);
+    expect(report[0].repair!.bridgeSeconds).toBeGreaterThan(0);
+    // 缺的那段真的進了逐字稿
+    expect(texts).toContain(MISSING);
+    // 橋接重轉的兩端不能變成第二份
+    expect(texts).not.toContain(A_TAIL_RETAKE);
+    expect(texts.filter(t => t === B_HEAD || t === B_HEAD_RETAKE)).toHaveLength(1);
+    // 額外的轉錄確實送出去了（切片兩次 ＋ 橋接至少一次）
+    expect(calls.length).toBeGreaterThan(2);
+  });
+
+  it('補不回來時記成 failed，而且不把接不上的橋接塞進逐字稿', async () => {
+    const { report, texts } = await runWith(gappyGemini(false));
+
+    expect(report[0].repair?.outcome).toBe('failed');
+    expect(report[0].repair!.attempts).toBe(3);
+    expect(texts).not.toContain('完全不相干的一段話,跟兩邊都接不上。');
+    // 兩片的內容一段都不能少
+    expect(texts).toContain(A_TAIL);
+    expect(texts).toContain(B_HEAD);
+  });
+
+  it('額度跨接縫共用：第一個破洞吃光之後，第二個記成 skipped 而不是 failed', async () => {
+    // skipped 與 failed 不可混為一談：failed 是「試過補不回來」，skipped 是「還不知道有沒有缺」
+    newMeeting();
+    const seen = new Map<number, number>();
+    const calls: number[] = [];
+    const pipeline = createTranscriptionPipeline({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(THREE_SLICE_DURATION),
+      gemini: fakeGemini({
+        transcribeSlice: async ({ offsetSeconds = 0 }) => {
+          calls.push(offsetSeconds);
+          const nth = (seen.get(offsetSeconds) ?? 0) + 1;
+          seen.set(offsetSeconds, nth);
+          // 第一次碰到某個切片起點＝切片本體，其餘（含同一個 offset 的第二次）都是橋接
+          const isSliceBody = nth === 1 && offsetSeconds % SLICE_DURATION_SECONDS === 0;
+          if (isSliceBody) {
+            // 三段內容必須真的不同。差一個字的公式化字串 bigram 相似度會到 0.9 以上，
+            // 接縫全部變成 duplicate，測不到破洞（這個坑這一包踩了三次）
+            const bodies = [
+              '先講第一件事情,關於這季的排程調整,每一組自己排自己的批次就好。',
+              '那倉儲那邊呢,棧板的數量從上個月開始就一直不夠用,採購說要等到月底。',
+              '招募的進度目前卡在第二輪面談,人資希望我們把時間壓在兩週以內。',
+            ];
+            return [seg(offsetSeconds, offsetSeconds + 60, bodies[offsetSeconds / SLICE_DURATION_SECONDS])];
+          }
+          return [seg(offsetSeconds, offsetSeconds + 10, '橋接也接不上任何一邊的內容。')];
+        },
+      }),
+      seamRepair: { enabled: true, budget: 3 },
+      now: () => T0 + 1,
+    });
+
+    await pipeline.run('m-1');
+
+    const report = store.getSeamReport('m-1')!;
+    expect(report.map(e => e.verdict)).toEqual(['gap', 'gap']);
+    expect(report[0].repair).toEqual({ outcome: 'failed', attempts: 3 });
+    expect(report[1].repair).toEqual({ outcome: 'skipped', attempts: 0 });
+    // 三片本體 ＋ 第一個破洞的三次橋接，第二個破洞一次都沒送
+    expect(calls).toHaveLength(6);
+  });
+
+  it('關掉修復時一次都不送，記成 skipped', async () => {
+    const calls: number[] = [];
+    const { report } = await runWith(gappyGemini(true, calls), { enabled: false, budget: 6 });
+
+    expect(report[0].repair?.outcome).toBe('skipped');
+    expect(report[0].repair!.attempts).toBe(0);
+    // 只有兩片本體，沒有橋接
+    expect(calls).toHaveLength(2);
+  });
+
+  it('接得上的接縫不送任何額外轉錄：修復只為破洞付錢', async () => {
+    newMeeting();
+    const calls: number[] = [];
+    const pipeline = createTranscriptionPipeline({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(THREE_SLICE_DURATION),
+      gemini: fakeGemini({
+        transcribeSlice: async ({ offsetSeconds = 0, sliceDurationSeconds = 0 }) => {
+          calls.push(offsetSeconds);
+          const out = [];
+          for (let t = 0; t < sliceDurationSeconds; t += 10) {
+            out.push({ start: offsetSeconds + t, end: offsetSeconds + t + 10, text: `${offsetSeconds + t}s 開始的內容`, speaker: 'Speaker 1' });
+          }
+          return out;
+        },
+      }),
+      now: () => T0 + 1,
+    });
+    await pipeline.run('m-1');
+
+    expect(store.getSeamReport('m-1')!.every(e => e.verdict === 'duplicate')).toBe(true);
+    expect(store.getSeamReport('m-1')!.every(e => e.repair === undefined)).toBe(true);
+    expect(calls).toHaveLength(3);
   });
 });
 
