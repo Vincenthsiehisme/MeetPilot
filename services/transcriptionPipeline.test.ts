@@ -195,6 +195,65 @@ describe('run：整場跑完', () => {
   });
 });
 
+describe('run：接縫報告落地', () => {
+  // 每片回一段真的無關的內容 → 每個接縫都對不上 → 每個接縫都是破洞。
+  // 內容必須實際不同，不能只差一個編號：「第 0 個主題」對「第 1 個主題」的 bigram 相似度是 0.93，
+  // 那是公式化字串的天生問題（第一版 fixture 就是這樣寫壞的）
+  const DISJOINT_TEXTS = [
+    '關於報價的部分，我們決定沿用去年的級距，下週把試算表寄給客戶確認。',
+    '倉儲那邊反映棧板不夠用，採購說最快也要到月底才補得到貨。',
+    '招募的進度目前卡在第二輪面談，人資希望我們把時間壓在兩週內。',
+  ];
+  const disjointGemini = (): GeminiServerClient => fakeGemini({
+    transcribeSlice: async ({ offsetSeconds = 0 }) => [{
+      start: offsetSeconds,
+      end: offsetSeconds + 60,
+      text: DISJOINT_TEXTS[offsetSeconds / 600],
+      speaker: 'Speaker 1',
+    }],
+  });
+
+  it('接不起來的接縫記進 seam_report，逐字稿照樣全收（不吞內容）', async () => {
+    newMeeting();
+    const pipeline = createTranscriptionPipeline({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(THREE_SLICE_DURATION),
+      gemini: disjointGemini(),
+      now: () => T0 + 1,
+    });
+
+    await pipeline.run('m-1');
+
+    const report = store.getSeamReport('m-1');
+    expect(report).not.toBeNull();
+    // 三片有兩個接縫，第 0 片沒有接縫所以不在報告裡
+    expect(report!.map(e => e.sliceIndex)).toEqual([1, 2]);
+    expect(report!.every(e => e.verdict === 'gap')).toBe(true);
+    expect(report!.every(e => e.droppedSegments === 0)).toBe(true);
+    // 破洞不代表丟內容：三片的內容一段都不能少
+    expect(store.getTranscript('m-1')!.segments).toHaveLength(3);
+  });
+
+  it('接得上的接縫記成 duplicate，並寫出丟了幾段', async () => {
+    newMeeting();
+    const pipeline = createTranscriptionPipeline({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(THREE_SLICE_DURATION),
+      gemini: overlappingGemini(),
+      now: () => T0 + 1,
+    });
+
+    await pipeline.run('m-1');
+
+    const report = store.getSeamReport('m-1')!;
+    expect(report.map(e => e.sliceIndex)).toEqual([1, 2]);
+    expect(report.every(e => e.verdict === 'duplicate')).toBe(true);
+    expect(report.every(e => e.droppedSegments > 0)).toBe(true);
+  });
+});
+
 describe('run：多片合併（overlap 去重）', () => {
   it('每片都回含 overlap 的完整內容時，合併結果沒有缺口、時間不倒退、接縫重複有界', async () => {
     newMeeting();

@@ -64,6 +64,11 @@ export interface MeetingDetailResponse {
   transcript: { segments: TranscriptSegment[]; polished_content: string | null } | null;
   analysis: AnalysisV2 | null;
   tags: string[];
+  /**
+   * 每個切片接縫的對齊結果（W2-2）。單片的會、還沒開始轉的會是 null。
+   * 裡面有 `verdict: 'gap'` 的項目代表這份逐字稿在那個接縫確實缺了一段內容
+   */
+  seamReport: SeamReportEntry[] | null;
 }
 
 /**
@@ -112,6 +117,21 @@ export interface PatchAnalysisResponse {
 export interface DeleteMeetingResponse {
   deleted: true;
   meetingId: string;
+}
+
+/**
+ * 一個切片接縫的對齊結果（W2-2）。`GET /api/meetings/:id` 會帶整份。
+ *
+ * `verdict` 是 `gap` 代表**第 sliceIndex 片與前一片之間有內容沒有人轉到**——
+ * 不是警告，是這份逐字稿確實缺了一段。實測一場 65 分鐘的會六個接縫中有兩個是這種。
+ */
+export interface SeamReportEntry {
+  /** 這一片接在前一片後面。第 0 片沒有接縫，不會出現在報告裡 */
+  sliceIndex: number;
+  verdict: 'duplicate' | 'gap' | 'inconclusive';
+  similarity: number;
+  /** 判定為重複而丟掉的段數 */
+  droppedSegments: number;
 }
 
 /** `POST /api/meetings/import`（W1 既有） */

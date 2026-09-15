@@ -16,13 +16,12 @@ import { AudioFileStore } from './audioFileStore';
 import { AudioSlicer, planSlices } from './audioSlicer';
 import { GeminiServerClient } from './geminiServerClient';
 import { MeetingStore } from './meetingStore';
+import { SeamReportEntry } from './meetingApi';
 import { SLICE_OVERLAP_SECONDS, mergeSliceTranscript } from './transcriptMerge';
 
 /** 一片 10 分鐘，與搬家前瀏覽器那套的 sliceDurationMin = 10 一致 */
 export const SLICE_DURATION_SECONDS = 10 * 60;
 
-/** 合併時容許的時間誤差，沿用搬家前傳給 mergeSliceTranscript 的值 */
-const MERGE_TOLERANCE_SECONDS = 0.5;
 
 export interface TranscriptionPipelineDeps {
   store: MeetingStore;
@@ -68,6 +67,8 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
     const processedSlices = store.getMeeting(meetingId)?.processed_slices ?? 0;
     const polishedContent = existing?.polished_content ?? null;
     let transcript: TranscriptSegment[] = existing?.segments ?? [];
+    // 續傳時沿用已經記下來的接縫：重跑的那幾片會覆寫自己那幾筆，跑過的不重算
+    const seamReport: SeamReportEntry[] = store.getSeamReport(meetingId) ?? [];
 
     store.setSliceProgress(meetingId, processedSlices, plan.length, now());
 
@@ -83,14 +84,30 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
         sliceDurationSeconds: slice.durationSeconds,
       });
 
-      transcript = mergeSliceTranscript(
-        transcript,
-        segments,
-        slice.startSeconds,
-        slice.index === 0,
-        MERGE_TOLERANCE_SECONDS,
-        SLICE_OVERLAP_SECONDS,
-      );
+      const merged = mergeSliceTranscript(transcript, segments, slice.startSeconds, slice.index === 0);
+      transcript = merged.segments;
+
+      if (merged.seam) {
+        const entry: SeamReportEntry = {
+          sliceIndex: slice.index,
+          verdict: merged.seam.verdict,
+          similarity: Number(merged.seam.similarity.toFixed(3)),
+          droppedSegments: merged.seam.duplicateSegments,
+        };
+        // 覆寫同一片的舊紀錄，不要疊上去：續傳會重跑最後一片，push 的話同一片會有兩筆，
+        // 而且「有幾個破洞」這個數字會跟著錯
+        const at = seamReport.findIndex(e => e.sliceIndex === slice.index);
+        if (at >= 0) seamReport[at] = entry; else seamReport.push(entry);
+        // 破洞要在當下就講出來。安靜吞掉的話，使用者看到的是一份「看起來完整」的逐字稿，
+        // 而音檔在分析成功之後就刪了，事後沒有任何辦法知道少了什麼
+        if (merged.seam.verdict === 'gap') {
+          console.warn(
+            `[MeetPilot] Meeting ${meetingId} 第 ${slice.index} 片與前一片接不起來`
+            + `（相似度 ${merged.seam.similarity.toFixed(3)}）：兩片之間有內容沒有被轉出來。`
+            + '接縫報告會存進這場會的逐字稿紀錄',
+          );
+        }
+      }
 
       store.saveTranscriptProgress(
         meetingId,
@@ -99,6 +116,8 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
         plan.length,
         now(),
       );
+      // 每一片都寫：中途失敗時已經知道的接縫要留得下來，不要跟著整輪一起消失
+      if (seamReport.length > 0) store.saveSeamReport(meetingId, seamReport);
     }
   };
 

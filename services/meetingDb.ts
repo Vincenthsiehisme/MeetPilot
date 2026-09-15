@@ -62,6 +62,10 @@ const MIGRATIONS: readonly string[] = [
   CREATE INDEX idx_meetings_status ON meetings(status);
   CREATE INDEX idx_meetings_created_at ON meetings(created_at);
   `,
+  // W2-2：每個切片接縫的對齊結果。對不上代表有一片沒轉完，中間是破洞（實測會發生）。
+  // 落地而不是只印 log：破洞要留得下來，W2-2b 的修補要拿它當輸入，
+  // 而且「這份逐字稿哪裡可能缺內容」是使用者看得到的事實，不是除錯訊息
+  `ALTER TABLE transcripts ADD COLUMN seam_report TEXT;`,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

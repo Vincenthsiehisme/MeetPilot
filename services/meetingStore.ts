@@ -12,6 +12,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { Meeting, TranscriptSegment } from '../types';
 import { AnalysisV2, isAnalysisV2SemanticallyEmpty } from './analysisContract';
 import { MigrationRecord } from './jobMigration';
+import { SeamReportEntry } from './meetingApi';
 import { MeetingStatus, assertTransition, isMeetingStatus } from './meetingState';
 
 export interface TranscriptRecord {
@@ -83,9 +84,16 @@ export const createMeetingStore = (db: DatabaseSync) => {
                           source_file_size, origin, error, processed_slices, total_slices, meeting_context)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
-  const insertTranscript = db.prepare(
-    'INSERT OR REPLACE INTO transcripts (meeting_id, segments, polished_content, created_at) VALUES (?, ?, ?, ?)',
-  );
+  // upsert 而不是 INSERT OR REPLACE：後者是砍掉整列再插一列，會把這個 statement 沒列出來的欄位
+  // （seam_report）一起清成 null。逐字稿每轉完一片就寫一次，用 REPLACE 的話接縫紀錄每片都被沖掉一次
+  const insertTranscript = db.prepare(`
+    INSERT INTO transcripts (meeting_id, segments, polished_content, created_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(meeting_id) DO UPDATE SET
+      segments = excluded.segments,
+      polished_content = excluded.polished_content,
+      created_at = excluded.created_at
+  `);
   const insertAnalysis = db.prepare(`
     INSERT OR REPLACE INTO analyses (meeting_id, contract_version, overview, topics, decisions, action_items, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -108,6 +116,13 @@ export const createMeetingStore = (db: DatabaseSync) => {
       { segments: string; polished_content: string | null } | undefined;
     if (!row) return null;
     return { segments: JSON.parse(row.segments) as TranscriptSegment[], polished_content: row.polished_content };
+  };
+
+  const readSeamReport = (id: string): SeamReportEntry[] | null => {
+    const row = db.prepare('SELECT seam_report FROM transcripts WHERE meeting_id = ?').get(id) as
+      { seam_report: string | null } | undefined;
+    if (!row?.seam_report) return null;
+    return JSON.parse(row.seam_report) as SeamReportEntry[];
   };
 
   const readAnalysisRow = (id: string) =>
@@ -347,6 +362,22 @@ export const createMeetingStore = (db: DatabaseSync) => {
     },
 
     getTranscript: readTranscript,
+
+    getSeamReport: readSeamReport,
+
+    /**
+     * 寫入接縫報告。逐字稿那一列必須先存在（接縫是合併的產物，合併寫完才輪到它）。
+     * 分開一支而不是併進 saveTranscriptProgress：`PATCH transcript` 走的是同一條寫入路徑，
+     * 使用者手動編輯逐字稿不該連帶改寫「模型當時漏了什麼」這個事實
+     */
+    saveSeamReport: (id: string, report: SeamReportEntry[]): void => {
+      requireMeeting(id);
+      const changed = db.prepare('UPDATE transcripts SET seam_report = ? WHERE meeting_id = ?')
+        .run(JSON.stringify(report), id);
+      if (changed.changes === 0) {
+        throw new Error(`Meeting ${id} 還沒有逐字稿，寫不了接縫報告`);
+      }
+    },
 
     getAnalysis: (id: string): AnalysisV2 | null => {
       const row = readAnalysisRow(id);

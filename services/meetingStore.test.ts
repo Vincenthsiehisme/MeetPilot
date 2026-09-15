@@ -207,6 +207,55 @@ describe('transcript 與 analysis', () => {
   });
 });
 
+describe('接縫報告（seam_report）', () => {
+  const report = [
+    { sliceIndex: 1, verdict: 'duplicate' as const, similarity: 0.635, droppedSegments: 1 },
+    { sliceIndex: 2, verdict: 'gap' as const, similarity: 0.053, droppedSegments: 0 },
+  ];
+
+  const withTranscript = () => {
+    newMeeting();
+    store.saveTranscriptProgress('m-1', { segments: [{ start: 0, end: 1, text: '嗨' }], polished_content: null }, 1, 3, T0);
+  };
+
+  it('寫進去讀得回來，形狀不變', () => {
+    withTranscript();
+    store.saveSeamReport('m-1', report);
+    expect(store.getSeamReport('m-1')).toEqual(report);
+  });
+
+  it('沒寫過是 null，不是空陣列：「沒量過」跟「量過沒問題」不是同一件事', () => {
+    withTranscript();
+    expect(store.getSeamReport('m-1')).toBeNull();
+  });
+
+  it('**後續的逐字稿寫入不會把接縫報告清掉**', () => {
+    // 這條擋的是 INSERT OR REPLACE：它是砍掉整列再插一列，statement 沒列到的欄位一起變 null。
+    // 逐字稿每轉完一片就寫一次，用 REPLACE 的話接縫報告每片都被沖掉一次，而且沒有任何症狀
+    withTranscript();
+    store.saveSeamReport('m-1', report);
+
+    store.saveTranscriptProgress(
+      'm-1',
+      { segments: [{ start: 0, end: 1, text: '嗨' }, { start: 1, end: 2, text: '再來' }], polished_content: '潤過的' },
+      2, 3, T0 + 1,
+    );
+
+    expect(store.getSeamReport('m-1')).toEqual(report);
+    expect(store.getTranscript('m-1')!.segments).toHaveLength(2);
+    expect(store.getTranscript('m-1')!.polished_content).toBe('潤過的');
+  });
+
+  it('還沒有逐字稿時拒絕寫入，不默默生一列出來', () => {
+    newMeeting();
+    expect(() => store.saveSeamReport('m-1', report)).toThrow(/還沒有逐字稿/);
+  });
+
+  it('meeting 不存在時拋錯', () => {
+    expect(() => store.saveSeamReport('nope', report)).toThrow();
+  });
+});
+
 describe('切片進度與續傳游標', () => {
   it('setSliceProgress 只動進度，不動狀態', () => {
     newMeeting();
