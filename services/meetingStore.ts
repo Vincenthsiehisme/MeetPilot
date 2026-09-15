@@ -21,6 +21,16 @@ import {
   TopicTag,
   isTopicExtractionStatus,
 } from './topicTag';
+import {
+  LinkExclusion,
+  LinkExclusionReason,
+  LinkRun,
+  TagVector,
+  TopicLink,
+  isLinkExclusionReason,
+  orderPair,
+  pairKey,
+} from './topicLink';
 
 export interface TranscriptRecord {
   segments: TranscriptSegment[];
@@ -67,6 +77,43 @@ export interface TopicTagWriteReport {
   skippedByManual: string[];
   /** 這一批自己有兩條以上 match_key 相同，只留第一條，其餘的標題在這裡 */
   skippedDuplicate: string[];
+}
+
+/** 要寫進去的一條向量。model 與維度由 embedding 呼叫端給，store 不猜 */
+export interface NewTagVector {
+  tag_id: string;
+  model: string;
+  dimensions: number;
+  vector: number[];
+}
+
+/** 一次關聯計算要落地的東西：關聯本體與這次的覆蓋率，同一個交易寫 */
+export interface LinkResult {
+  algo_version: string;
+  links: readonly NewTopicLink[];
+  coverage: {
+    candidates: number;
+    judged: number;
+    skipped_cap: number;
+    skipped_excluded: number;
+    skipped_error: number;
+    incomparable_pairs: number;
+    error: string | null;
+  };
+}
+
+export interface NewTopicLink {
+  /** 對方那一場。兩端的排序由 store 做，呼叫端不用管 */
+  other_meeting_id: string;
+  confidence: number;
+  evidence: string;
+  shared_topics: string[];
+}
+
+export interface LinkWriteReport {
+  inserted: number;
+  /** 因為排除紀錄而沒有寫進去的對方 meeting_id。正常路徑上應該是空的（候選階段就扣掉了） */
+  blockedByExclusion: string[];
 }
 
 export interface CreateMeetingInput {
@@ -127,12 +174,61 @@ const toMeeting = (row: MeetingRow): Meeting => {
 
 type TopicTagRow = Omit<TopicTag, 'source'> & { source: string };
 
+// node:sqlite 回的是帶 index signature 的 Record，而 interface 沒有隱式 index signature，
+// 直接轉會被 tsc 擋下來。照 MeetingRow 的既有做法宣告本地 row type
+type LinkRunRow = {
+  meeting_id: string;
+  algo_version: string;
+  candidates: number;
+  judged: number;
+  skipped_cap: number;
+  skipped_excluded: number;
+  skipped_error: number;
+  incomparable_pairs: number;
+  error: string | null;
+  created_at: number;
+};
+
+type LinkExclusionRow = {
+  meeting_a: string;
+  meeting_b: string;
+  reason_code: string;
+  created_at: number;
+};
+
+const toLinkExclusion = (row: LinkExclusionRow): LinkExclusion => {
+  if (!isLinkExclusionReason(row.reason_code)) {
+    // 認不得的原因往下傳，6.3 的三分類統計就會混進一個不存在的類別，
+    // 而那份統計是判斷關聯品質的唯一線上訊號
+    throw new Error(`排除紀錄 ${row.meeting_a} × ${row.meeting_b} 的 reason_code 不是合法值：${row.reason_code}`);
+  }
+  return { ...row, reason_code: row.reason_code };
+};
+
 const toTopicTag = (row: TopicTagRow): TopicTag => {
   if (row.source !== 'auto' && row.source !== 'manual') {
     // 分不出來源就沒有人工優先可言：往下傳的話，重算會不會蓋掉它變成看運氣
     throw new Error(`TopicTag ${row.tag_id} 的 source 不是合法值：${row.source}`);
   }
   return { ...row, source: row.source };
+};
+
+/**
+ * 向量在資料庫裡是 float32 的位元組（W4）。
+ *
+ * 不存 JSON 文字：3072 個 float 寫成 JSON 約 60KB、二進位是 12KB，而一年約 18,700 條標籤。
+ * float32 也正是 embedding API 本來的精度，轉成它不損失原本就有的資訊。
+ */
+const toVectorBlob = (vector: readonly number[]): Uint8Array =>
+  new Uint8Array(new Float32Array(vector).buffer.slice(0));
+
+const fromVectorBlob = (blob: Uint8Array): number[] => {
+  if (blob.byteLength % 4 !== 0) {
+    // 長度不是 4 的倍數代表這個 BLOB 不是 float32 陣列。硬解會回一組看起來正常的數字
+    throw new Error(`向量的長度 ${blob.byteLength} bytes 不是 4 的倍數，不是 float32 陣列`);
+  }
+  const view = new Float32Array(blob.buffer, blob.byteOffset, blob.byteLength / 4);
+  return Array.from(view);
 };
 
 export const createMeetingStore = (db: DatabaseSync) => {
@@ -207,6 +303,22 @@ export const createMeetingStore = (db: DatabaseSync) => {
 
   const writeTranscript = (id: string, transcript: TranscriptRecord, createdAt: number) => {
     insertTranscript.run(id, JSON.stringify(transcript.segments), transcript.polished_content, createdAt);
+  };
+
+  const writeLinkRun = (id: string, result: LinkResult, at: number) => {
+    db.prepare(
+      'INSERT INTO link_runs (meeting_id, algo_version, candidates, judged, skipped_cap, skipped_excluded, '
+      + 'skipped_error, incomparable_pairs, error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) '
+      + 'ON CONFLICT(meeting_id) DO UPDATE SET algo_version = excluded.algo_version, '
+      + 'candidates = excluded.candidates, judged = excluded.judged, skipped_cap = excluded.skipped_cap, '
+      + 'skipped_excluded = excluded.skipped_excluded, skipped_error = excluded.skipped_error, '
+      + 'incomparable_pairs = excluded.incomparable_pairs, error = excluded.error, '
+      + 'created_at = excluded.created_at',
+    ).run(
+      id, result.algo_version, result.coverage.candidates, result.coverage.judged,
+      result.coverage.skipped_cap, result.coverage.skipped_excluded, result.coverage.skipped_error,
+      result.coverage.incomparable_pairs, result.coverage.error, at,
+    );
   };
 
   const writeAnalysis = (id: string, analysis: AnalysisV2, createdAt: number) => {
@@ -553,6 +665,176 @@ export const createMeetingStore = (db: DatabaseSync) => {
         throw err;
       }
       return report;
+    },
+
+    /**
+     * 有題目標籤的會議 id（W4）。關聯的比對對象就是這一組。
+     *
+     * 只看 topic_tags 有沒有列，不看 `topic_extraction_status`：`empty` 與 `failed` 的會如果
+     * 上一輪抽到過標籤，那些標籤仍然留著（saveTopicExtraction 不刪），它們照樣是合法的關聯原料。
+     * 反過來用狀態欄判的話，一次失敗的重抽會讓這場會從所有人的關聯對象裡安靜消失。
+     */
+    listTopicTagOwners: (): string[] =>
+      (db.prepare('SELECT DISTINCT meeting_id FROM topic_tags ORDER BY meeting_id').all() as
+        { meeting_id: string }[]).map(r => r.meeting_id),
+
+    /** 這場會有向量的標籤（W4）。沒有向量的標籤不會出現在這裡，要補算的用 listTagsMissingVectors 查 */
+    getTagVectors: (id: string): TagVector[] =>
+      (db.prepare(
+        'SELECT t.tag_id, t.title, e.model, e.dimensions, e.vector FROM topic_tags t '
+        + 'JOIN topic_tag_embeddings e ON e.tag_id = t.tag_id '
+        + 'WHERE t.meeting_id = ? ORDER BY t.created_at, t.title, t.tag_id',
+      ).all(id) as { tag_id: string; title: string; model: string; dimensions: number; vector: Uint8Array }[])
+        .map(row => ({
+          tag_id: row.tag_id,
+          title: row.title,
+          model: row.model,
+          dimensions: row.dimensions,
+          vector: fromVectorBlob(row.vector),
+        })),
+
+    /**
+     * 這場會需要（重）算向量的標籤（W4）。lazy 補算的輸入。
+     *
+     * 兩種都算：**沒有向量的**，以及**向量是別的 model 算的**。
+     * 只補前者的話，換過 embedding model 之後舊向量會一直留著，而 `canCompare` 會把它們全部
+     * 判成不可比——結果是那些會安靜地關聯不到任何東西，狀態卻是正常的 `LINKED` ＋ 空集合。
+     */
+    listTagsNeedingVectors: (id: string, model: string): TopicTag[] =>
+      (db.prepare(
+        'SELECT t.* FROM topic_tags t LEFT JOIN topic_tag_embeddings e ON e.tag_id = t.tag_id '
+        + 'WHERE t.meeting_id = ? AND (e.tag_id IS NULL OR e.model <> ?) '
+        + 'ORDER BY t.created_at, t.title, t.tag_id',
+      ).all(id, model) as TopicTagRow[]).map(toTopicTag),
+
+    /**
+     * 落地一批向量（W4）。整批一個交易。
+     *
+     * 同一個 tag_id 重送就覆蓋：重算向量的唯一正當理由是換了 model，那時舊的一定要走。
+     */
+    saveTagVectors: (rows: readonly NewTagVector[], at: number): void => {
+      db.exec('BEGIN');
+      try {
+        for (const row of rows) {
+          if (row.vector.length !== row.dimensions) {
+            // 維度欄跟實際長度對不上的話，canCompare 會拿一個假的維度去比，
+            // 而兩條長度不同的向量算 cosine 會在 cosine 裡拋錯，錯誤指到的是比對不是寫入
+            throw new Error(
+              `標籤 ${row.tag_id} 的向量長度是 ${row.vector.length}，但 dimensions 欄寫 ${row.dimensions}`,
+            );
+          }
+          db.prepare(
+            'INSERT INTO topic_tag_embeddings (tag_id, model, dimensions, vector, created_at) VALUES (?, ?, ?, ?, ?) '
+            + 'ON CONFLICT(tag_id) DO UPDATE SET model = excluded.model, dimensions = excluded.dimensions, '
+            + 'vector = excluded.vector, created_at = excluded.created_at',
+          ).run(row.tag_id, row.model, row.dimensions, toVectorBlob(row.vector), at);
+        }
+        db.exec('COMMIT');
+      } catch (err) {
+        db.exec('ROLLBACK');
+        throw err;
+      }
+    },
+
+    /** 這場會的關聯（W4）。兩端都查，因為 A×B 只存一列 */
+    getLinks: (id: string): TopicLink[] =>
+      (db.prepare(
+        'SELECT * FROM topic_links WHERE meeting_a = ? OR meeting_b = ? '
+        + 'ORDER BY confidence DESC, meeting_a, meeting_b',
+      ).all(id, id) as (Omit<TopicLink, 'shared_topics'> & { shared_topics: string })[])
+        .map(row => ({ ...row, shared_topics: JSON.parse(row.shared_topics) as string[] })),
+
+    /** 這場會最近一次關聯計算的覆蓋率（W4）。沒算過是 null——那跟「算過但沒找到」不是同一件事 */
+    getLinkRun: (id: string): LinkRun | null =>
+      (db.prepare('SELECT * FROM link_runs WHERE meeting_id = ?').get(id) as LinkRunRow | undefined) ?? null,
+
+    /** 人標記某一對不相關（W4）。同一對重標就更新原因，不新增一列 */
+    addLinkExclusion: (x: string, y: string, reason: LinkExclusionReason, at: number): void => {
+      const [a, b] = orderPair(x, y);
+      requireMeeting(a);
+      requireMeeting(b);
+      if (!isLinkExclusionReason(reason)) throw new Error(`排除原因不是合法值：${reason}`);
+      db.exec('BEGIN');
+      try {
+        db.prepare(
+          'INSERT INTO link_exclusions (meeting_a, meeting_b, reason_code, created_at) VALUES (?, ?, ?, ?) '
+          + 'ON CONFLICT(meeting_a, meeting_b) DO UPDATE SET reason_code = excluded.reason_code',
+        ).run(a, b, reason, at);
+        // 已經在畫面上的那一筆同時撤掉。只記排除不刪 Link 的話，人標了不相關之後那筆關聯
+        // 還會留在那裡直到下一次重算，而重算可能永遠不會發生
+        db.prepare('DELETE FROM topic_links WHERE meeting_a = ? AND meeting_b = ?').run(a, b);
+        db.exec('COMMIT');
+      } catch (err) {
+        db.exec('ROLLBACK');
+        throw err;
+      }
+    },
+
+    /** 跟這場會有關的排除紀錄（W4） */
+    listLinkExclusions: (id: string): LinkExclusion[] =>
+      (db.prepare(
+        'SELECT * FROM link_exclusions WHERE meeting_a = ? OR meeting_b = ? ORDER BY meeting_a, meeting_b',
+      ).all(id, id) as LinkExclusionRow[]).map(toLinkExclusion),
+
+    /**
+     * 落地一次關聯計算（W4）：關聯本體與覆蓋率同一個交易。
+     *
+     * **整組換掉，不是累加**：先刪掉這場會兩端的全部既有關聯，再寫新的。累加的話，上一輪算出來
+     * 而這一輪不再成立的關聯會永遠留著，而重算本來就是為了讓結果跟著新的標籤與新的演算法版本走。
+     *
+     * **排除紀錄在這裡再擋一次**（SDD 1.2「人工優先且黏著」）。候選階段已經扣過了，這裡是最後一道：
+     * 少了它，任何一條繞過候選選擇直接寫入的路徑都會讓人標過不相關的關聯復活，而復活的當下
+     * 沒有任何錯誤訊息。
+     */
+    saveLinkResult: (id: string, result: LinkResult, at: number): LinkWriteReport => {
+      requireMeeting(id);
+      const report: LinkWriteReport = { inserted: 0, blockedByExclusion: [] };
+
+      const excluded = new Set(
+        (db.prepare('SELECT meeting_a, meeting_b FROM link_exclusions WHERE meeting_a = ? OR meeting_b = ?')
+          .all(id, id) as { meeting_a: string; meeting_b: string }[])
+          .map(r => pairKey(r.meeting_a, r.meeting_b)),
+      );
+
+      db.exec('BEGIN');
+      try {
+        db.prepare('DELETE FROM topic_links WHERE meeting_a = ? OR meeting_b = ?').run(id, id);
+
+        for (const link of result.links) {
+          const [a, b] = orderPair(id, link.other_meeting_id);
+          if (excluded.has(pairKey(a, b))) {
+            report.blockedByExclusion.push(link.other_meeting_id);
+            continue;
+          }
+          db.prepare(
+            'INSERT INTO topic_links (link_id, meeting_a, meeting_b, confidence, evidence, shared_topics, '
+            + 'algo_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          ).run(
+            randomUUID(), a, b, link.confidence, link.evidence,
+            JSON.stringify(link.shared_topics), result.algo_version, at,
+          );
+          report.inserted += 1;
+        }
+
+        writeLinkRun(id, result, at);
+        db.exec('COMMIT');
+      } catch (err) {
+        db.exec('ROLLBACK');
+        throw err;
+      }
+      return report;
+    },
+
+    /**
+     * 只寫覆蓋率，不動既有的關聯（W4）。
+     *
+     * 關聯算失敗時走這條：這一輪沒算到不代表上一輪算到的是錯的，把既有那組刪掉只會讓
+     * 使用者在一次額度用完之後失去本來看得到的關聯——理由與 W3 的 `empty`／`failed`
+     * 不刪既有標籤同一條。狀態欄已經把「這一輪沒算成」講清楚了。
+     */
+    saveLinkRun: (id: string, result: LinkResult, at: number): void => {
+      requireMeeting(id);
+      writeLinkRun(id, result, at);
     },
 
     /**

@@ -80,6 +80,10 @@ const fakeGemini = (overrides: Partial<GeminiServerClient> = {}): GeminiServerCl
   polishTranscript: async () => '潤過的',
   analyzeTranscript: async () => analysis,
   extractTopicTags: async () => [{ title: '題目 A', content: '這場會對題目 A 的討論' }],
+  embeddingModel: 'fake-embedding',
+  // W4 的兩支。這一層不算關聯，形狀要在，缺了型別就對不上
+  embedTopicTags: async (texts) => ({ model: 'fake-embedding', dimensions: 1, vectors: texts.map(() => [1]) }),
+  judgeMeetingPair: async () => ({ sameTopic: false, confidence: 0, reason: '假的判定', sharedTopics: [] }),
   ...overrides,
 });
 
@@ -874,4 +878,73 @@ const createAudioFileStoreStub = (): AudioFileStore => ({
   saveFrom: async () => ({ path: '', bytes: 0 }),
   removePartialUploads: () => [],
   remove: () => {},
+});
+
+describe('run：關聯接在 READY 之後（W4）', () => {
+  it('關聯排在 READY 且音檔刪掉之後才跑', async () => {
+    newMeeting();
+    const present = new Set(['m-1']);
+    const seen: { status: string; hasAudio: boolean }[] = [];
+    const pipeline = pipelineWith({
+      store,
+      audioStore: fakeAudioStore(present),
+      slicer: fakeSlicer(THREE_SLICE_DURATION),
+      gemini: fakeGemini(),
+      now: () => T0 + 1,
+      topicLinker: {
+        link: async (id: string) => {
+          seen.push({ status: store.getMeeting(id)!.status, hasAudio: present.has(id) });
+          return { status: 'LINKED' as const, links: 0, coverage: {
+            candidates: 0, judged: 0, skipped_cap: 0, skipped_excluded: 0, skipped_error: 0,
+        incomparable_pairs: 0, error: null,
+          } };
+        },
+      },
+    });
+
+    await pipeline.run('m-1');
+
+    // 音檔已經刪掉、狀態已經是 READY 才輪到關聯：關聯失敗不該讓一場已經可用的會回不去
+    expect(seen).toEqual([{ status: 'READY', hasAudio: false }]);
+  });
+
+  it('關聯拋出預期外的錯誤時，這場會不會被標成 FAILED（AC-6）', async () => {
+    newMeeting();
+    const pipeline = pipelineWith({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(THREE_SLICE_DURATION),
+      gemini: fakeGemini(),
+      now: () => T0 + 1,
+      topicLinker: { link: async () => { throw new Error('資料庫寫不進去'); } },
+    });
+
+    await expect(pipeline.run('m-1')).resolves.toBeUndefined();
+
+    // 逐字稿與結論都已經落地、音檔已經刪掉，這時標 FAILED 是謊報，而且 retry 會去重跑
+    // 一條音檔已經不在的轉錄——那是死路
+    expect(store.getMeeting('m-1')?.status).toBe('READY');
+    expect(store.getMeeting('m-1')?.error).toBeNull();
+    expect(store.getTranscript('m-1')?.segments.length).toBeGreaterThan(0);
+    expect(store.getAnalysis('m-1')).not.toBeNull();
+  });
+
+  it('關聯關掉時（linker 是 null）這場會停在 READY，不是 LINK_FAILED', async () => {
+    newMeeting();
+    const pipeline = pipelineWith({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(THREE_SLICE_DURATION),
+      gemini: fakeGemini(),
+      now: () => T0 + 1,
+      topicLinker: null,
+    });
+
+    await pipeline.run('m-1');
+
+    // READY 的意思正是「還沒算關聯」；寫成 LINK_FAILED 會讓畫面出現一個不存在的錯誤，
+    // 也會讓 6.1 的關聯成功率指標被人為關閉污染
+    expect(statuses).toEqual(['TRANSCRIBING', 'ANALYZING', 'READY']);
+    expect(store.getMeeting('m-1')?.error).toBeNull();
+  });
 });

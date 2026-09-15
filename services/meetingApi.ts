@@ -10,6 +10,7 @@
 import { Job, Meeting, TranscriptSegment } from '../types';
 import { AnalysisV2 } from './analysisContract';
 import { TopicTag } from './topicTag';
+import { LinkRun, TopicLink } from './topicLink';
 
 /** 音檔上傳的 Content-Type。刻意不是 JSON：這條路徑不經 body parser，body 直接 pipe 進檔案 */
 export const AUDIO_CONTENT_TYPE = 'application/octet-stream';
@@ -79,6 +80,29 @@ export interface MeetingDetailResponse {
    * 裡面有 `verdict: 'gap'` 的項目代表這份逐字稿在那個接縫確實缺了一段內容
    */
   seamReport: SeamReportEntry[] | null;
+  /**
+   * 跟這場會判定為同題目的歷史會議（W4 的 `topic_links`）。
+   *
+   * **空陣列不等於「沒有相關會議」**，要配 `meeting.status` 一起讀（SDD 1.3.1 三種狀態必須分得開）：
+   * `LINKED` ＋ 空陣列是「算過了，沒有同題目的會」；`READY` 或 `LINKING` 是「還沒算完」；
+   * `LINK_FAILED` 是「算壞了」，原因在 `meeting.error`。三者寫成同一句話正是 2.3 列的
+   * 「不會有人發現的壞法」
+   */
+  links: TopicLink[];
+  /**
+   * 最近一次關聯計算的覆蓋率（W4）。沒算過是 null。
+   *
+   * `judged` 小於 `candidates` 是常態（候選有上限），所以要看得出剩下的是被上限丟的、
+   * 被人排除的、還是撞到額度沒判的——三個數字分開記就是為了這個
+   */
+  linkRun: LinkRun | null;
+}
+
+/** `POST /api/meetings/:id/link` 200。重算這場會的關聯 */
+export interface LinkRecomputeResponse {
+  meeting: MeetingView;
+  links: TopicLink[];
+  linkRun: LinkRun | null;
 }
 
 /**

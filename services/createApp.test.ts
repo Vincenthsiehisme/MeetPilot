@@ -12,6 +12,7 @@ import { openMeetingDb } from './meetingDb';
 import { MeetingStore, createMeetingStore } from './meetingStore';
 import { MATCH_KEY_VERSION } from './topicTag';
 import { TranscriptionQueue } from './transcriptionQueue';
+import { TopicLinker } from './topicLinker';
 
 /**
  * 路由層測試：跑的是 server.ts 真的用的那個 app（同一支 createApp、同一組 middleware 順序）。
@@ -36,6 +37,10 @@ const fakeGemini = (): GeminiServerClient => ({
   analyzeTranscript: async () => ({ overview: 'x', topics: [], decisions: [], action_items: [] }),
   // 路由這一層不跑轉錄鏈，抽標籤也不會被呼叫到；形狀要在，缺了型別就對不上
   extractTopicTags: async () => [],
+  embeddingModel: 'fake-embedding',
+  // W4 的兩支。這一層不算關聯，形狀要在，缺了型別就對不上
+  embedTopicTags: async (texts) => ({ model: 'fake-embedding', dimensions: 1, vectors: texts.map(() => [1]) }),
+  judgeMeetingPair: async () => ({ sameTopic: false, confidence: 0, reason: '假的判定', sharedTopics: [] }),
 });
 
 // 假佇列預設模仿真實佇列的同步行為：enqueue 會一路跑到 pipeline 的第一個 await，
@@ -53,6 +58,7 @@ const startWith = async (options: {
   listenConfig?: Partial<ListenConfig>;
   queue?: TranscriptionQueue;
   audioStore?: AudioFileStore;
+  topicLinker?: TopicLinker | null;
 } = {}) => {
   const app = createApp({
     listenConfig: {
@@ -70,13 +76,19 @@ const startWith = async (options: {
     }),
     geminiClient: fakeGemini(),
     llmLogger: { log: () => {} },
+    // 預設不給 linker：既有的測試不該因為 W4 多出一條背景呼叫而改變行為
+    topicLinker: options.topicLinker ?? null,
   });
   server = createServer(app);
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
 };
 
-const start = (options: { listenConfig?: Partial<ListenConfig>; queue?: TranscriptionQueue } = {}) =>
+const start = (options: {
+  listenConfig?: Partial<ListenConfig>;
+  queue?: TranscriptionQueue;
+  topicLinker?: TopicLinker | null;
+} = {}) =>
   startWith(options);
 
 const createMeeting = async (body: Record<string, unknown> = { fileName: 'a.m4a', fileSize: 10 }) => {
@@ -472,5 +484,126 @@ describe('DELETE /api/meetings/:id', () => {
     expect(res.status).toBe(200);
     expect(cancelled).toEqual(['m-1']);
     expect(store.getMeeting('m-1')).toBeNull();
+  });
+});
+
+describe('W4：關聯的路由', () => {
+  /** 把一場會推到 READY，並讓它有一筆既有關聯可查 */
+  const readyPair = () => {
+    for (const id of ['m-1', 'm-2']) {
+      store.createMeeting({ meeting_id: id, created_at: Date.now(), source_file_name: 'a.m4a', source_file_size: 1 });
+      store.setStatus(id, 'TRANSCRIBING', Date.now());
+      store.setStatus(id, 'ANALYZING', Date.now());
+      store.setStatus(id, 'READY', Date.now());
+    }
+  };
+
+  const fakeLinker = (impl?: (id: string) => Promise<void>): TopicLinker => ({
+    link: async (id: string) => {
+      await impl?.(id);
+      return { status: 'LINKED', links: 0, coverage: {
+        candidates: 0, judged: 0, skipped_cap: 0, skipped_excluded: 0, skipped_error: 0,
+        incomparable_pairs: 0, error: null,
+      } };
+    },
+  });
+
+  it('GET 詳情帶著 links 與 linkRun', async () => {
+    readyPair();
+    store.saveLinkResult('m-1', {
+      algo_version: 'test-v1',
+      links: [{ other_meeting_id: 'm-2', confidence: 0.9, evidence: '理由', shared_topics: ['共同題目'] }],
+      coverage: { candidates: 1, judged: 1, skipped_cap: 0, skipped_excluded: 0, skipped_error: 0,
+            incomparable_pairs: 0, error: null },
+    }, Date.now());
+    await start();
+
+    const res = await fetch(`${url}/api/meetings/m-1`);
+    const body = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(body.links).toHaveLength(1);
+    expect(body.links[0].evidence).toBe('理由');
+    expect(body.linkRun).toMatchObject({ candidates: 1, judged: 1, skipped_error: 0 });
+  });
+
+  it('沒算過的會 linkRun 是 null、links 是空陣列', async () => {
+    readyPair();
+    await start();
+
+    const body = await (await fetch(`${url}/api/meetings/m-1`)).json() as any;
+    // 空陣列要配 status 讀才有意義：這裡是 READY，意思是「還沒算」不是「沒有相關會議」
+    expect(body.links).toEqual([]);
+    expect(body.linkRun).toBeNull();
+    expect(body.meeting.status).toBe('READY');
+  });
+
+  it('POST link 重算之後回新的 links 與 linkRun', async () => {
+    readyPair();
+    await start({
+      topicLinker: fakeLinker(async (id) => {
+        store.setStatus(id, 'LINKING', Date.now());
+        store.saveLinkResult(id, {
+          algo_version: 'test-v1',
+          links: [{ other_meeting_id: 'm-2', confidence: 0.7, evidence: '重算的理由', shared_topics: [] }],
+          coverage: { candidates: 1, judged: 1, skipped_cap: 0, skipped_excluded: 0, skipped_error: 0,
+            incomparable_pairs: 0, error: null },
+        }, Date.now());
+        store.setStatus(id, 'LINKED', Date.now());
+      }),
+    });
+
+    const res = await fetch(`${url}/api/meetings/m-1/link`, { method: 'POST' });
+    const body = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(body.meeting.status).toBe('LINKED');
+    expect(body.links[0].evidence).toBe('重算的理由');
+    expect(body.linkRun.judged).toBe(1);
+  });
+
+  it('關聯關掉時回 503，而且講得出是被關掉不是壞掉', async () => {
+    readyPair();
+    await start({ topicLinker: null });
+
+    const res = await fetch(`${url}/api/meetings/m-1/link`, { method: 'POST' });
+    expect(res.status).toBe(503);
+    expect((await res.json() as any).error).toContain('MEETPILOT_LINKING=off');
+  });
+
+  it('找不到的會回 404', async () => {
+    await start({ topicLinker: fakeLinker() });
+    const res = await fetch(`${url}/api/meetings/m-nope/link`, { method: 'POST' });
+    expect(res.status).toBe(404);
+  });
+
+  it('還沒 READY 的會回 409，而且不去呼叫 linker', async () => {
+    store.createMeeting({ meeting_id: 'm-1', created_at: Date.now(), source_file_name: 'a.m4a', source_file_size: 1 });
+    let called = 0;
+    await start({ topicLinker: fakeLinker(async () => { called += 1; }) });
+
+    const res = await fetch(`${url}/api/meetings/m-1/link`, { method: 'POST' });
+    expect(res.status).toBe(409);
+    expect((await res.json() as any).error).toContain('CREATED');
+    expect(called).toBe(0);
+  });
+
+  it('同一場會兩個重算同時進來，第二個回 409 而且講得出原因是「正在算」', async () => {
+    readyPair();
+    let release: () => void = () => {};
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    await start({ topicLinker: fakeLinker(async () => { await gate; }) });
+
+    const first = fetch(`${url}/api/meetings/m-1/link`, { method: 'POST' });
+    // 讓第一個請求走到 await 為止
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const second = await fetch(`${url}/api/meetings/m-1/link`, { method: 'POST' });
+
+    expect(second.status).toBe(409);
+    // 只靠狀態機擋的話訊息會說成「狀態不對」，那是在講結果不是講原因
+    expect((await second.json() as any).error).toContain('正在計算中');
+
+    release();
+    expect((await first).status).toBe(200);
   });
 });

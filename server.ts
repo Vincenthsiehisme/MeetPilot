@@ -10,6 +10,7 @@ import { createAudioFileStore, resolveAudioDir } from './services/audioFileStore
 import { createAudioSlicer, resolveFfmpegPaths } from './services/audioSlicer';
 import { createTranscriptionPipeline, requeueInterruptedMeetings } from './services/transcriptionPipeline';
 import { createTopicExtractor } from './services/topicExtractor';
+import { createTopicLinker, isLinkingEnabled } from './services/topicLinker';
 import { resolveSeamRepairConfig } from './services/seamRepair';
 import { createTranscriptionQueue } from './services/transcriptionQueue';
 import { createApp } from './services/createApp';
@@ -37,6 +38,15 @@ const geminiClient = createGeminiServerClient(llmLogger);
 // 才發現修復從頭到尾沒開過
 const seamRepair = resolveSeamRepairConfig(process.env);
 
+// 跨會議關聯（W4）。關掉時整個 module 不建，pipeline 收到 null 就跳過關聯、會議停在 READY
+// ——那是「還沒算」，跟 LINK_FAILED（算了、失敗了）不是同一件事
+const topicLinker = isLinkingEnabled(process.env)
+  ? createTopicLinker({ store: meetingStore, gemini: geminiClient })
+  : null;
+if (!topicLinker) {
+  console.log('[MeetPilot] MEETPILOT_LINKING=off，跨會議關聯關閉，會議會停在 READY');
+}
+
 const transcriptionPipeline = createTranscriptionPipeline({
   store: meetingStore,
   seamRepair,
@@ -44,6 +54,7 @@ const transcriptionPipeline = createTranscriptionPipeline({
   slicer: createAudioSlicer({ ffmpegPath: ffmpegPaths.ffmpeg, ffprobePath: ffmpegPaths.ffprobe }),
   gemini: geminiClient,
   topicExtractor: createTopicExtractor({ store: meetingStore, gemini: geminiClient }),
+  topicLinker,
 });
 // in-process 序列佇列：同一時間只跑一場會（理由見 services/transcriptionQueue.ts 檔頭）
 const transcriptionQueue = createTranscriptionQueue(transcriptionPipeline.run);
@@ -55,6 +66,7 @@ const app = createApp({
   transcriptionQueue,
   geminiClient,
   llmLogger,
+  topicLinker,
 });
 
 // Vite middleware & Production static serving

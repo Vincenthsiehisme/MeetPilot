@@ -21,6 +21,7 @@ import { GeminiServerClient, formatTranscriptWithTimeForAI, getAI } from './gemi
 import { AudioFileStore } from './audioFileStore';
 import { TranscriptionQueue } from './transcriptionQueue';
 import { deleteMeetingRequest, patchAnalysisRequest, patchTranscriptRequest } from './meetingEdits';
+import { TopicLinker } from './topicLinker';
 
 export interface AppDeps {
   listenConfig: ListenConfig;
@@ -29,10 +30,22 @@ export interface AppDeps {
   transcriptionQueue: TranscriptionQueue;
   geminiClient: GeminiServerClient;
   llmLogger: LlmLogger;
+  /** 跨會議關聯（W4）。null 代表這台 server 把關聯關掉了（`MEETPILOT_LINKING=off`） */
+  topicLinker?: TopicLinker | null;
 }
 
 export function createApp(deps: AppDeps): express.Express {
   const { listenConfig, meetingStore, audioStore, transcriptionQueue, geminiClient, llmLogger } = deps;
+  const topicLinker = deps.topicLinker ?? null;
+
+  /**
+   * 正在算關聯的會（W4）。同一場會兩個重算請求同時進來時，第二個回 409。
+   *
+   * 不靠狀態機擋就夠了嗎？不夠：第一個請求把狀態推成 LINKING 是同步的，但整段計算有很多 await，
+   * 而第二個請求讀到 LINKING 之後也會拿到「不是可以算關聯的狀態」——訊息會說成狀態不對，
+   * 那是在講結果不是講原因。這個集合讓「已經有人在算」講得出來。
+   */
+  const linking = new Set<string>();
 
   /**
    * 回給前端的 Meeting 一律帶 has_audio（契約檔的 MeetingView）。
@@ -354,6 +367,50 @@ export function createApp(deps: AppDeps): express.Express {
         // 題目標籤與上面的 tags 分成兩個欄位送（契約檔有寫為什麼不能併）
         topicTags: meetingStore.getTopicTags(req.params.id),
         seamReport: meetingStore.getSeamReport(req.params.id),
+        // 關聯與它的覆蓋率（W4）。空陣列要配 status 一起讀，理由在契約檔
+        links: meetingStore.getLinks(req.params.id),
+        linkRun: meetingStore.getLinkRun(req.params.id),
+      });
+    } catch (err) {
+      handleStoreError(err, res);
+    }
+  });
+
+  /**
+   * 重算這場會的關聯（W4）。換演算法版本、補上漏掉的候選、額度恢復之後重跑，走這一條。
+   *
+   * **同步等它跑完再回**，不像 `PUT audio` 那樣回 202 丟到背景：這是單人本機工具的手動動作，
+   * 最多 20 次 LLM 呼叫，而回 202 就得再開一套佇列與進度查詢，那一套的唯一用途就是這條路由。
+   * 代價寫在這裡：候選滿的時候這個請求會跑上幾分鐘。
+   */
+  app.post('/api/meetings/:id/link', async (req, res) => {
+    const meetingId = req.params.id;
+    if (!topicLinker) {
+      return res.status(503).json({ error: '這台 server 的跨會議關聯是關閉的（MEETPILOT_LINKING=off）' });
+    }
+    try {
+      const meeting = meetingStore.getMeeting(meetingId);
+      if (!meeting) return res.status(404).json({ error: `找不到 Meeting ${meetingId}` });
+      if (linking.has(meetingId)) {
+        return res.status(409).json({ error: `Meeting ${meetingId} 的關聯正在計算中，等它跑完再試` });
+      }
+      if (meeting.status !== 'READY' && meeting.status !== 'LINKED' && meeting.status !== 'LINK_FAILED') {
+        return res.status(409).json({
+          error: `Meeting ${meetingId} 目前是 ${meeting.status}，要 READY、LINKED 或 LINK_FAILED 才能算關聯`,
+        });
+      }
+
+      linking.add(meetingId);
+      try {
+        await topicLinker.link(meetingId);
+      } finally {
+        linking.delete(meetingId);
+      }
+
+      res.json({
+        meeting: toView(meetingStore.getMeeting(meetingId)!),
+        links: meetingStore.getLinks(meetingId),
+        linkRun: meetingStore.getLinkRun(meetingId),
       });
     } catch (err) {
       handleStoreError(err, res);

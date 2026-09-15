@@ -17,6 +17,10 @@ const fakeGemini = (extract: () => Promise<ExtractedTopicTag[]>): GeminiServerCl
   polishTranscript: async () => '',
   analyzeTranscript: async () => ({ overview: 'x', topics: [], decisions: [], action_items: [] }),
   extractTopicTags: extract,
+  embeddingModel: 'fake-embedding',
+  // W4 的兩支。這一層不算關聯，形狀要在，缺了型別就對不上
+  embedTopicTags: async (texts) => ({ model: 'fake-embedding', dimensions: 1, vectors: texts.map(() => [1]) }),
+  judgeMeetingPair: async () => ({ sameTopic: false, confidence: 0, reason: '假的判定', sharedTopics: [] }),
 });
 
 const extractorWith = (extract: () => Promise<ExtractedTopicTag[]>) =>

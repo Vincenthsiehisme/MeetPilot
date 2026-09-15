@@ -45,6 +45,7 @@ POST   /api/meetings              建立 Meeting（CREATED）
 PUT    /api/meetings/:id/audio    上傳音檔，立刻回 202，轉錄在 server 背景跑（TRANSCRIBING）
 GET    /api/meetings/:id          每 3 秒查一次進度（processed_slices / total_slices / status / error）
 POST   /api/meetings/:id/retry    FAILED 的會重跑（音檔還在才行）
+POST   /api/meetings/:id/link     重算跨會議關聯（READY / LINKED / LINK_FAILED 才行，同步等它跑完）
 DELETE /api/meetings/:id          刪掉；正在跑的回 409，等它結束或失敗再刪
 PATCH  /api/meetings/:id/transcript   改逐字稿或存潤稿
 PATCH  /api/meetings/:id/analysis     改會議記錄
@@ -172,6 +173,68 @@ WHERE status = 'READY' AND (topic_extraction_status IS NULL OR topic_extraction_
 新抽出來的標籤若跟人改過的同一題目撞上（`match_key` 相同）就整條跳過，保留人工版本。
 `empty` 與 `failed` 不刪既有標籤——這一輪沒抽到不代表上一輪抽到的是錯的。
 
+### 跨會議關聯：哪幾場會在討論同一件事
+
+題目標籤抽完、狀態進 `READY` 之後，server 接著算**跨會議關聯**，狀態走
+`READY → LINKING → LINKED`（失敗是 `LINK_FAILED`）。
+
+**兩段式，不是單一演算法：**
+
+1. **S2 召回**：把每條題目標籤送去取 embedding，跟歷史會議的標籤兩兩算 cosine。
+   至少 3 對標籤相似度 >= 0.7 才算候選。
+2. **S3 判定**：候選（最多 20 場，按最高相似度排）逐一交給 Gemini，回「是不是同一個題目」、
+   信心值、**一句判定理由**與共同題目清單。信心值 >= 0.5 才落地成關聯。
+
+門檻與 prompt 在 `services/topicLink.ts` 與 `services/geminiServerClient.ts`。
+**改它們要對評測集重跑並做前後比較**，不是改一個數字：關聯算錯的代價是人看到一則錯的關聯，
+而信任回不來。同一個理由，改完要把 `LINK_ALGO_VERSION` 換掉。
+
+向量存在 `topic_tag_embeddings`（float32 的 BLOB，帶 model 與維度）。**model 或維度對不上的兩條
+標籤不會被拿去比**，那是「不知道」不是「不像」。向量在抽完標籤時就算，既有的會第一次算關聯時補上；
+**換 embedding model 之後，舊 model 算的向量會在下一次關聯時自動重算**（不自動重算的話，舊向量會
+被全部判成不可比，那些會就安靜地關聯不到任何東西，狀態卻是正常的 `LINKED` ＋ 空集合）。真的還有
+比不了的向量時，`link_runs.incomparable_pairs` 會講出來。
+
+**三種狀態在資料上分得開**，這是 `READY` 與 `LINKED` 要拆成兩個狀態的全部理由：
+
+| 狀況 | `meetings.status` | `GET /api/meetings/:id` |
+|---|---|---|
+| 還沒算 | `READY` / `LINKING` | `links: []`、`linkRun: null` |
+| 算過了，沒有同題目的會 | `LINKED` | `links: []`、`linkRun.candidates = 0` |
+| 算了一部分（撞到額度） | `LINKED` | `linkRun.skipped_error > 0`、`linkRun.error` 有原因 |
+| 算壞了（一對都沒判成功） | `LINK_FAILED` | `meeting.error` 有原因 |
+
+**判的比候選少是常態**（有上限），所以每次計算的覆蓋率落在 `link_runs`，三種沒判到的原因分開數：
+
+| 欄位 | 意思 |
+|---|---|
+| `candidates` | S2 過門檻的對數 |
+| `judged` | 真的送去 S3 判過的對數 |
+| `skipped_cap` | 超出 20 場上限、分數最低那幾對 |
+| `skipped_excluded` | 人標過不相關的 |
+| `skipped_error` | 撞到額度或呼叫失敗，還沒輪到的 |
+| `incomparable_pairs` | embedding 的 model 或維度對不上、因此沒被比到的**標籤對**數。正常永遠是 0 |
+
+撞到額度時**已經判出來的關聯留著**、狀態仍是 `LINKED`，`skipped_error` 與 `error` 說明沒判完；
+一對都沒判成功才是 `LINK_FAILED`，而且**不動上一輪算出來的關聯**——這一輪沒算到不代表上一輪算到的是錯的。
+
+撈出「算到一半就停了」的會：
+
+```sql
+SELECT meeting_id, judged, candidates, skipped_error, error FROM link_runs WHERE skipped_error > 0;
+```
+
+**被標為不相關的關聯不會復活。** 排除紀錄存在 `link_exclusions`（跟關聯分開兩張表：關聯可以
+全量重建，人的判斷不行），原因分四種：`different_topic`、`outdated`、`not_needed`、`unspecified`。
+重算時被排除的那幾對連 S3 都不會打。**這一期還沒有標記不相關的入口**（跟人工修正標籤一樣走
+Obsidian vault 的受控區塊，之後才做），保護與測試先做在這裡，理由同題目標籤那一節。
+
+**`MEETPILOT_LINKING=off` 整個關掉關聯。** 關掉時會議停在 `READY`——那是「還沒算」，
+跟 `LINK_FAILED`（算了、失敗了）不是同一件事。關掉之後 `POST /api/meetings/:id/link` 回 503。
+
+**目前沒有關聯品質的實測數字。** 這一版的機制有測試把關，但兩段式組合起來對評測集的
+precision / recall 還沒跑過，門檻是沿用兩段各自單獨跑的結果推的。
+
 ### 把舊紀錄搬到 server
 
 搬遷由使用者在本機那一區按「搬到伺服器」發動，不會自動觸發（server 讀不到 IndexedDB）：
@@ -203,6 +266,8 @@ POST /api/meetings/import   { jobs: Job[], blobIds: string[] }
 見 `.env.example`。`MEETPILOT_AUDIO_DIR` 是上傳音檔的落地位置；`MEETPILOT_FFMPEG` 與
 `MEETPILOT_FFPROBE` 指定那兩支執行檔的路徑，不設就走 PATH。`MEETPILOT_DB` 是 SQLite 的位置，路徑不可寫時 server 直接起不來；
 資料庫的 schema 版本比程式碼新時也拒絕開啟，不用舊程式碼往裡面寫。`npm run dev` 與 `npm start` 用 Node 的 `--env-file-if-exists=.env` 讀 `.env`，沒有那個檔就只吃 shell 環境變數。`HOST` 不是本機位址時必須設 `MEETPILOT_BASIC_AUTH_USER` 與 `MEETPILOT_BASIC_AUTH_PASSWORD`，server 才會啟動。`/api/*` 每個 IP 每分鐘最多 `MEETPILOT_API_RATE_LIMIT` 次（預設 60）。放在反向代理後面時所有使用者會共用同一個 IP 的額度，Express 沒設 `trust proxy`，這是刻意的：設了又沒限定代理位址，`X-Forwarded-For` 就能繞過限流。
+
+`MEETPILOT_LINKING=off` 關掉跨會議關聯（預設開啟），關掉時會議停在 `READY`。
 
 每次 Gemini 呼叫會在 `MEETPILOT_LLM_LOG`（預設 `logs/llm.jsonl`）追加一行 JSON，設成 `off` 關閉。一次嘗試一行，fallback 鏈退了幾個模型、重試幾次都各自有一行，所以它回答得了「首選模型多常不可用」「撞限流時實際等多久」「一場會議燒多少 token」。**只記 metadata，不記逐字稿、提問或模型回覆**；拿不到的 token 數記成 `null`，不是 `0`。啟動時就開檔，路徑不可寫會直接讓 server 起不來。
 
