@@ -154,6 +154,27 @@ describe('transcribeSlice', () => {
 });
 
 describe('fallback 鏈', () => {
+  it('轉錄回應沒有文字或只回空物件時重試同一個 model，再退到下一個', async () => {
+    vi.useFakeTimers();
+    generateContent
+      .mockResolvedValueOnce({ text: '', usageMetadata: { thoughtsTokenCount: 21, totalTokenCount: 21 } })
+      .mockResolvedValueOnce({ text: '{}', usageMetadata: { thoughtsTokenCount: 13, totalTokenCount: 13 } })
+      .mockResolvedValueOnce({ text: '{"segments":[]}' });
+
+    const pending = client().transcribeSlice({ base64Data: 'AAAA' });
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    await expect(pending).resolves.toEqual([]);
+    expect(generateContent.mock.calls.map(c => (c[0] as any).model)).toEqual([
+      'gemini-3.8-flash', 'gemini-3.8-flash', 'gemini-3.1-flash-lite',
+    ]);
+    expect(logged.map(l => l.outcome)).toEqual(['transient', 'transient', 'ok']);
+    expect(logged.slice(0, 2).map(l => l.response)).toEqual([
+      { text: '', usageMetadata: { thoughtsTokenCount: 21, totalTokenCount: 21 } },
+      { text: '{}', usageMetadata: { thoughtsTokenCount: 13, totalTokenCount: 13 } },
+    ]);
+  });
+
   it('transient 錯誤重試同一個 model 兩次後才退到下一個，紀錄留下 modelIndex', async () => {
     vi.useFakeTimers();
     generateContent
