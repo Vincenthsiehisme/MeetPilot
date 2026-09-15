@@ -9,6 +9,7 @@ import { createGeminiServerClient } from './services/geminiServerClient';
 import { createAudioFileStore, resolveAudioDir } from './services/audioFileStore';
 import { createAudioSlicer, resolveFfmpegPaths } from './services/audioSlicer';
 import { createTranscriptionPipeline, requeueInterruptedMeetings } from './services/transcriptionPipeline';
+import { createTopicExtractor } from './services/topicExtractor';
 import { resolveSeamRepairConfig } from './services/seamRepair';
 import { createTranscriptionQueue } from './services/transcriptionQueue';
 import { createApp } from './services/createApp';
@@ -42,6 +43,7 @@ const transcriptionPipeline = createTranscriptionPipeline({
   audioStore,
   slicer: createAudioSlicer({ ffmpegPath: ffmpegPaths.ffmpeg, ffprobePath: ffmpegPaths.ffprobe }),
   gemini: geminiClient,
+  topicExtractor: createTopicExtractor({ store: meetingStore, gemini: geminiClient }),
 });
 // in-process 序列佇列：同一時間只跑一場會（理由見 services/transcriptionQueue.ts 檔頭）
 const transcriptionQueue = createTranscriptionQueue(transcriptionPipeline.run);

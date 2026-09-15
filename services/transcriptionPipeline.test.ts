@@ -7,8 +7,10 @@ import { GeminiServerClient } from './geminiServerClient';
 import { openMeetingDb } from './meetingDb';
 import { MeetingStore, createMeetingStore } from './meetingStore';
 import { SLICE_OVERLAP_SECONDS } from './transcriptMerge';
+import { createTopicExtractor } from './topicExtractor';
 import {
   SLICE_DURATION_SECONDS,
+  TranscriptionPipelineDeps,
   buildPreviousContext,
   createTranscriptionPipeline,
   requeueInterruptedMeetings,
@@ -77,8 +79,21 @@ const fakeGemini = (overrides: Partial<GeminiServerClient> = {}): GeminiServerCl
   ],
   polishTranscript: async () => '潤過的',
   analyzeTranscript: async () => analysis,
+  extractTopicTags: async () => [{ title: '題目 A', content: '這場會對題目 A 的討論' }],
   ...overrides,
 });
+
+/**
+ * 每一條測試都用**真的** TopicExtractor（假的只有 Gemini）。
+ *
+ * 給它一個假的 extractor 的話，「抽標籤掛掉會不會害這場會變成 FAILED」這條接線就沒有人測，
+ * 而那正是 W3 唯一會改變既有流程的地方
+ */
+const pipelineWith = (deps: Omit<TranscriptionPipelineDeps, 'topicExtractor'>) =>
+  createTranscriptionPipeline({
+    ...deps,
+    topicExtractor: createTopicExtractor({ store: deps.store, gemini: deps.gemini, now: deps.now }),
+  });
 
 const newMeeting = (id = 'm-1') =>
   store.createMeeting({ meeting_id: id, created_at: T0, source_file_name: 'a.m4a', source_file_size: 10 });
@@ -127,7 +142,7 @@ describe('run：整場跑完', () => {
     const present = new Set(['m-1']);
     const audioStore = fakeAudioStore(present);
     const removedAt: string[] = [];
-    const pipeline = createTranscriptionPipeline({
+    const pipeline = pipelineWith({
       store,
       audioStore: { ...audioStore, remove: (id: string) => { removedAt.push(store.getMeeting(id)!.status); audioStore.remove(id); } },
       slicer: fakeSlicer(THREE_SLICE_DURATION),
@@ -147,7 +162,7 @@ describe('run：整場跑完', () => {
   it('三片都送給 Gemini，逐字稿與進度一起落地', async () => {
     newMeeting();
     const offsets: number[] = [];
-    const pipeline = createTranscriptionPipeline({
+    const pipeline = pipelineWith({
       store,
       audioStore: fakeAudioStore(new Set(['m-1'])),
       slicer: fakeSlicer(THREE_SLICE_DURATION),
@@ -174,7 +189,7 @@ describe('run：整場跑完', () => {
   it('第二片開始要帶前文，否則講者編號會在片與片之間跳掉', async () => {
     newMeeting();
     const contexts: string[] = [];
-    const pipeline = createTranscriptionPipeline({
+    const pipeline = pipelineWith({
       store,
       audioStore: fakeAudioStore(new Set(['m-1'])),
       slicer: fakeSlicer(THREE_SLICE_DURATION),
@@ -218,7 +233,7 @@ describe('run：接縫報告落地', () => {
 
   it('接不起來的接縫記進 seam_report，逐字稿照樣全收（不吞內容）', async () => {
     newMeeting();
-    const pipeline = createTranscriptionPipeline({
+    const pipeline = pipelineWith({
       store,
       audioStore: fakeAudioStore(new Set(['m-1'])),
       slicer: fakeSlicer(THREE_SLICE_DURATION),
@@ -240,7 +255,7 @@ describe('run：接縫報告落地', () => {
 
   it('接得上的接縫記成 duplicate，並寫出丟了幾段', async () => {
     newMeeting();
-    const pipeline = createTranscriptionPipeline({
+    const pipeline = pipelineWith({
       store,
       audioStore: fakeAudioStore(new Set(['m-1'])),
       slicer: fakeSlicer(THREE_SLICE_DURATION),
@@ -298,7 +313,7 @@ describe('run：破洞修復（W2-2b）', () => {
 
   const runWith = async (gemini: GeminiServerClient, seamRepair?: { enabled: boolean; budget: number }) => {
     newMeeting();
-    const pipeline = createTranscriptionPipeline({
+    const pipeline = pipelineWith({
       store,
       audioStore: fakeAudioStore(new Set(['m-1'])),
       slicer: fakeSlicer(SLICE_DURATION_SECONDS + 200),
@@ -343,7 +358,7 @@ describe('run：破洞修復（W2-2b）', () => {
     newMeeting();
     const seen = new Map<number, number>();
     const calls: number[] = [];
-    const pipeline = createTranscriptionPipeline({
+    const pipeline = pipelineWith({
       store,
       audioStore: fakeAudioStore(new Set(['m-1'])),
       slicer: fakeSlicer(THREE_SLICE_DURATION),
@@ -394,7 +409,7 @@ describe('run：破洞修復（W2-2b）', () => {
   it('接得上的接縫不送任何額外轉錄：修復只為破洞付錢', async () => {
     newMeeting();
     const calls: number[] = [];
-    const pipeline = createTranscriptionPipeline({
+    const pipeline = pipelineWith({
       store,
       audioStore: fakeAudioStore(new Set(['m-1'])),
       slicer: fakeSlicer(THREE_SLICE_DURATION),
@@ -422,7 +437,7 @@ describe('run：多片合併（overlap 去重）', () => {
   it('每片都回含 overlap 的完整內容時，合併結果沒有缺口、時間不倒退、接縫重複有界', async () => {
     newMeeting();
     const seen: { offsetSeconds: number; previousContext: string }[] = [];
-    const pipeline = createTranscriptionPipeline({
+    const pipeline = pipelineWith({
       store,
       audioStore: fakeAudioStore(new Set(['m-1'])),
       slicer: fakeSlicer(THREE_SLICE_DURATION),
@@ -455,7 +470,7 @@ describe('run：多片合併（overlap 去重）', () => {
 
   it('同一秒的內容不會被重複收太多次：overlap 區只留一段接縫', async () => {
     newMeeting();
-    const pipeline = createTranscriptionPipeline({
+    const pipeline = pipelineWith({
       store,
       audioStore: fakeAudioStore(new Set(['m-1'])),
       slicer: fakeSlicer(THREE_SLICE_DURATION),
@@ -487,7 +502,7 @@ describe('run：失敗', () => {
   it('轉錄中途失敗時狀態是 FAILED 帶原因，而且音檔還在', async () => {
     newMeeting();
     const present = new Set(['m-1']);
-    const pipeline = createTranscriptionPipeline({
+    const pipeline = pipelineWith({
       store,
       audioStore: fakeAudioStore(present),
       slicer: fakeSlicer(THREE_SLICE_DURATION),
@@ -514,7 +529,7 @@ describe('run：失敗', () => {
   it('分析失敗時一樣 FAILED 且音檔還在，逐字稿留著', async () => {
     newMeeting();
     const present = new Set(['m-1']);
-    const pipeline = createTranscriptionPipeline({
+    const pipeline = pipelineWith({
       store,
       audioStore: fakeAudioStore(present),
       slicer: fakeSlicer(SLICE_DURATION_SECONDS),
@@ -532,7 +547,7 @@ describe('run：失敗', () => {
   it('每一片都沒轉出內容時擋在分析前面，不送空逐字稿去生一份憑空的摘要', async () => {
     newMeeting();
     const analyzeTranscript = vi.fn(async () => analysis);
-    const pipeline = createTranscriptionPipeline({
+    const pipeline = pipelineWith({
       store,
       audioStore: fakeAudioStore(new Set(['m-1'])),
       slicer: fakeSlicer(SLICE_DURATION_SECONDS),
@@ -548,7 +563,7 @@ describe('run：失敗', () => {
   it('音檔不在時直接 FAILED，不會去呼叫 ffprobe', async () => {
     newMeeting();
     const probeDurationSeconds = vi.fn(async () => THREE_SLICE_DURATION);
-    const pipeline = createTranscriptionPipeline({
+    const pipeline = pipelineWith({
       store,
       audioStore: fakeAudioStore(new Set()),
       slicer: { probeDurationSeconds, readSlice: async () => Buffer.from('x') },
@@ -565,7 +580,7 @@ describe('run：失敗', () => {
     newMeeting();
     const audioStore = fakeAudioStore(new Set(['m-1']));
     const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
-    const pipeline = createTranscriptionPipeline({
+    const pipeline = pipelineWith({
       store,
       audioStore: {
         ...audioStore,
@@ -590,7 +605,7 @@ describe('run：失敗', () => {
     store.setStatus('m-1', 'TRANSCRIBING', T0 + 1);
     store.setStatus('m-1', 'ANALYZING', T0 + 2);
     store.setStatus('m-1', 'READY', T0 + 3);
-    const pipeline = createTranscriptionPipeline({
+    const pipeline = pipelineWith({
       store, audioStore: fakeAudioStore(new Set(['m-1'])), slicer: fakeSlicer(600), gemini: fakeGemini(),
     });
 
@@ -613,7 +628,7 @@ describe('run：續傳', () => {
 
     const sliced: number[] = [];
     const offsets: number[] = [];
-    const pipeline = createTranscriptionPipeline({
+    const pipeline = pipelineWith({
       store,
       audioStore: fakeAudioStore(new Set(['m-1'])),
       slicer: fakeSlicer(THREE_SLICE_DURATION, async (_path, start) => {
@@ -782,6 +797,7 @@ describe('requeueInterruptedMeetings', () => {
         meeting_id: 'job/怪 id', title: null, status: 'TRANSCRIBING', created_at: T0, updated_at: T0,
         source_file_name: null, source_file_size: null, origin: 'migrated', error: null,
         processed_slices: null, total_slices: null, meeting_context: null,
+        topic_extraction_status: null, topic_extraction_error: null,
       },
       transcript: null, analysis: null, tags: [],
     }]);
@@ -793,6 +809,56 @@ describe('requeueInterruptedMeetings', () => {
 
     expect(report.failed[0].reason).toMatch(/無法判斷音檔位置/);
     expect(store.getMeeting('job/怪 id')?.status).toBe('FAILED');
+  });
+});
+
+describe('題目標籤（W3）', () => {
+  const runOnce = async (gemini: GeminiServerClient) => {
+    newMeeting();
+    const pipeline = pipelineWith({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(SLICE_DURATION_SECONDS),
+      gemini,
+      now: () => T0 + 1,
+    });
+    await pipeline.run('m-1');
+  };
+
+  it('分析成功之後抽標籤，而且是在進 READY 之前：READY 的會一定有抽取結果', async () => {
+    const statusWhenExtracting: (string | undefined)[] = [];
+    await runOnce(fakeGemini({
+      extractTopicTags: async () => {
+        statusWhenExtracting.push(store.getMeeting('m-1')?.status);
+        return [{ title: 'POC 時程', content: '卡在報價' }];
+      },
+    }));
+
+    expect(statusWhenExtracting).toEqual(['ANALYZING']);
+    expect(statuses).toEqual(['TRANSCRIBING', 'ANALYZING', 'READY']);
+    expect(store.getMeeting('m-1')?.topic_extraction_status).toBe('ok');
+    expect(store.getTopicTags('m-1').map(t => t.title)).toEqual(['POC 時程']);
+  });
+
+  it('**抽不出標籤不會讓這場會變成 FAILED**：分析已經成功，標成失敗是謊報（Q2 裁決）', async () => {
+    await runOnce(fakeGemini({
+      extractTopicTags: async () => { throw new Error('模型輸出被截斷'); },
+    }));
+
+    expect(statuses).toEqual(['TRANSCRIBING', 'ANALYZING', 'READY']);
+    const meeting = store.getMeeting('m-1');
+    expect(meeting?.status).toBe('READY');
+    expect(meeting?.topic_extraction_status).toBe('failed');
+    expect(meeting?.topic_extraction_error).toBe('模型輸出被截斷');
+    // 這場會的 error 欄是給狀態機用的，抽標籤失敗不該污染它
+    expect(meeting?.error).toBeNull();
+  });
+
+  it('一條標籤都沒抽到時是 empty，這場會照樣 READY', async () => {
+    await runOnce(fakeGemini({ extractTopicTags: async () => [] }));
+
+    expect(store.getMeeting('m-1')?.status).toBe('READY');
+    expect(store.getMeeting('m-1')?.topic_extraction_status).toBe('empty');
   });
 });
 

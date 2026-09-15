@@ -205,3 +205,58 @@ describe('polishTranscript', () => {
     expect(await client().polishTranscript([{ start: 0, end: 1, text: 'x' }])).toBe('無法生成修潤內容');
   });
 });
+
+describe('extractTopicTags', () => {
+  const transcript = [{ start: 0, end: 65, text: 'POC 時程還沒定', speaker: 'A' }];
+
+  it('用的是題目標籤專屬的 prompt，不是 analyze 那一份', async () => {
+    generateContent.mockResolvedValue({ text: '{"tags":[]}' });
+
+    await client().extractTopicTags({ transcript });
+
+    const request = generateContent.mock.calls[0][0] as any;
+    // 這三段字是 U-001 第二版 prompt 的骨架（跨會議比對、具體不概括、15 到 25）。
+    // 換成 analyze 的 systemInstruction 會把一場會壓成 3 到 5 個抽象標題，
+    // 那個粒度下任何關聯策略都認不出同一題目
+    expect(request.config.systemInstruction).toContain('跨會議比對');
+    expect(request.config.systemInstruction).toContain('15 到 25');
+    expect(request.config.systemInstruction).not.toContain('會議記錄師');
+    // 逐字稿帶時間戳送進去，與評測那一跑吃到的形狀一致
+    expect(request.contents).toContain('[00:00-01:05] A: POC 時程還沒定');
+  });
+
+  it('解析 tags 並去掉前後空白', async () => {
+    generateContent.mockResolvedValue({
+      text: '```json\n{"tags":[{"title":" POC 時程 ","content":" 卡在報價 "}]}\n```',
+    });
+
+    expect(await client().extractTopicTags({ transcript }))
+      .toEqual([{ title: 'POC 時程', content: '卡在報價' }]);
+  });
+
+  it('空陣列是合法結果：那是「這份逐字稿沒有可抽的題目」，由上層記成 empty', async () => {
+    generateContent.mockResolvedValue({ text: '{"tags":[]}' });
+    expect(await client().extractTopicTags({ transcript })).toEqual([]);
+  });
+
+  it('回的不是合法 JSON 時拋錯，不退成空陣列：空陣列跟「真的沒有題目」分不開', async () => {
+    generateContent.mockResolvedValue({ text: '{"tags":[{"title":"被截斷' });
+    await expect(client().extractTopicTags({ transcript })).rejects.toThrow(/不是合法 JSON/);
+  });
+
+  it('沒有 tags 陣列時拋錯，不當成沒抽到', async () => {
+    generateContent.mockResolvedValue({ text: '{"topics":[]}' });
+    await expect(client().extractTopicTags({ transcript })).rejects.toThrow(/沒有 tags 陣列/);
+  });
+
+  it('某一條缺 title 時整份拋掉，不偷偷跳過壞掉的那幾條', async () => {
+    generateContent.mockResolvedValue({ text: '{"tags":[{"title":"好的","content":"x"},{"content":"沒有標題"}]}' });
+    await expect(client().extractTopicTags({ transcript })).rejects.toThrow(/第 1 條沒有 title/);
+  });
+
+  it('紀錄的 kind 是 extract-tags：算得出這件事燒掉多少額度', async () => {
+    generateContent.mockResolvedValue({ text: '{"tags":[]}' });
+    await client().extractTopicTags({ transcript });
+    expect(logged.map(l => l.kind)).toEqual(['extract-tags']);
+  });
+});

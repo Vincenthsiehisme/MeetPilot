@@ -9,11 +9,18 @@
  * 「解析失敗」會散成好幾種處理方式。
  */
 import type { DatabaseSync } from 'node:sqlite';
+import { randomUUID } from 'node:crypto';
 import { Meeting, TranscriptSegment } from '../types';
 import { AnalysisV2, isAnalysisV2SemanticallyEmpty } from './analysisContract';
 import { MigrationRecord } from './jobMigration';
 import { SeamReportEntry } from './meetingApi';
 import { MeetingStatus, assertTransition, isMeetingStatus } from './meetingState';
+import {
+  MATCH_KEY_VERSION,
+  TopicExtractionStatus,
+  TopicTag,
+  isTopicExtractionStatus,
+} from './topicTag';
 
 export interface TranscriptRecord {
   segments: TranscriptSegment[];
@@ -30,6 +37,36 @@ export interface TranscriptRecord {
 export interface TranscriptPatch {
   segments?: TranscriptSegment[];
   polished_content?: string | null;
+}
+
+/**
+ * 要寫進去的一條 auto 題目標籤。`tag_id` 由 store 生，呼叫端不用管。
+ *
+ * `match_key` 由 `TopicExtractor` 算好傳進來（規則見 topicTag.ts），不是在這裡算：
+ * 正規化是那個 module 存在的理由之一，散進儲存層之後兩邊會各自演化。
+ */
+export interface NewAutoTopicTag {
+  title: string;
+  content: string;
+  match_key: string;
+  match_key_version: number;
+}
+
+/**
+ * 一次抽取的結果（W3）。三種情形分開寫，是因為它們要做的事不一樣：
+ * 只有 `ok` 會動 topic_tags，`empty` 與 `failed` 只留標記。
+ */
+export type TopicExtractionResult =
+  | { status: 'ok'; tags: readonly NewAutoTopicTag[] }
+  | { status: 'empty' }
+  | { status: 'failed'; error: string };
+
+export interface TopicTagWriteReport {
+  inserted: number;
+  /** 因為同一場會已經有人工標籤佔著同一個 match_key 而沒有寫進去的標題 */
+  skippedByManual: string[];
+  /** 這一批自己有兩條以上 match_key 相同，只留第一條，其餘的標題在這裡 */
+  skippedDuplicate: string[];
 }
 
 export interface CreateMeetingInput {
@@ -59,6 +96,16 @@ type MeetingRow = {
   processed_slices: number | null;
   total_slices: number | null;
   meeting_context: string | null;
+  topic_extraction_status: string | null;
+  topic_extraction_error: string | null;
+};
+
+/** null 是「還沒抽過」，其餘只認三個值。認不得的值往下傳會讓畫面顯示一個不存在的抽取狀態，而那不會有任何錯誤 */
+const readExtractionStatus = (row: MeetingRow): TopicExtractionStatus | null => {
+  const raw = row.topic_extraction_status;
+  if (raw === null) return null;
+  if (isTopicExtractionStatus(raw)) return raw;
+  throw new Error(`Meeting ${row.meeting_id} 的 topic_extraction_status 不是合法值：${raw}`);
 };
 
 const toMeeting = (row: MeetingRow): Meeting => {
@@ -70,7 +117,22 @@ const toMeeting = (row: MeetingRow): Meeting => {
   if (row.origin !== 'native' && row.origin !== 'migrated') {
     throw new Error(`Meeting ${row.meeting_id} 的 origin 不是合法值：${row.origin}`);
   }
-  return { ...row, status: row.status, origin: row.origin };
+  return {
+    ...row,
+    status: row.status,
+    origin: row.origin,
+    topic_extraction_status: readExtractionStatus(row),
+  };
+};
+
+type TopicTagRow = Omit<TopicTag, 'source'> & { source: string };
+
+const toTopicTag = (row: TopicTagRow): TopicTag => {
+  if (row.source !== 'auto' && row.source !== 'manual') {
+    // 分不出來源就沒有人工優先可言：往下傳的話，重算會不會蓋掉它變成看運氣
+    throw new Error(`TopicTag ${row.tag_id} 的 source 不是合法值：${row.source}`);
+  }
+  return { ...row, source: row.source };
 };
 
 export const createMeetingStore = (db: DatabaseSync) => {
@@ -81,8 +143,9 @@ export const createMeetingStore = (db: DatabaseSync) => {
 
   const insertMeeting = db.prepare(`
     INSERT INTO meetings (meeting_id, title, status, created_at, updated_at, source_file_name,
-                          source_file_size, origin, error, processed_slices, total_slices, meeting_context)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                          source_file_size, origin, error, processed_slices, total_slices, meeting_context,
+                          topic_extraction_status, topic_extraction_error)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   // upsert 而不是 INSERT OR REPLACE：後者是砍掉整列再插一列，會把這個 statement 沒列出來的欄位
   // （seam_report）一起清成 null。逐字稿每轉完一片就寫一次，用 REPLACE 的話接縫紀錄每片都被沖掉一次
@@ -99,6 +162,16 @@ export const createMeetingStore = (db: DatabaseSync) => {
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `);
   const insertTag = db.prepare('INSERT OR IGNORE INTO meeting_tags (meeting_id, tag) VALUES (?, ?)');
+  const insertTopicTag = db.prepare(`
+    INSERT INTO topic_tags (tag_id, meeting_id, title, content, source, corrected_at,
+                            match_key, match_key_version, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  // 排序鍵明寫到唯一為止（理由同 selectAll）：同一批標籤的 created_at 全都一樣，
+  // 只用它排的話順序未定義，而 vault markdown 每次投影出來的行序會跟著跳
+  const selectTopicTags = db.prepare(
+    'SELECT * FROM topic_tags WHERE meeting_id = ? ORDER BY created_at, title, tag_id',
+  );
 
   const getMeeting = (id: string): Meeting | null => {
     const row = selectOne.get(id) as MeetingRow | undefined;
@@ -168,6 +241,10 @@ export const createMeetingStore = (db: DatabaseSync) => {
         null,
         null,
         input.meeting_context ?? null,
+        // 新建的會還沒抽過標籤。這裡寫死 null 而不是省略欄位：省略的話新增欄位時
+        // 會安靜地吃到資料庫預設值，而那不一定是這裡想要的
+        null,
+        null,
       );
       return requireMeeting(input.meeting_id);
     },
@@ -398,6 +475,86 @@ export const createMeetingStore = (db: DatabaseSync) => {
       (db.prepare('SELECT tag FROM meeting_tags WHERE meeting_id = ? ORDER BY tag').all(id) as { tag: string }[])
         .map(r => r.tag),
 
+    /** 一場會的題目標籤，auto 與 manual 都在裡面（W3）。跟 getTags 是兩件事，見 topicTag.ts 檔頭 */
+    getTopicTags: (id: string): TopicTag[] =>
+      (selectTopicTags.all(id) as TopicTagRow[]).map(toTopicTag),
+
+    /**
+     * 落地一次抽取的結果：標籤與狀態同一個交易（W3，SDD 1.2）。
+     *
+     * 分兩次寫的話，中間掛掉會留下「標籤寫進去了但狀態還是 null」——那看起來是
+     * 「這場會還沒抽過」，下一輪重算會再抽一次、再寫一批，而舊的那批已經在表裡。
+     *
+     * **人工優先（SDD 1.2）：只刪 `source = 'auto'` 的列。** manual 的一列都不碰，
+     * 而且新抽出來的標籤只要 match_key 跟既有的 manual 撞上就整條跳過——不跳過的話，
+     * 同一場會的同一題目會同時存在「人改過的」與「模型又抽一次的」兩條，
+     * 人工修正等於白做，而且沒有任何錯誤訊息。
+     *
+     * `empty` 與 `failed` **不刪既有標籤**：這一輪沒抽到不代表上一輪抽到的是錯的，
+     * 刪掉只會讓這場會連舊的關聯原料都沒有。狀態欄已經把「最新一輪沒抽到」講清楚了。
+     */
+    saveTopicExtraction: (id: string, result: TopicExtractionResult, at: number): TopicTagWriteReport => {
+      requireMeeting(id);
+      const report: TopicTagWriteReport = { inserted: 0, skippedByManual: [], skippedDuplicate: [] };
+
+      if (result.status === 'ok' && result.tags.length === 0) {
+        // 空集合要走 'empty'，那是它自己的狀態。當成 ok 寫下去的話，
+        // 「抽到 0 條」在資料上跟「抽得好好的」長得一樣
+        throw new Error(`Meeting ${id} 的抽取結果是 ok 卻沒有任何標籤，應該用 empty`);
+      }
+
+      db.exec('BEGIN');
+      try {
+        if (result.status === 'ok') {
+          const manualKeys = new Set(
+            (db.prepare("SELECT match_key FROM topic_tags WHERE meeting_id = ? AND source = 'manual'")
+              .all(id) as { match_key: string }[]).map(r => r.match_key),
+          );
+          db.prepare("DELETE FROM topic_tags WHERE meeting_id = ? AND source = 'auto'").run(id);
+
+          const seen = new Set<string>();
+          for (const tag of result.tags) {
+            if (tag.match_key === '') {
+              // 空鍵跟空鍵會互相「相等」，會把兩件不相干的事判成同一題。
+              // TopicExtractor 應該已經擋掉了，這裡是最後一道
+              throw new Error(`Meeting ${id} 的標籤「${tag.title}」算不出比對鍵，不寫入`);
+            }
+            if (tag.match_key_version !== MATCH_KEY_VERSION) {
+              throw new Error(
+                `Meeting ${id} 的標籤「${tag.title}」帶的比對鍵版本是 ${tag.match_key_version}，`
+                + `這一版只寫 ${MATCH_KEY_VERSION}`,
+              );
+            }
+            if (manualKeys.has(tag.match_key)) {
+              report.skippedByManual.push(tag.title);
+              continue;
+            }
+            if (seen.has(tag.match_key)) {
+              report.skippedDuplicate.push(tag.title);
+              continue;
+            }
+            seen.add(tag.match_key);
+            insertTopicTag.run(
+              randomUUID(), id, tag.title, tag.content, 'auto', null,
+              tag.match_key, tag.match_key_version, at,
+            );
+            report.inserted += 1;
+          }
+        }
+
+        const status: TopicExtractionStatus = result.status;
+        db.prepare(
+          'UPDATE meetings SET topic_extraction_status = ?, topic_extraction_error = ?, updated_at = ? '
+          + 'WHERE meeting_id = ?',
+        ).run(status, result.status === 'failed' ? result.error : null, at, id);
+        db.exec('COMMIT');
+      } catch (err) {
+        db.exec('ROLLBACK');
+        throw err;
+      }
+      return report;
+    },
+
     /**
      * Migration 匯入。整批一個交易：中途失敗就整批回退，不留半套。
      * 已存在的 meeting_id 跳過而不是覆寫，重跑匯入才安全；覆寫會把 server 上已經往前跑過的
@@ -417,6 +574,7 @@ export const createMeetingStore = (db: DatabaseSync) => {
             meeting.meeting_id, meeting.title, meeting.status, meeting.created_at, meeting.updated_at,
             meeting.source_file_name, meeting.source_file_size, meeting.origin, meeting.error,
             meeting.processed_slices, meeting.total_slices, meeting.meeting_context,
+            meeting.topic_extraction_status, meeting.topic_extraction_error,
           );
           if (record.transcript) writeTranscript(meeting.meeting_id, record.transcript, meeting.created_at);
           if (record.analysis) writeAnalysis(meeting.meeting_id, record.analysis, meeting.created_at);

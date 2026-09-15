@@ -9,6 +9,7 @@
  */
 import { Job, Meeting, TranscriptSegment } from '../types';
 import { AnalysisV2 } from './analysisContract';
+import { TopicTag } from './topicTag';
 
 /** 音檔上傳的 Content-Type。刻意不是 JSON：這條路徑不經 body parser，body 直接 pipe 進檔案 */
 export const AUDIO_CONTENT_TYPE = 'application/octet-stream';
@@ -63,7 +64,16 @@ export interface MeetingDetailResponse {
   meeting: MeetingView;
   transcript: { segments: TranscriptSegment[]; polished_content: string | null } | null;
   analysis: AnalysisV2 | null;
+  /** 使用者建立會議時自己打的會議標籤（`meeting_tags`），只當 prompt 背景 */
   tags: string[];
+  /**
+   * 模型抽出來、要拿去跨會議比對的題目標籤（W3 的 `topic_tags`）。
+   *
+   * **跟上面的 `tags` 是兩件事，不要合併顯示**：那是人打的會議標籤，這是模型抽的題目，
+   * 而人工優先規則只套用在這一組。沒有標籤時是空陣列；「還沒抽過」與「抽過但一條都沒有」
+   * 要看 `meeting.topic_extraction_status`（null 是還沒抽過）
+   */
+  topicTags: TopicTag[];
   /**
    * 每個切片接縫的對齊結果（W2-2）。單片的會、還沒開始轉的會是 null。
    * 裡面有 `verdict: 'gap'` 的項目代表這份逐字稿在那個接縫確實缺了一段內容

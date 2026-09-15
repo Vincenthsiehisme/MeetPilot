@@ -22,6 +22,8 @@ import type { AnalysisV2 } from './analysisContract';
 
 const meeting = (overrides: Partial<Meeting> = {}): Meeting => ({
   meeting_id: 'm_1',
+  topic_extraction_status: null,
+  topic_extraction_error: null,
   title: null,
   status: 'CREATED',
   created_at: 1000,

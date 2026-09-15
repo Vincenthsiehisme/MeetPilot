@@ -1,4 +1,5 @@
 import { MeetingStatus } from './services/meetingState';
+import { TopicExtractionStatus } from './services/topicTag';
 export enum JobStatus {
   PENDING = 'PENDING',
   RUNNING = 'RUNNING',
@@ -76,6 +77,14 @@ export interface Meeting {
   processed_slices: number | null;
   total_slices: number | null;
   meeting_context: string | null;
+  /**
+   * 題目標籤抽取的結果（W3）。**null 是「還沒抽過」**——W3 之前就 READY 的會與搬遷進來的會
+   * 都是這個值，跟 'empty'（抽過、模型一條都沒回）不是同一件事。
+   * 'empty' 與 'failed' 的會永遠不會參與任何關聯，靠這一欄查得出來
+   */
+  topic_extraction_status: TopicExtractionStatus | null;
+  /** 抽取失敗的原因。只有 'failed' 會有值，其餘一律 null */
+  topic_extraction_error: string | null;
 }
 
 export interface ChatMessage {

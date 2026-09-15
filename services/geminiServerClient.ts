@@ -98,10 +98,46 @@ export interface AnalyzeTranscriptInput {
   meetingContext?: string;
 }
 
+/** 模型回的一條題目標籤。落地前還要算比對鍵，見 services/topicExtractor.ts */
+export interface ExtractedTopicTag {
+  title: string;
+  content: string;
+}
+
+/**
+ * 題目標籤抽取的 systemInstruction（`FN-03`）。
+ *
+ * **整段照搬 `eval/extract-tags.ts`，包含那六條規則，一個字都不要改。** 它是 U-001 第二版的
+ * 產物：同一組關聯策略、同一份評測集，只換這段字，S3 的 recall 就從 0.333 升到 0.667。
+ * 改它等於讓已經落地的標籤與新抽的標籤來自兩種粒度，而那不會有任何錯誤訊息，
+ * 只會讓兩場本來對得上的會安靜地對不上。要改就要重跑評測。
+ *
+ * 也不要改成沿用 analyze 的 systemInstruction：那個 prompt 是為「給人看的會議記錄」寫的，
+ * 會把一場會壓成 3 到 5 個抽象標題，任何關聯策略都認不出具體的同一題目（2026-09-14 實測）。
+ */
+const EXTRACT_TAGS_SYSTEM_INSTRUCTION = `你要從會議逐字稿抽出「題目標籤」。這些標籤的唯一用途是拿去跨會議比對，找出不同場會議在討論同一件事。
+
+這跟整理會議記錄不同。會議記錄要概括，一場會三到五個大項就夠；題目標籤要具體，因為兩場會的重疊往往只落在其中一兩個細項上，概括掉就比不出來了。
+
+規則：
+
+1. 一個標籤代表一件具體的事：一個待決事項、一個系統或流程、一個規則、一個對象。
+2. 不要把兩件事綁進同一個標籤。「A 與 B」這種標題會讓比對失效，該拆成兩個。
+3. 標籤要能離開這場會被讀懂。不要用只有在場的人才知道指什麼的代稱。
+4. 涵蓋整場會，包含只討論幾分鐘但有具體內容的事。
+5. 數量通常落在 15 到 25 之間。很短的會議可以少，但不要為了湊數把一件事拆成兩件。
+6. 逐字稿可能有同音錯字與語意破碎的段落。看得出是什麼就用正確的寫法，看不出來就跳過那一段，不要猜。
+
+每個標籤附一句 content，寫這件事在這場會裡的具體內容：有哪些選項、決定了什麼、卡在哪。
+
+回傳純 JSON，不要 Markdown 標記。`;
+
 export interface GeminiServerClient {
   transcribeSlice(input: TranscribeSliceInput): Promise<TranscriptSegment[]>;
   polishTranscript(transcript: TranscriptSegment[]): Promise<string>;
   analyzeTranscript(input: AnalyzeTranscriptInput): Promise<GeminiOutput>;
+  /** 題目標籤抽取（W3）。回空陣列是合法結果（模型說這份逐字稿沒有可抽的題目），不是錯誤 */
+  extractTopicTags(input: { transcript: TranscriptSegment[] }): Promise<ExtractedTopicTag[]>;
 }
 
 export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClient {
@@ -375,6 +411,68 @@ ${formattedTranscript}`,
 
       const jsonStr = cleanJsonString(response.text);
       return JSON.parse(jsonStr) as GeminiOutput;
+    },
+
+    async extractTopicTags(input: { transcript: TranscriptSegment[] }): Promise<ExtractedTopicTag[]> {
+      const ai = getAI();
+
+      const response = await generateContentWithFallback(ai, {
+        kind: 'extract-tags',
+        // 不指定 preferredModel：fallback 鏈就是評測跑出 15 到 25 那個結果時用的那條
+        // （eval/lib/client.ts 的 ANALYZE_MODELS），加一個首選等於換掉受測對象
+        contents: `會議逐字稿：\n${formatTranscriptWithTimeForAI(input.transcript)}`,
+        config: {
+          maxOutputTokens: 8192,
+          systemInstruction: EXTRACT_TAGS_SYSTEM_INSTRUCTION,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              tags: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    title: { type: Type.STRING },
+                    content: { type: Type.STRING },
+                  },
+                  required: ['title', 'content'],
+                },
+              },
+            },
+            required: ['tags'],
+          },
+        },
+      });
+
+      const jsonStr = cleanJsonString(response.text);
+      let parsed: any;
+      try {
+        parsed = JSON.parse(jsonStr);
+      } catch (err) {
+        // 解不開就拋，不要退成空陣列：空陣列在上層跟「這場會真的沒有題目可抽」分不開，
+        // 而那種會永遠不會參與任何關聯（SDD 4.x）。拋上去之後 TopicExtractor 會把它
+        // 記成 failed 並附上原因，這場會照樣進 READY
+        throw new Error(
+          `題目標籤的回應不是合法 JSON（模型輸出可能被截斷）：${(err as Error).message}。`
+          + `收到的開頭：${jsonStr.slice(0, 200)}`,
+        );
+      }
+      if (!Array.isArray(parsed?.tags)) {
+        throw new Error(`題目標籤的回應沒有 tags 陣列，模型回的形狀不對：${jsonStr.slice(0, 200)}`);
+      }
+
+      return parsed.tags.map((tag: any, index: number) => {
+        // 形狀不對就整份拋掉，不要偷偷跳過壞掉的那幾條：跳過之後「模型少抽了五條」
+        // 與「模型回的形狀壞了」在標籤數上長得一模一樣
+        if (typeof tag?.title !== 'string' || tag.title.trim() === '') {
+          throw new Error(`題目標籤第 ${index} 條沒有 title：${JSON.stringify(tag).slice(0, 200)}`);
+        }
+        if (typeof tag?.content !== 'string') {
+          throw new Error(`題目標籤「${tag.title}」的 content 不是字串：${JSON.stringify(tag).slice(0, 200)}`);
+        }
+        return { title: tag.title.trim(), content: tag.content.trim() };
+      });
     },
   };
 }
