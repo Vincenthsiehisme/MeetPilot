@@ -3,20 +3,28 @@ import { LlmCallInput } from './llmTelemetry';
 
 // @google/genai 整包換掉：這些測試要驗的是 prompt 組裝、fallback 鏈與回應解析，
 // 不是真的去打 Gemini。vi.hoisted 是因為 vi.mock 的 factory 會被提到 import 之前執行
-const { generateContent } = vi.hoisted(() => ({ generateContent: vi.fn() }));
+const { generateContent, embedContent } = vi.hoisted(() => ({
+  generateContent: vi.fn(),
+  embedContent: vi.fn(),
+}));
 
 vi.mock('@google/genai', () => ({
   GoogleGenAI: class {
-    models = { generateContent: (request: unknown) => generateContent(request) };
+    models = {
+      generateContent: (request: unknown) => generateContent(request),
+      embedContent: (request: unknown) => embedContent(request),
+    };
   },
-  Type: { OBJECT: 'OBJECT', ARRAY: 'ARRAY', STRING: 'STRING', NUMBER: 'NUMBER' },
+  Type: { OBJECT: 'OBJECT', ARRAY: 'ARRAY', STRING: 'STRING', NUMBER: 'NUMBER', BOOLEAN: 'BOOLEAN' },
 }));
 
 const {
+  EMBEDDING_MODEL,
   cleanJsonString,
   createGeminiServerClient,
   formatTranscriptForAI,
   formatTranscriptWithTimeForAI,
+  isTransientLlmError,
 } = await import('./geminiServerClient');
 
 let logged: LlmCallInput[];
@@ -25,6 +33,7 @@ const client = () => createGeminiServerClient({ log: (input) => logged.push(inpu
 beforeEach(() => {
   logged = [];
   generateContent.mockReset();
+  embedContent.mockReset();
   process.env.GEMINI_API_KEY = 'test-key';
   vi.spyOn(console, 'warn').mockImplementation(() => {});
 });
@@ -258,5 +267,127 @@ describe('extractTopicTags', () => {
     generateContent.mockResolvedValue({ text: '{"tags":[]}' });
     await client().extractTopicTags({ transcript });
     expect(logged.map(l => l.kind)).toEqual(['extract-tags']);
+  });
+});
+
+describe('isTransientLlmError', () => {
+  it('限流與過載算 transient，其餘算 fatal', () => {
+    // 這一支是 W4 從 generateContentWithFallback 的 body 抽出來的（判斷字串逐字相同），
+    // 抽出來是為了 embedding 那條沒有 fallback 鏈的路徑也用同一把尺
+    expect(isTransientLlmError(new Error('429 RESOURCE_EXHAUSTED'))).toBe(true);
+    expect(isTransientLlmError(new Error('503 Service Unavailable'))).toBe(true);
+    expect(isTransientLlmError(new Error('model is overloaded'))).toBe(true);
+    expect(isTransientLlmError(new Error('invalid api key'))).toBe(false);
+    expect(isTransientLlmError(undefined)).toBe(false);
+  });
+});
+
+describe('embedTopicTags（W4）', () => {
+  it('分批送出，回來的順序就是送出去的順序', async () => {
+    embedContent.mockImplementation((request: any) => ({
+      embeddings: request.contents.map((text: string) => ({ values: [text.length, 0, 0] })),
+    }));
+
+    const batch = await client().embedTopicTags(['一', '兩個字', '三個字啦']);
+
+    expect(batch.model).toBe(EMBEDDING_MODEL);
+    expect(batch.dimensions).toBe(3);
+    expect(batch.vectors).toEqual([[1, 0, 0], [3, 0, 0], [4, 0, 0]]);
+    expect(logged.map(l => [l.kind, l.outcome])).toEqual([['embed', 'ok']]);
+  });
+
+  it('沒有標籤時不打 API', async () => {
+    const batch = await client().embedTopicTags([]);
+    expect(embedContent).not.toHaveBeenCalled();
+    expect(batch.vectors).toEqual([]);
+  });
+
+  it('回來的筆數對不上就整批拋掉，不按順序硬對', async () => {
+    embedContent.mockResolvedValue({ embeddings: [{ values: [1, 2, 3] }] });
+    await expect(client().embedTopicTags(['甲', '乙'])).rejects.toThrow(/回傳 1 筆，送出 2 筆/);
+  });
+
+  it('同一批出現兩種維度就拋錯', async () => {
+    embedContent.mockResolvedValue({ embeddings: [{ values: [1, 2, 3] }, { values: [1, 2] }] });
+    await expect(client().embedTopicTags(['甲', '乙'])).rejects.toThrow(/維度不一致/);
+  });
+
+  it('向量裡有非數字或非有限值就拋錯（Codex 2026-09-15 findings 4）', async () => {
+    // 不擋的話：null 轉 Float32Array 被 coercion 成 0、字串變 NaN，而 NaN 進 cosine 之後
+    // 每個比較都是 false，結果是 0 個候選、狀態 LINKED、空集合——跟「這場會真的沒有同題目的會」
+    // 在資料上完全一樣
+    embedContent.mockResolvedValue({ embeddings: [{ values: [1, null, 3] }] });
+    await expect(client().embedTopicTags(['甲'])).rejects.toThrow(/第 1 個值不是有限數字/);
+
+    embedContent.mockResolvedValue({ embeddings: [{ values: [1, 'bad', 3] }] });
+    await expect(client().embedTopicTags(['甲'])).rejects.toThrow(/不是有限數字/);
+
+    embedContent.mockResolvedValue({ embeddings: [{ values: [1, NaN, 3] }] });
+    await expect(client().embedTopicTags(['甲'])).rejects.toThrow(/不是有限數字/);
+  });
+
+  it('空的向量就拋錯，不當成一條合法的標籤向量', async () => {
+    embedContent.mockResolvedValue({ embeddings: [{ values: [] }] });
+    await expect(client().embedTopicTags(['甲'])).rejects.toThrow(/embedding 是空的/);
+  });
+
+  it('失敗時紀錄分得出 transient 與 fatal，而且不退到別的 embedding model', async () => {
+    embedContent.mockRejectedValue(new Error('429 RESOURCE_EXHAUSTED'));
+    await expect(client().embedTopicTags(['甲'])).rejects.toThrow(/429/);
+
+    expect(embedContent).toHaveBeenCalledTimes(1);
+    expect(logged.map(l => [l.kind, l.model, l.outcome])).toEqual([['embed', EMBEDDING_MODEL, 'transient']]);
+  });
+});
+
+describe('judgeMeetingPair（W4 的 S3）', () => {
+  const tags = (titles: string[]) => titles.map(title => ({ title, content: `${title} 的內容` }));
+
+  const judgeReply = (body: unknown) => {
+    generateContent.mockResolvedValue({ text: JSON.stringify(body) });
+  };
+
+  const judge = () => client().judgeMeetingPair({
+    idA: 'm-1', tagsA: tags(['自動貼標']), idB: 'm-2', tagsB: tags(['標籤管理']),
+  });
+
+  it('把兩場會的標籤排成編號清單送出去，紀錄記成 link-judge', async () => {
+    judgeReply({ sameTopic: true, confidence: 0.85, reason: '同一件事', sharedTopics: ['貼標'] });
+
+    const result = await judge();
+    expect(result).toEqual({ sameTopic: true, confidence: 0.85, reason: '同一件事', sharedTopics: ['貼標'] });
+
+    const request = generateContent.mock.calls[0][0];
+    expect(request.contents).toContain('1. 自動貼標：自動貼標 的內容');
+    expect(request.contents).toContain('1. 標籤管理：標籤管理 的內容');
+    expect(logged.map(l => l.kind)).toEqual(['link-judge']);
+  });
+
+  it('解不開的回應拋錯，不退成「判為不相關」', async () => {
+    generateContent.mockResolvedValue({ text: '{"sameTopic": tr' });
+    // 退成 false 的話，「模型說沒關係」與「我們沒問成功」會長得一模一樣，
+    // 而後者應該讓這一對留在「還沒判過」
+    await expect(judge()).rejects.toThrow(/不是合法 JSON/);
+  });
+
+  it('沒有判定理由就拒收', async () => {
+    judgeReply({ sameTopic: true, confidence: 0.9, reason: '   ', sharedTopics: [] });
+    // FN-04 的驗收條件是「每筆判定必須帶可被人否決的理由」。只有信心值的話人無從否決
+    await expect(judge()).rejects.toThrow(/沒有判定理由/);
+  });
+
+  it('信心值超出 0 到 1 就拒收，不夾回範圍內', async () => {
+    judgeReply({ sameTopic: true, confidence: 1.4, reason: '理由', sharedTopics: [] });
+    await expect(judge()).rejects.toThrow(/不在 0 到 1 之間/);
+  });
+
+  it('sameTopic 不是布林就拒收', async () => {
+    judgeReply({ sameTopic: 'yes', confidence: 0.9, reason: '理由', sharedTopics: [] });
+    await expect(judge()).rejects.toThrow(/沒有布林的 sameTopic/);
+  });
+
+  it('sharedTopics 不是字串陣列就拒收', async () => {
+    judgeReply({ sameTopic: true, confidence: 0.9, reason: '理由', sharedTopics: [{ x: 1 }] });
+    await expect(judge()).rejects.toThrow(/sharedTopics 不是字串陣列/);
   });
 });

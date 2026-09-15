@@ -83,6 +83,16 @@ repo 現存的 generator 只剩 `askDocumentStream` 一個（匿名）。下次�
 名字互為前綴的一組符號會互相污染。判死碼一律再跑一次
 `grep -rn --include=*.ts --include=*.tsx '<符號名>' .` 交叉驗證。
 
+**四、掛在回傳物件字面值上的方法不在圖裡。** 2026-09-15（W3 收尾）實測：`MeetingStore` 是
+`createMeetingStore` 回一個物件字面值，它上面每一支方法查符號都是 `Symbol not found`——
+`codegraph callers saveTopicExtraction`、`codegraph callers saveSeamReport` 都一樣。所以
+**`MeetingStore`、`TopicExtractor`、`TopicLinker`、`TranscriptionPipeline` 這一整組 factory 回傳的
+方法，用拓樸查呼叫端一律是假的空**，不是「沒有人呼叫」。同一次還撞到：`server.ts` 不會被算成
+`callers` 的呼叫端（它跟 `App.tsx` 一樣，`affected` 對它也回空）。
+
+這個 repo 的 module 幾乎全是這個寫法，所以**接線要靠讀碼與 grep 確認**，不要拿 `callers` 的空
+當證據。
+
 ## `codegraph affected` 的 filter 與盲區
 
 **驗證過的 glob（2026-09-14 實測）**：

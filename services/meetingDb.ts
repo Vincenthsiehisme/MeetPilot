@@ -8,8 +8,8 @@
  * 用 node 內建的 `node:sqlite`，不加原生依賴。
  *
  * 表只在真的要落地的那一包才建。W1 建了四張（meetings、transcripts、analyses、meeting_tags），
- * W3 加了 topic_tags；TopicLink、排除紀錄、RecallFeedback 等到 W4 到 W6 各自實作時再加一條
- * migration：現在建空表等於憑空猜欄位，而那些欄位的形狀（例如 TopicLink 的判定理由）
+ * W3 加了 topic_tags，W4 加了 topic_links、link_exclusions、topic_tag_embeddings、link_runs；
+ * RecallFeedback 等到 W6 再加一條 migration：現在建空表等於憑空猜欄位，而那些欄位的形狀
  * 要等策略實作完才確定。
  */
 import { DatabaseSync } from 'node:sqlite';
@@ -96,6 +96,80 @@ const MIGRATIONS: readonly string[] = [
   ALTER TABLE meetings ADD COLUMN topic_extraction_status TEXT
     CHECK (topic_extraction_status IN ('ok', 'empty', 'failed'));
   ALTER TABLE meetings ADD COLUMN topic_extraction_error TEXT;
+  `,
+  // W4：跨會議關聯（`C-TOPICLINK` v1，SDD 1.1／1.2／1.3／2.4／FN-04）。
+  //
+  // 四張表各自有存在的理由，不要合併：
+  //
+  // `topic_links` 是可全量重建的計算結果；`link_exclusions` 是人的判斷，**不可重建**（SDD 1.5）。
+  // 放同一張表的話，「清掉重算」這個正常操作會順手刪掉人標過的不相關，而且刪的當下沒有任何訊息。
+  //
+  // `topic_tag_embeddings` 另開而不是掛在 topic_tags 上：那張表是 API 詳情的熱路徑
+  // （`getTopicTags` 每次整列讀出來），一條 3072 維的向量是 12KB，一場會 20 條就是 240KB
+  // 跟著每一次詳情請求走。而且換 embedding model 時整欄語意作廢，掛在原表上沒地方寫版本。
+  // 靠 tag_id 的外鍵 cascade：重新抽取會刪掉 auto 標籤並換新的 tag_id，舊向量跟著走，
+  // 不會留下對不到標籤的孤兒向量。
+  //
+  // `link_runs` 記一次計算的覆蓋率，一場會一列（重算時整列換掉）。不塞進 meetings，跟 W3 把
+  // topic_extraction_status 放進 meetings 的判斷相反，而且是刻意的：那一欄是單一結果碼，
+  // 這裡是五個數字加一個錯誤原因，塞進去要加六欄，而它們描述的是「那一次計算」不是「這場會」。
+  // 查得出來不受影響：`SELECT * FROM link_runs WHERE skipped_error > 0` 就是一句 SQL。
+  `
+  CREATE TABLE topic_links (
+    link_id TEXT PRIMARY KEY,
+    meeting_a TEXT NOT NULL REFERENCES meetings(meeting_id) ON DELETE CASCADE,
+    meeting_b TEXT NOT NULL REFERENCES meetings(meeting_id) ON DELETE CASCADE,
+    confidence REAL NOT NULL,
+    evidence TEXT NOT NULL,
+    shared_topics TEXT NOT NULL,
+    algo_version TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    -- 兩端一律正規化排序（services/topicLink.ts 的 orderPair）。沒有這條約束的話，
+    -- 繞過那個函式寫進來的 A×B 與 B×A 會變成兩筆不同的關聯，而查詢只會找到其中一筆
+    CHECK (meeting_a < meeting_b)
+  );
+
+  -- 一對會議只能有一筆關聯，版本不進唯一鍵。重算時整組刪掉重寫（見 meetingStore.saveLinkResult），
+  -- 所以同一對不會有兩個版本的結果並排；algo_version 留在列上是為了看得出「這一筆是哪一版算的」，
+  -- 那在「有些會重算過、有些還沒」的混合狀態下是唯一的線索
+  CREATE UNIQUE INDEX idx_topic_links_pair ON topic_links(meeting_a, meeting_b);
+  CREATE INDEX idx_topic_links_b ON topic_links(meeting_b);
+
+  CREATE TABLE link_exclusions (
+    meeting_a TEXT NOT NULL REFERENCES meetings(meeting_id) ON DELETE CASCADE,
+    meeting_b TEXT NOT NULL REFERENCES meetings(meeting_id) ON DELETE CASCADE,
+    reason_code TEXT NOT NULL
+      CHECK (reason_code IN ('different_topic', 'outdated', 'not_needed', 'unspecified')),
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (meeting_a, meeting_b),
+    CHECK (meeting_a < meeting_b)
+  );
+
+  -- vector 存 BLOB（Float32Array 的位元組），不存 JSON 文字：3072 個 float 寫成 JSON 約 60KB，
+  -- 二進位是 12KB，而一年約 18,700 條標籤。float32 也正是 embedding API 本來的精度
+  CREATE TABLE topic_tag_embeddings (
+    tag_id TEXT PRIMARY KEY REFERENCES topic_tags(tag_id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    dimensions INTEGER NOT NULL,
+    vector BLOB NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE link_runs (
+    meeting_id TEXT PRIMARY KEY REFERENCES meetings(meeting_id) ON DELETE CASCADE,
+    algo_version TEXT NOT NULL,
+    candidates INTEGER NOT NULL,
+    judged INTEGER NOT NULL,
+    skipped_cap INTEGER NOT NULL,
+    skipped_excluded INTEGER NOT NULL,
+    skipped_error INTEGER NOT NULL,
+    -- 因為 embedding 的 model 或維度對不上而沒有被比到的「標籤對」數。
+    -- 正常情況永遠是 0（舊 model 的向量會被自動重算）。不是 0 就代表這一次的分數不完整，
+    -- 而那種情況下最可能的結果是「LINKED ＋ 空集合」——跟真的沒有相關會議長得一樣
+    incomparable_pairs INTEGER NOT NULL,
+    error TEXT,
+    created_at INTEGER NOT NULL
+  );
   `,
 ];
 

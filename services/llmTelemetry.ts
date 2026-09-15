@@ -6,7 +6,12 @@ import { dirname } from 'node:path';
 // 「一場會議燒掉多少 token」。埋在這裡的欄位就是為了回答這三個問題。
 // 不上 observability 平台的門檻見 vault 的 AGENT-EVAL-METHODS〈不要上 observability 平台〉。
 
-export type LlmCallKind = 'transcribe' | 'polish' | 'analyze' | 'chat-stream' | 'extract-tags';
+export type LlmCallKind =
+  | 'transcribe' | 'polish' | 'analyze' | 'chat-stream' | 'extract-tags'
+  // W4：'embed' 是題目標籤的 embedding（S2 召回的原料），'link-judge' 是兩場會的 S3 判定。
+  // 分成兩個 kind 而不是一個 'link'：兩者的額度池、成本與失敗意義都不同——embedding 失敗是
+  // 「這場會算不出候選」，判定失敗是「候選判不完」，混成一個之後那份紀錄回答不了「首選模型多常不可用」
+  | 'embed' | 'link-judge';
 
 // ok：模型回了東西。transient：可重試的錯（503／429／overloaded），會退到 fallback 鏈的下一個。
 // fatal：不可重試，直接往上拋。三者分開才看得出「退了幾次才成功」與「第一次就死」的差別，

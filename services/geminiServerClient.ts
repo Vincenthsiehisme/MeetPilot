@@ -13,6 +13,7 @@ import { GoogleGenAI, Type } from '@google/genai';
 import { GeminiOutput, TranscriptSegment } from '../types';
 import { normalizeTranscribedSegments } from './transcribeSegments';
 import { LlmCallKind, LlmLogger } from './llmTelemetry';
+import { PairJudgement } from './topicLink';
 
 // Lazy GoogleGenAI client
 let aiClient: GoogleGenAI | null = null;
@@ -58,6 +59,25 @@ export function cleanJsonString(str: string | undefined): string {
   }
 
   return cleaned;
+}
+
+/**
+ * 這個錯誤值不值得退到 fallback 鏈的下一個。
+ *
+ * W4 把它從 `generateContentWithFallback` 的 body 抽出來（判斷字串逐字相同，行為未變），
+ * 因為 embedding 沒有 fallback 鏈卻一樣要在紀錄裡分得出 transient 與 fatal。
+ * 留兩份的話，之後加一個新的限流訊息只會改到其中一份，而紀錄上看不出哪一份沒改。
+ */
+export function isTransientLlmError(err: any): boolean {
+  const msg = (err?.message || '').toLowerCase();
+  return (
+    msg.includes('503') ||
+    msg.includes('unavailable') ||
+    msg.includes('high demand') ||
+    msg.includes('429') ||
+    msg.includes('resource_exhausted') ||
+    msg.includes('overloaded')
+  );
 }
 
 export function formatTranscriptForAI(transcript: TranscriptSegment[]): string {
@@ -132,12 +152,70 @@ const EXTRACT_TAGS_SYSTEM_INSTRUCTION = `你要從會議逐字稿抽出「題目
 
 回傳純 JSON，不要 Markdown 標記。`;
 
+/**
+ * Embedding model（W4）。
+ *
+ * 2026-09-14 實測：這把 key 能用的只有 `gemini-embedding-001`、`gemini-embedding-2` 與其 preview 版，
+ * `text-embedding-004` 回 404。取穩定版不取 preview。**沒有 fallback 鏈**，這裡跟轉錄不一樣：
+ * 退到另一個 embedding model 會產出另一個向量空間的向量，跟既有的算 cosine 得到的數字沒有意義。
+ * 所以它失敗就是失敗，寧可這場會算不出候選。
+ *
+ * 換 model 一定要連 `LINK_ALGO_VERSION` 一起換，而且既有向量全部要重算。
+ */
+export const EMBEDDING_MODEL = 'gemini-embedding-001';
+
+/** 一次 embedding 的結果。model 與維度跟著回來，呼叫端要把它們跟向量一起落地 */
+export interface EmbeddingBatch {
+  model: string;
+  dimensions: number;
+  vectors: number[][];
+}
+
+export interface JudgeMeetingPairInput {
+  idA: string;
+  tagsA: readonly { title: string; content: string }[];
+  idB: string;
+  tagsB: readonly { title: string; content: string }[];
+}
+
+/**
+ * S3 的 systemInstruction（`FN-04`）。**整段照搬 `eval/strategies/s3-llm.ts`，一個字都不要改。**
+ *
+ * 理由同 W3 的抽取 prompt：U-001 第三輪量到的 P 1.000 / R 0.667 是這段字跑出來的，
+ * 改它等於讓已經落地的判定與新判定來自兩把尺，而那不會有任何錯誤訊息。要改就要重跑評測，
+ * 而且依 SDD 4.1 那是 L3 變更。
+ */
+const JUDGE_PAIR_SYSTEM_INSTRUCTION = `你要判斷兩場會議有沒有在討論「同一個題目」。
+
+判準：
+- 同一個題目指的是同一件待決事項、同一個系統或流程、同一個對象。用詞不同不影響判定。
+- 只是同屬一個大領域（例如都跟 AI 有關、都跟業務有關）不算同一個題目。
+- 一方只順口提過一句、沒有實質討論的，不算。
+
+請回傳 JSON：sameTopic（布林）、confidence（0 到 1）、reason（一句話，繁體中文）、sharedTopics（共同題目的名稱陣列，沒有就空陣列）。`;
+
+/** 把一場會的題目標籤排成 S3 看的清單。格式與 eval/strategies/s3-llm.ts 的 listOf 相同 */
+const formatTagsForJudge = (tags: readonly { title: string; content: string }[]): string =>
+  tags.map((tag, i) => `${i + 1}. ${tag.title}${tag.content ? `：${tag.content}` : ''}`).join('\n');
+
 export interface GeminiServerClient {
+  /**
+   * 這個 client 現在用的 embedding model（W4）。
+   *
+   * 掛在介面上而不是讓呼叫端直接讀 `EMBEDDING_MODEL` 常數：`TopicLinker` 要靠它判斷
+   * 「表裡那些向量是不是舊 model 算的」，而測試注入的假 client 用的是另一個名字。
+   * 讀常數的話，測試裡每一次關聯都會把全部向量重算一遍，而那條路線在正式環境從來不會走到。
+   */
+  readonly embeddingModel: string;
   transcribeSlice(input: TranscribeSliceInput): Promise<TranscriptSegment[]>;
   polishTranscript(transcript: TranscriptSegment[]): Promise<string>;
   analyzeTranscript(input: AnalyzeTranscriptInput): Promise<GeminiOutput>;
   /** 題目標籤抽取（W3）。回空陣列是合法結果（模型說這份逐字稿沒有可抽的題目），不是錯誤 */
   extractTopicTags(input: { transcript: TranscriptSegment[] }): Promise<ExtractedTopicTag[]>;
+  /** 題目標籤的 embedding（W4，S2 召回的原料）。回傳順序與送進去的順序一致 */
+  embedTopicTags(texts: readonly string[]): Promise<EmbeddingBatch>;
+  /** 兩場會是不是在討論同一題目（W4，S3）。判不出來就拋，不回一個猜的 false */
+  judgeMeetingPair(input: JudgeMeetingPairInput): Promise<PairJudgement>;
 }
 
 export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClient {
@@ -178,14 +256,7 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
           return response;
         } catch (err: any) {
           lastError = err;
-          const msg = (err?.message || '').toLowerCase();
-          const isTransient =
-            msg.includes('503') ||
-            msg.includes('unavailable') ||
-            msg.includes('high demand') ||
-            msg.includes('429') ||
-            msg.includes('resource_exhausted') ||
-            msg.includes('overloaded');
+          const isTransient = isTransientLlmError(err);
 
           llmLogger.log({
             kind: request.kind,
@@ -213,6 +284,8 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
   }
 
   return {
+    embeddingModel: EMBEDDING_MODEL,
+
     async transcribeSlice(input: TranscribeSliceInput): Promise<TranscriptSegment[]> {
       const {
         base64Data,
@@ -473,6 +546,150 @@ ${formattedTranscript}`,
         }
         return { title: tag.title.trim(), content: tag.content.trim() };
       });
+    },
+
+    async embedTopicTags(texts: readonly string[]): Promise<EmbeddingBatch> {
+      // 沒有標籤時不打 API，也不回一個假的維度：0 維在下游會讓 canCompare 判成「可以比」
+      if (texts.length === 0) return { model: EMBEDDING_MODEL, dimensions: 0, vectors: [] };
+
+      const ai = getAI();
+      const vectors: number[][] = [];
+      const BATCH = 50;
+
+      for (let i = 0; i < texts.length; i += BATCH) {
+        const batch = texts.slice(i, i + BATCH);
+        const startedAt = Date.now();
+        let response: any;
+        try {
+          response = await ai.models.embedContent({ model: EMBEDDING_MODEL, contents: batch as string[] });
+        } catch (err) {
+          llmLogger.log({
+            kind: 'embed',
+            model: EMBEDDING_MODEL,
+            modelIndex: 0,
+            attempt: 1,
+            streamed: false,
+            latencyMs: Date.now() - startedAt,
+            outcome: isTransientLlmError(err) ? 'transient' : 'fatal',
+            error: err,
+          });
+          // 不退到別的 embedding model：那是另一個向量空間，跟既有向量算出來的 cosine 沒有意義
+          throw err;
+        }
+        llmLogger.log({
+          kind: 'embed',
+          model: EMBEDDING_MODEL,
+          modelIndex: 0,
+          attempt: 1,
+          streamed: false,
+          latencyMs: Date.now() - startedAt,
+          outcome: 'ok',
+          response,
+        });
+
+        const embeddings = response?.embeddings;
+        // 回來的筆數對不上就整批拋掉，不要按順序硬對：少一筆的話後面每一條標籤都會配到別人的向量，
+        // 而那不會有任何錯誤，只會讓關聯安靜地變成亂的
+        if (!Array.isArray(embeddings) || embeddings.length !== batch.length) {
+          throw new Error(`embedding 回傳 ${embeddings?.length ?? 0} 筆，送出 ${batch.length} 筆`);
+        }
+        embeddings.forEach((item: any, index: number) => {
+          const values = item?.values;
+          if (!Array.isArray(values) || values.length === 0) {
+            throw new Error(`第 ${i + index} 條標籤的 embedding 是空的`);
+          }
+          // 逐值檢查。不檢查的話 `null` 會在轉 Float32Array 時被 coercion 成 0、字串變成 NaN，
+          // 而 NaN 進 cosine 之後每個比較都是 false ——結果是 0 個候選、狀態 LINKED、空集合，
+          // 跟「這場會真的沒有同題目的會」長得一模一樣。這正是這個 repo 一直在擋的那種壞法
+          for (let k = 0; k < values.length; k += 1) {
+            if (typeof values[k] !== 'number' || !Number.isFinite(values[k])) {
+              throw new Error(
+                `第 ${i + index} 條標籤的 embedding 第 ${k} 個值不是有限數字：${JSON.stringify(values[k])}`,
+              );
+            }
+          }
+          vectors.push(values);
+        });
+      }
+
+      const dimensions = vectors[0].length;
+      for (let i = 1; i < vectors.length; i += 1) {
+        // 同一批出現兩種維度代表 API 換了行為。讓它往下走的話，canCompare 會把整批標籤判成
+        // 不可比，而症狀是「這場會突然關聯不到任何東西」，看不出來源
+        if (vectors[i].length !== dimensions) {
+          throw new Error(`同一批 embedding 的維度不一致：第 0 條是 ${dimensions}、第 ${i} 條是 ${vectors[i].length}`);
+        }
+      }
+      return { model: EMBEDDING_MODEL, dimensions, vectors };
+    },
+
+    async judgeMeetingPair(input: JudgeMeetingPairInput): Promise<PairJudgement> {
+      const ai = getAI();
+
+      const response = await generateContentWithFallback(ai, {
+        kind: 'link-judge',
+        // 不指定 preferredModel：理由同 extractTopicTags，評測跑出那組數字時走的就是這條預設鏈
+        contents: `會議 ${input.idA} 討論的題目：
+${formatTagsForJudge(input.tagsA)}
+
+會議 ${input.idB} 討論的題目：
+${formatTagsForJudge(input.tagsB)}`,
+        config: {
+          maxOutputTokens: 2048,
+          systemInstruction: JUDGE_PAIR_SYSTEM_INSTRUCTION,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              sameTopic: { type: Type.BOOLEAN },
+              confidence: { type: Type.NUMBER },
+              reason: { type: Type.STRING },
+              sharedTopics: { type: Type.ARRAY, items: { type: Type.STRING } },
+            },
+            required: ['sameTopic', 'confidence', 'reason', 'sharedTopics'],
+          },
+        },
+      });
+
+      const jsonStr = cleanJsonString(response.text);
+      let parsed: any;
+      try {
+        parsed = JSON.parse(jsonStr);
+      } catch (err) {
+        // 解不開就拋，不要退成「判為不相關」：那會讓「模型說沒關係」與「我們沒問成功」
+        // 長得一模一樣，而前者是結論、後者是這一對還沒被判過
+        throw new Error(
+          `${input.idA} × ${input.idB} 的判定回應不是合法 JSON（模型輸出可能被截斷）：${(err as Error).message}。`
+          + `收到的開頭：${jsonStr.slice(0, 200)}`,
+        );
+      }
+
+      const where = `${input.idA} × ${input.idB} 的判定`;
+      if (typeof parsed?.sameTopic !== 'boolean') {
+        throw new Error(`${where}沒有布林的 sameTopic：${jsonStr.slice(0, 200)}`);
+      }
+      if (typeof parsed?.confidence !== 'number' || !Number.isFinite(parsed.confidence)) {
+        throw new Error(`${where}的 confidence 不是數字：${jsonStr.slice(0, 200)}`);
+      }
+      if (parsed.confidence < 0 || parsed.confidence > 1) {
+        // 夾回 0 到 1 會讓一個壞掉的回應看起來正常，而信心值正是門檻在比的東西
+        throw new Error(`${where}的 confidence 是 ${parsed.confidence}，不在 0 到 1 之間`);
+      }
+      if (typeof parsed?.reason !== 'string' || parsed.reason.trim() === '') {
+        // 沒有理由的判定不能落地：`FN-04` 的驗收條件是「每筆判定必須帶可被人否決的理由」，
+        // 而 SDD 1.3.1 的 vault markdown 直接列它。只有信心值的話人無從否決
+        throw new Error(`${where}沒有判定理由：${jsonStr.slice(0, 200)}`);
+      }
+      if (!Array.isArray(parsed?.sharedTopics) || !parsed.sharedTopics.every((t: unknown) => typeof t === 'string')) {
+        throw new Error(`${where}的 sharedTopics 不是字串陣列：${jsonStr.slice(0, 200)}`);
+      }
+
+      return {
+        sameTopic: parsed.sameTopic,
+        confidence: parsed.confidence,
+        reason: parsed.reason.trim(),
+        sharedTopics: parsed.sharedTopics.map((t: string) => t.trim()).filter((t: string) => t !== ''),
+      };
     },
   };
 }

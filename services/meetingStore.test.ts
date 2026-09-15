@@ -547,3 +547,165 @@ describe('題目標籤（topic_tags，W3）', () => {
     expect(store.getTopicTags('m-1').map(t => t.title)).toEqual(['POC 時程', '客服座席', '派單規則']);
   });
 });
+
+describe('W4：向量、關聯與排除紀錄', () => {
+  const tagsFor = (id: string, titles: readonly string[]) => {
+    store.saveTopicExtraction(id, {
+      status: 'ok',
+      tags: titles.map(title => ({
+        title,
+        content: `${title} 的內容`,
+        match_key: title,
+        match_key_version: MATCH_KEY_VERSION,
+      })),
+    }, T0);
+    return store.getTopicTags(id);
+  };
+
+  beforeEach(() => {
+    newMeeting('m-1');
+    newMeeting('m-2');
+  });
+
+  it('向量存進去再讀出來是同一組（float32 的精度）', () => {
+    const [tag] = tagsFor('m-1', ['題目甲']);
+    store.saveTagVectors([{ tag_id: tag.tag_id, model: 'e-1', dimensions: 3, vector: [0.5, -0.25, 0.125] }], T0);
+
+    const [read] = store.getTagVectors('m-1');
+    expect(read.tag_id).toBe(tag.tag_id);
+    expect(read.model).toBe('e-1');
+    expect(read.dimensions).toBe(3);
+    // float32 存得下的值原樣回來；存不下的差在 1e-7 量級，cosine 不受影響
+    expect(read.vector).toEqual([0.5, -0.25, 0.125]);
+  });
+
+  it('dimensions 欄跟實際長度對不上就拒收', () => {
+    const [tag] = tagsFor('m-1', ['題目甲']);
+    expect(() =>
+      store.saveTagVectors([{ tag_id: tag.tag_id, model: 'e-1', dimensions: 4, vector: [1, 2, 3] }], T0),
+    ).toThrow(/dimensions 欄寫 4/);
+  });
+
+  it('listTagsMissingVectors 只回還沒算過的那幾條', () => {
+    const tags = tagsFor('m-1', ['題目甲', '題目乙']);
+    expect(store.listTagsNeedingVectors('m-1', 'e-1')).toHaveLength(2);
+
+    store.saveTagVectors([{ tag_id: tags[0].tag_id, model: 'e-1', dimensions: 1, vector: [1] }], T0);
+    expect(store.listTagsNeedingVectors('m-1', 'e-1').map(t => t.tag_id)).toEqual([tags[1].tag_id]);
+  });
+
+  it('向量是別的 model 算的就算要重算（Codex 2026-09-15 findings 6）', () => {
+    const [tag] = tagsFor('m-1', ['題目甲']);
+    store.saveTagVectors([{ tag_id: tag.tag_id, model: '舊 model', dimensions: 1, vector: [1] }], T0);
+
+    // 同一個 model 問：不用重算
+    expect(store.listTagsNeedingVectors('m-1', '舊 model')).toEqual([]);
+    // 換了 model 問：那條要重算。不重算的話 canCompare 會把舊向量全部判成不可比，
+    // 而那些會就安靜地關聯不到任何東西，狀態卻是正常的 LINKED ＋ 空集合
+    expect(store.listTagsNeedingVectors('m-1', '新 model').map(t => t.tag_id)).toEqual([tag.tag_id]);
+  });
+
+  it('重新抽取會把舊向量一起帶走，不留對不到標籤的孤兒', () => {
+    const [tag] = tagsFor('m-1', ['題目甲']);
+    store.saveTagVectors([{ tag_id: tag.tag_id, model: 'e-1', dimensions: 1, vector: [1] }], T0);
+    expect(store.getTagVectors('m-1')).toHaveLength(1);
+
+    tagsFor('m-1', ['題目甲']);
+    // 新一輪的 tag_id 是新的，舊向量靠外鍵 cascade 走掉
+    expect(store.getTagVectors('m-1')).toHaveLength(0);
+    expect(db.prepare('SELECT COUNT(*) AS n FROM topic_tag_embeddings').get()).toEqual({ n: 0 });
+  });
+
+  it('listTopicTagOwners 只列真的有標籤的會，不看抽取狀態', () => {
+    tagsFor('m-1', ['題目甲']);
+    // m-2 抽過但一條都沒有
+    store.saveTopicExtraction('m-2', { status: 'empty' }, T0);
+    expect(store.listTopicTagOwners()).toEqual(['m-1']);
+
+    // 上一輪抽到過的標籤仍是合法的關聯原料，就算這一輪失敗了
+    store.saveTopicExtraction('m-1', { status: 'failed', error: '壞了' }, T0);
+    expect(store.listTopicTagOwners()).toEqual(['m-1']);
+  });
+
+  const linkResult = (other: string) => ({
+    algo_version: 'test-v1',
+    links: [{ other_meeting_id: other, confidence: 0.8, evidence: '理由', shared_topics: ['共同題目'] }],
+    coverage: { candidates: 1, judged: 1, skipped_cap: 0, skipped_excluded: 0, skipped_error: 0,
+      incomparable_pairs: 0, error: null },
+  });
+
+  it('關聯兩端正規化排序，兩邊都查得到', () => {
+    const report = store.saveLinkResult('m-2', linkResult('m-1'), T0);
+    expect(report.inserted).toBe(1);
+
+    const [link] = store.getLinks('m-1');
+    expect([link.meeting_a, link.meeting_b]).toEqual(['m-1', 'm-2']);
+    expect(link.shared_topics).toEqual(['共同題目']);
+    expect(store.getLinks('m-2')).toHaveLength(1);
+  });
+
+  it('重算是換掉不是累加', () => {
+    store.saveLinkResult('m-1', linkResult('m-2'), T0);
+    store.saveLinkResult('m-1', linkResult('m-2'), T0 + 1);
+    expect(store.getLinks('m-1')).toHaveLength(1);
+  });
+
+  it('儲存層擋住排除過的那一對（AC-3 的最後一道）', () => {
+    store.addLinkExclusion('m-1', 'm-2', 'different_topic', T0);
+
+    const report = store.saveLinkResult('m-1', linkResult('m-2'), T0 + 1);
+    expect(report.inserted).toBe(0);
+    expect(report.blockedByExclusion).toEqual(['m-2']);
+    expect(store.getLinks('m-1')).toEqual([]);
+  });
+
+  it('標記不相關會當場把既有那一筆撤掉，不等下一次重算', () => {
+    store.saveLinkResult('m-1', linkResult('m-2'), T0);
+    expect(store.getLinks('m-1')).toHaveLength(1);
+
+    store.addLinkExclusion('m-2', 'm-1', 'outdated', T0 + 1);
+    expect(store.getLinks('m-1')).toEqual([]);
+    expect(store.listLinkExclusions('m-1')).toEqual([
+      { meeting_a: 'm-1', meeting_b: 'm-2', reason_code: 'outdated', created_at: T0 + 1 },
+    ]);
+  });
+
+  it('同一對重標只更新原因，不長出第二列', () => {
+    store.addLinkExclusion('m-1', 'm-2', 'different_topic', T0);
+    store.addLinkExclusion('m-1', 'm-2', 'not_needed', T0 + 1);
+    expect(store.listLinkExclusions('m-1')).toHaveLength(1);
+    expect(store.listLinkExclusions('m-1')[0].reason_code).toBe('not_needed');
+  });
+
+  it('排除原因不是那四個之一就拒收', () => {
+    expect(() => store.addLinkExclusion('m-1', 'm-2', '看不順眼' as never, T0)).toThrow(/不是合法值/);
+  });
+
+  it('saveLinkRun 只寫覆蓋率，不碰既有關聯', () => {
+    store.saveLinkResult('m-1', linkResult('m-2'), T0);
+    store.saveLinkRun('m-1', {
+      algo_version: 'test-v1',
+      links: [],
+      coverage: { candidates: 1, judged: 0, skipped_cap: 0, skipped_excluded: 0, skipped_error: 1,
+        incomparable_pairs: 0, error: '429' },
+    }, T0 + 1);
+
+    expect(store.getLinks('m-1')).toHaveLength(1);
+    expect(store.getLinkRun('m-1')).toMatchObject({ judged: 0, skipped_error: 1, error: '429' });
+  });
+
+  it('沒算過的會 getLinkRun 是 null——那跟「算過但沒找到」不是同一件事', () => {
+    expect(store.getLinkRun('m-1')).toBeNull();
+  });
+
+  it('刪掉會議時關聯、排除紀錄與覆蓋率一起走', () => {
+    tagsFor('m-1', ['題目甲']);
+    store.saveLinkResult('m-1', linkResult('m-2'), T0);
+    store.addLinkExclusion('m-1', 'm-2', 'not_needed', T0);
+    store.deleteMeeting('m-1');
+
+    expect(db.prepare('SELECT COUNT(*) AS n FROM topic_links').get()).toEqual({ n: 0 });
+    expect(db.prepare('SELECT COUNT(*) AS n FROM link_exclusions').get()).toEqual({ n: 0 });
+    expect(db.prepare('SELECT COUNT(*) AS n FROM link_runs').get()).toEqual({ n: 0 });
+  });
+});
