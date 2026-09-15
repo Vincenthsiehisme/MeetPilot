@@ -10,6 +10,7 @@ import { GeminiServerClient } from './geminiServerClient';
 import { ListenConfig } from './httpGuards';
 import { openMeetingDb } from './meetingDb';
 import { MeetingStore, createMeetingStore } from './meetingStore';
+import { MATCH_KEY_VERSION } from './topicTag';
 import { TranscriptionQueue } from './transcriptionQueue';
 
 /**
@@ -33,6 +34,8 @@ const fakeGemini = (): GeminiServerClient => ({
   transcribeSlice: async () => [],
   polishTranscript: async () => '潤過的',
   analyzeTranscript: async () => ({ overview: 'x', topics: [], decisions: [], action_items: [] }),
+  // 路由這一層不跑轉錄鏈，抽標籤也不會被呼叫到；形狀要在，缺了型別就對不上
+  extractTopicTags: async () => [],
 });
 
 // 假佇列預設模仿真實佇列的同步行為：enqueue 會一路跑到 pipeline 的第一個 await，
@@ -350,6 +353,37 @@ describe('middleware 順序（限流 → Basic Auth → 音檔路由 → body pa
 
     expect(res.status).toBe(400);
     expect((await res.json() as any).error).toContain('JSON 格式錯誤');
+  });
+});
+
+describe('GET /api/meetings/:id 的題目標籤（W3）', () => {
+  it('題目標籤與會議標籤分成兩個欄位回出去，不會混成同一組', async () => {
+    await start({ queue: fakeQueue() });
+    store.createMeeting({ meeting_id: 'm-tagged', created_at: T0 });
+    // 使用者自己打的會議標籤
+    store.setTags('m-tagged', ['週會']);
+    // 模型抽的題目標籤
+    store.saveTopicExtraction('m-tagged', {
+      status: 'ok',
+      tags: [{ title: 'POC 時程', content: '卡在報價', match_key: 'poc時程', match_key_version: MATCH_KEY_VERSION }],
+    }, T0 + 1);
+
+    const detail = await (await fetch(`${url}/api/meetings/m-tagged`)).json() as any;
+
+    expect(detail.tags).toEqual(['週會']);
+    expect(detail.topicTags).toHaveLength(1);
+    expect(detail.topicTags[0]).toMatchObject({ title: 'POC 時程', content: '卡在報價', source: 'auto' });
+    expect(detail.meeting.topic_extraction_status).toBe('ok');
+  });
+
+  it('沒抽過的會回空陣列，而 topic_extraction_status 是 null：兩者合起來才分得出「還沒抽」與「抽了沒有」', async () => {
+    await start({ queue: fakeQueue() });
+    store.createMeeting({ meeting_id: 'm-plain', created_at: T0 });
+
+    const detail = await (await fetch(`${url}/api/meetings/m-plain`)).json() as any;
+
+    expect(detail.topicTags).toEqual([]);
+    expect(detail.meeting.topic_extraction_status).toBeNull();
   });
 });
 

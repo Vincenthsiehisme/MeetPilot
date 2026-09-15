@@ -18,6 +18,7 @@ import { GeminiServerClient } from './geminiServerClient';
 import { MeetingStore } from './meetingStore';
 import { SeamReportEntry } from './meetingApi';
 import { DEFAULT_SEAM_REPAIR, RepairResult, SeamRepairConfig, repairSeamGap } from './seamRepair';
+import { TopicExtractor } from './topicExtractor';
 import { SLICE_OVERLAP_SECONDS, mergeSliceTranscript } from './transcriptMerge';
 
 /** 一片 10 分鐘，與搬家前瀏覽器那套的 sliceDurationMin = 10 一致 */
@@ -29,6 +30,8 @@ export interface TranscriptionPipelineDeps {
   audioStore: AudioFileStore;
   slicer: AudioSlicer;
   gemini: GeminiServerClient;
+  /** 分析成功之後抽題目標籤（W3）。抽不到不影響這場會進 READY，理由見 topicExtractor.ts */
+  topicExtractor: TopicExtractor;
   /** 破洞修復的設定。不傳就用預設（開啟、一場會最多 6 次額外轉錄） */
   seamRepair?: SeamRepairConfig;
   /** 測試注入用；正式呼叫不要傳 */
@@ -52,7 +55,7 @@ export function buildPreviousContext(transcript: readonly TranscriptSegment[]): 
 }
 
 export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
-  const { store, audioStore, slicer, gemini } = deps;
+  const { store, audioStore, slicer, gemini, topicExtractor } = deps;
   const now = deps.now ?? (() => Date.now());
   const repairConfig = deps.seamRepair ?? DEFAULT_SEAM_REPAIR;
 
@@ -218,6 +221,14 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
 
         store.setStatus(meetingId, 'ANALYZING', now());
         await analyze(meetingId);
+
+        // 題目標籤在進 READY 之前抽（W3）。順序是刻意的：READY 是「這場會可以用了」，
+        // 而它可不可以參與關聯是使用者看得到的事實之一，不該在 READY 之後才補上。
+        // 這樣一來「READY 但 topic_extraction_status 是 null」只會發生在 W3 之前的舊資料上。
+        //
+        // extract 自己接住模型的錯誤（記成 failed），所以抽不到不會讓這場會變 FAILED——
+        // 分析已經成功了，把它標成失敗是謊報（Q2 裁決）
+        await topicExtractor.extract(meetingId);
 
         store.setStatus(meetingId, 'READY', now());
 

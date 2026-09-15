@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { SCHEMA_VERSION, openMeetingDb, resolveDbPath } from './meetingDb';
 import { createMeetingStore, MeetingStore } from './meetingStore';
 import { MigrationRecord } from './jobMigration';
+import { MATCH_KEY_VERSION } from './topicTag';
 
 let db: DatabaseSync;
 let store: MeetingStore;
@@ -38,6 +39,8 @@ const migrated = (id: string, overrides: Partial<MigrationRecord['meeting']> = {
     processed_slices: null,
     total_slices: null,
     meeting_context: null,
+    topic_extraction_status: null,
+    topic_extraction_error: null,
     ...overrides,
   },
   transcript: { segments: [{ start: 0, end: 1, text: 'hi' }], polished_content: null },
@@ -391,5 +394,156 @@ describe('importMigrated', () => {
       migrated('c', { created_at: T0 }),
     ]);
     expect(store.listMeetings().map(m => m.meeting_id)).toEqual(['c', 'b', 'a']);
+  });
+});
+
+describe('題目標籤（topic_tags，W3）', () => {
+  const autoTag = (title: string, matchKey: string, content = '內容') => ({
+    title,
+    content,
+    match_key: matchKey,
+    match_key_version: MATCH_KEY_VERSION,
+  });
+
+  // manual 的標籤這一期還沒有入口（W5／W6 才有），直接寫進表裡建局面：
+  // 保護要現在就成立，等入口做好再補測試等於讓這條路在中間裸奔
+  const insertManual = (meetingId: string, title: string, matchKey: string) => {
+    db.prepare(`
+      INSERT INTO topic_tags (tag_id, meeting_id, title, content, source, corrected_at,
+                              match_key, match_key_version, created_at)
+      VALUES (?, ?, ?, ?, 'manual', ?, ?, ?, ?)
+    `).run(`manual-${title}`, meetingId, title, '人改過的內容', T0 + 5, matchKey, MATCH_KEY_VERSION, T0);
+  };
+
+  beforeEach(() => {
+    newMeeting();
+  });
+
+  it('寫進去讀得回來，欄位一個不掉', () => {
+    store.saveTopicExtraction('m-1', { status: 'ok', tags: [autoTag('POC 時程', 'poc時程', '卡在廠商報價')] }, T0 + 1);
+
+    const tags = store.getTopicTags('m-1');
+    expect(tags).toHaveLength(1);
+    expect(tags[0]).toMatchObject({
+      meeting_id: 'm-1',
+      title: 'POC 時程',
+      content: '卡在廠商報價',
+      source: 'auto',
+      corrected_at: null,
+      match_key: 'poc時程',
+      match_key_version: MATCH_KEY_VERSION,
+      created_at: T0 + 1,
+    });
+    expect(tags[0].tag_id).toBeTruthy();
+    expect(store.getMeeting('m-1')?.topic_extraction_status).toBe('ok');
+    expect(store.getMeeting('m-1')?.topic_extraction_error).toBeNull();
+  });
+
+  it('重抽只換掉 auto 的那些，**人工修正一條都不動**', () => {
+    insertManual('m-1', '知識庫維護', '知識庫維護');
+    store.saveTopicExtraction('m-1', { status: 'ok', tags: [autoTag('POC 時程', 'poc時程')] }, T0 + 1);
+
+    store.saveTopicExtraction('m-1', { status: 'ok', tags: [autoTag('派單規則', '派單規則')] }, T0 + 2);
+
+    const tags = store.getTopicTags('m-1');
+    // 舊的 auto 被換掉、新的 auto 進來、manual 還在原地
+    expect(tags.map(t => `${t.source}:${t.title}`).sort())
+      .toEqual(['auto:派單規則', 'manual:知識庫維護']);
+    expect(tags.find(t => t.source === 'manual')?.corrected_at).toBe(T0 + 5);
+  });
+
+  it('新抽的標籤撞到人工修正過的同一題目時整條跳過，不讓兩個版本並存', () => {
+    insertManual('m-1', '知識庫的維護方式', '知識庫維護');
+
+    const report = store.saveTopicExtraction('m-1', {
+      status: 'ok',
+      tags: [autoTag('知識庫維護', '知識庫維護'), autoTag('POC 時程', 'poc時程')],
+    }, T0 + 1);
+
+    expect(report.inserted).toBe(1);
+    expect(report.skippedByManual).toEqual(['知識庫維護']);
+    expect(store.getTopicTags('m-1').filter(t => t.match_key === '知識庫維護').map(t => t.source))
+      .toEqual(['manual']);
+  });
+
+  it('同一批裡比對鍵重複的只留第一條，並回報被丟掉的那些', () => {
+    const report = store.saveTopicExtraction('m-1', {
+      status: 'ok',
+      tags: [autoTag('POC 時程', 'poc時程'), autoTag('POC 的時程', 'poc時程')],
+    }, T0 + 1);
+
+    expect(report).toEqual({ inserted: 1, skippedByManual: [], skippedDuplicate: ['POC 的時程'] });
+    expect(store.getTopicTags('m-1')).toHaveLength(1);
+  });
+
+  it('比對鍵是空字串時拋錯：空鍵之間會互相相等，會把兩件不相干的事判成同一題', () => {
+    expect(() => store.saveTopicExtraction('m-1', { status: 'ok', tags: [autoTag('相關討論', '')] }, T0 + 1))
+      .toThrow(/算不出比對鍵/);
+    expect(store.getTopicTags('m-1')).toEqual([]);
+    // 整個交易回退，狀態也不能留下來
+    expect(store.getMeeting('m-1')?.topic_extraction_status).toBeNull();
+  });
+
+  it('比對鍵版本跟這一版不同時拋錯，不讓兩種規則的鍵混在同一張表', () => {
+    expect(() => store.saveTopicExtraction('m-1', {
+      status: 'ok',
+      tags: [{ ...autoTag('POC 時程', 'poc時程'), match_key_version: MATCH_KEY_VERSION + 1 }],
+    }, T0 + 1)).toThrow(/比對鍵版本/);
+  });
+
+  it('ok 卻一條標籤都沒有時拋錯：那是 empty，不能寫成抽得好好的', () => {
+    expect(() => store.saveTopicExtraction('m-1', { status: 'ok', tags: [] }, T0 + 1)).toThrow(/應該用 empty/);
+  });
+
+  it('empty 落地成狀態，既有標籤不刪：這一輪沒抽到不代表上一輪抽到的是錯的', () => {
+    store.saveTopicExtraction('m-1', { status: 'ok', tags: [autoTag('POC 時程', 'poc時程')] }, T0 + 1);
+
+    store.saveTopicExtraction('m-1', { status: 'empty' }, T0 + 2);
+
+    expect(store.getMeeting('m-1')?.topic_extraction_status).toBe('empty');
+    expect(store.getTopicTags('m-1')).toHaveLength(1);
+  });
+
+  it('failed 把原因留下來，既有標籤同樣不刪', () => {
+    store.saveTopicExtraction('m-1', { status: 'ok', tags: [autoTag('POC 時程', 'poc時程')] }, T0 + 1);
+
+    store.saveTopicExtraction('m-1', { status: 'failed', error: '模型輸出被截斷' }, T0 + 2);
+
+    const meeting = store.getMeeting('m-1');
+    expect(meeting?.topic_extraction_status).toBe('failed');
+    expect(meeting?.topic_extraction_error).toBe('模型輸出被截斷');
+    expect(store.getTopicTags('m-1')).toHaveLength(1);
+  });
+
+  it('從 failed 抽成功之後原因要清掉，不留一個已經不成立的失敗訊息', () => {
+    store.saveTopicExtraction('m-1', { status: 'failed', error: '模型輸出被截斷' }, T0 + 1);
+
+    store.saveTopicExtraction('m-1', { status: 'ok', tags: [autoTag('POC 時程', 'poc時程')] }, T0 + 2);
+
+    expect(store.getMeeting('m-1')?.topic_extraction_error).toBeNull();
+  });
+
+  it('沒抽過的會是 null，不是 empty：「還沒輪到它」與「抽不出東西」不是同一件事', () => {
+    expect(store.getMeeting('m-1')?.topic_extraction_status).toBeNull();
+    expect(store.getTopicTags('m-1')).toEqual([]);
+  });
+
+  it('刪掉整場會時標籤跟著走，不留孤兒列', () => {
+    store.saveTopicExtraction('m-1', { status: 'ok', tags: [autoTag('POC 時程', 'poc時程')] }, T0 + 1);
+    store.deleteMeeting('m-1');
+    expect(db.prepare('SELECT COUNT(*) AS n FROM topic_tags').get()).toMatchObject({ n: 0 });
+  });
+
+  it('Meeting 不存在時拋錯，不靜默生出一批沒有主人的標籤', () => {
+    expect(() => store.saveTopicExtraction('nope', { status: 'empty' }, T0)).toThrow(/找不到 Meeting/);
+  });
+
+  it('同一批標籤的順序固定，不依賴插入時的巧合', () => {
+    store.saveTopicExtraction('m-1', {
+      status: 'ok',
+      tags: [autoTag('派單規則', '派單規則'), autoTag('POC 時程', 'poc時程'), autoTag('客服座席', '客服座席')],
+    }, T0 + 1);
+
+    expect(store.getTopicTags('m-1').map(t => t.title)).toEqual(['POC 時程', '客服座席', '派單規則']);
   });
 });

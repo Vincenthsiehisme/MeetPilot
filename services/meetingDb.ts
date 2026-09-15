@@ -7,9 +7,10 @@
  *
  * 用 node 內建的 `node:sqlite`，不加原生依賴。
  *
- * 這一版只建 migration 真的要落地的四張表。TopicTag、TopicLink、排除紀錄、RecallFeedback
- * 等到 W3 到 W6 各自實作時再加一條 migration：現在建空表等於憑空猜欄位，而那些欄位的形狀
- * （例如 TopicLink 的判定理由）要等策略實作完才確定。
+ * 表只在真的要落地的那一包才建。W1 建了四張（meetings、transcripts、analyses、meeting_tags），
+ * W3 加了 topic_tags；TopicLink、排除紀錄、RecallFeedback 等到 W4 到 W6 各自實作時再加一條
+ * migration：現在建空表等於憑空猜欄位，而那些欄位的形狀（例如 TopicLink 的判定理由）
+ * 要等策略實作完才確定。
  */
 import { DatabaseSync } from 'node:sqlite';
 import { dirname, resolve } from 'node:path';
@@ -66,6 +67,36 @@ const MIGRATIONS: readonly string[] = [
   // 落地而不是只印 log：破洞要留得下來，W2-2b 的修補要拿它當輸入，
   // 而且「這份逐字稿哪裡可能缺內容」是使用者看得到的事實，不是除錯訊息
   `ALTER TABLE transcripts ADD COLUMN seam_report TEXT;`,
+  // W3：題目標籤（`C-TOPICTAG` v1，SDD 1.1／1.2／FN-03）。
+  //
+  // 另開一張表而不是併進 meeting_tags：那張是使用者自己打的會議標籤，全部是人打的；
+  // 這張分得出 auto 與 manual，而人工優先規則只該套在這張上面。併進去之後兩種來源
+  // 長得一模一樣，重算會把人工修正一起洗掉而且沒有任何錯誤訊息。
+  //
+  // meetings 那兩欄是抽取的結果本身：標籤數 0 的會永遠不會參與任何關聯（SDD 4.x），
+  // 這件事要查得出來，不能只寫 log。NULL 是「還沒抽過」（W3 之前的會與搬遷進來的會），
+  // 跟 'empty'（抽過、一條都沒有）不是同一件事
+  `
+  CREATE TABLE topic_tags (
+    tag_id TEXT PRIMARY KEY,
+    meeting_id TEXT NOT NULL REFERENCES meetings(meeting_id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('auto', 'manual')),
+    corrected_at INTEGER,
+    match_key TEXT NOT NULL,
+    match_key_version INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+
+  CREATE INDEX idx_topic_tags_meeting ON topic_tags(meeting_id);
+  -- 跨會議比對是照 match_key 找的（W4），沒有這個索引就是全表掃
+  CREATE INDEX idx_topic_tags_match_key ON topic_tags(match_key);
+
+  ALTER TABLE meetings ADD COLUMN topic_extraction_status TEXT
+    CHECK (topic_extraction_status IN ('ok', 'empty', 'failed'));
+  ALTER TABLE meetings ADD COLUMN topic_extraction_error TEXT;
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

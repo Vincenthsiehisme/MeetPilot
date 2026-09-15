@@ -153,6 +153,10 @@ export const toMigrationRecord = (raw: unknown): MigrationOutcome => {
     processed_slices: asNumber(raw.processedSlices),
     total_slices: asNumber(raw.totalSlices),
     meeting_context: asString(raw.meetingContext),
+    // 搬遷進來的會沒有題目標籤，也不該假裝抽過。null 是「還沒抽過」，
+    // 之後真的抽了才會有值（W3）
+    topic_extraction_status: null,
+    topic_extraction_error: null,
   };
 
   return {

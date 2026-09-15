@@ -123,6 +123,55 @@ repair: { outcome: 'repaired' | 'failed' | 'skipped', attempts, bridgeSeconds? }
 反過來的話，斷在「音檔已換、游標還沒清」的瞬間，重啟後會把新音檔的後半接到舊音檔的逐字稿後面。
 續傳只發生在上面那張表的第一列，也就是 server 自己重啟後的掃描，不會因為重新上傳而沿用舊進度。
 
+### 題目標籤：拿來跨會議比對的那一組
+
+分析成功之後、狀態進 `READY` 之前，server 會再送一次 Gemini，從逐字稿抽出**題目標籤**
+（`topic_tags`），那是之後判斷「兩場會在討論同一件事」的原料。
+
+**這跟會議標籤是兩件事，不要混：**
+
+| | 誰產的 | 存在哪 | 用途 |
+|---|---|---|---|
+| 會議標籤 | 使用者建立會議時自己打 | `meeting_tags` | 當分析 prompt 的背景 |
+| 題目標籤 | 模型從逐字稿抽 | `topic_tags` | 跨會議比對 |
+
+`GET /api/meetings/:id` 兩組分開回（`tags` 與 `topicTags`）。人工優先規則只套用在題目標籤上，
+會議標籤本來就全是人打的。
+
+**抽取用專屬 prompt，不能沿用 `analyze` 的那一份。** 那份是為「給人看的會議記錄」寫的，
+會把一場會壓成 3 到 5 個抽象標題；實測在那個粒度下任何關聯策略都認不出同一題目。
+專屬 prompt 的產出量級是一場會 15 到 25 條。prompt 在
+`services/geminiServerClient.ts` 的 `EXTRACT_TAGS_SYSTEM_INSTRUCTION`，**改它要重跑評測**。
+
+**抽不出標籤不會讓這場會失敗。** 分析已經成功，逐字稿與結論照樣可用，這場會仍然進 `READY`。
+代價是那場會**永遠不會參與任何關聯**，所以結果留成資料而不是只寫 log：
+
+| `meetings.topic_extraction_status` | 意思 |
+|---|---|
+| `NULL` | 還沒抽過（這個功能之前就存在的會、搬遷進來的會） |
+| `ok` | 抽到了，標籤在 `topic_tags` |
+| `empty` | 模型回了，但一條可比對的標籤都沒有 |
+| `failed` | 呼叫或解析失敗，原因在 `topic_extraction_error` |
+
+撈出「不會參與關聯」的會：
+
+```sql
+SELECT meeting_id, status, topic_extraction_status, topic_extraction_error
+FROM meetings
+WHERE status = 'READY' AND (topic_extraction_status IS NULL OR topic_extraction_status <> 'ok');
+```
+
+每條標籤除了給人看的 `title`，還存一個正規化後的比對鍵 `match_key` 與它的規則版本
+`match_key_version`（規則在 `services/topicTag.ts`）。**改正規化規則就要把
+`MATCH_KEY_VERSION` 加一**：不加的話，舊鍵與新鍵會用兩套規則混在同一張表裡比對，
+而那不會有任何錯誤訊息，只會讓兩場本來對得上的會安靜地對不上。
+
+**這一期還沒有任何產生 `source = 'manual'` 標籤的入口**（人工修正走 Obsidian vault 的受控區塊，之後才做），保護與測試先做在這裡：等入口做好才補，等於讓「重算會洗掉人工修正」這條路在中間裸奔，而它洗掉的當下沒有任何錯誤訊息。
+
+重新解析（`retry`）會把 `source = 'auto'` 的標籤整組換掉，**`source = 'manual'` 的一條都不動**；
+新抽出來的標籤若跟人改過的同一題目撞上（`match_key` 相同）就整條跳過，保留人工版本。
+`empty` 與 `failed` 不刪既有標籤——這一輪沒抽到不代表上一輪抽到的是錯的。
+
 ### 把舊紀錄搬到 server
 
 搬遷由使用者在本機那一區按「搬到伺服器」發動，不會自動觸發（server 讀不到 IndexedDB）：

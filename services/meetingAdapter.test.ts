@@ -37,6 +37,9 @@ import {
 
 const makeMeeting = (overrides: Partial<MeetingView> = {}): MeetingView => ({
   meeting_id: 'm_1',
+  // 預設沒抽過題目標籤（null），不是 'empty'：在意這個欄位的測試自己覆寫
+  topic_extraction_status: null,
+  topic_extraction_error: null,
   // 預設有音檔：絕大多數測試不在意這個欄位，在意的那幾條自己覆寫
   has_audio: true,
   title: null,
@@ -187,6 +190,7 @@ describe('meetingDetailToJob', () => {
     transcript: { segments: [{ start: 0, end: 1, text: '嗨' }], polished_content: '嗨。' },
     analysis,
     tags: ['週會'],
+    topicTags: [],
     seamReport: null,
     ...overrides,
   });
@@ -373,6 +377,7 @@ describe('action_items 的往返無損', () => {
       transcript: null,
       analysis: original,
       tags: [],
+      topicTags: [],
     }).analysis!;
 
     // 使用者只動了 overview，action_items 原樣送回
@@ -393,6 +398,7 @@ describe('action_items 的往返無損', () => {
       transcript: null,
       analysis: roundTripped,
       tags: [],
+      topicTags: [],
     }).analysis!;
     expect(shownAgain.action_items).toEqual(['寄簡報', '訂會議室', '對帳']);
   });
@@ -550,8 +556,8 @@ describe('切換會議時的舊回應（C-P1）', () => {
     // 兩個 deferred：A 先送出、後回來，剛好是會把 A 寫進 B 的那個順序
     let resolveA: (v: MeetingDetailResponse) => void = () => {};
     let resolveB: (v: MeetingDetailResponse) => void = () => {};
-    const detailA = { seamReport: null, meeting: makeMeeting({ meeting_id: 'm_A', status: 'READY' }), transcript: null, analysis: null, tags: [] };
-    const detailB = { seamReport: null, meeting: makeMeeting({ meeting_id: 'm_B', status: 'READY' }), transcript: null, analysis: null, tags: [] };
+    const detailA = { seamReport: null, meeting: makeMeeting({ meeting_id: 'm_A', status: 'READY' }), transcript: null, analysis: null, tags: [], topicTags: [] };
+    const detailB = { seamReport: null, meeting: makeMeeting({ meeting_id: 'm_B', status: 'READY' }), transcript: null, analysis: null, tags: [], topicTags: [] };
 
     const fetchDetail = vi.fn((id: string) => new Promise<MeetingDetailResponse>(resolve => {
       if (id === 'm_A') resolveA = resolve; else resolveB = resolve;

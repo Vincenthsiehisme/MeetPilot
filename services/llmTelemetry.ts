@@ -6,7 +6,7 @@ import { dirname } from 'node:path';
 // 「一場會議燒掉多少 token」。埋在這裡的欄位就是為了回答這三個問題。
 // 不上 observability 平台的門檻見 vault 的 AGENT-EVAL-METHODS〈不要上 observability 平台〉。
 
-export type LlmCallKind = 'transcribe' | 'polish' | 'analyze' | 'chat-stream';
+export type LlmCallKind = 'transcribe' | 'polish' | 'analyze' | 'chat-stream' | 'extract-tags';
 
 // ok：模型回了東西。transient：可重試的錯（503／429／overloaded），會退到 fallback 鏈的下一個。
 // fatal：不可重試，直接往上拋。三者分開才看得出「退了幾次才成功」與「第一次就死」的差別，

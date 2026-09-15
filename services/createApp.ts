@@ -351,6 +351,8 @@ export function createApp(deps: AppDeps): express.Express {
         transcript: meetingStore.getTranscript(req.params.id),
         analysis: meetingStore.getAnalysis(req.params.id),
         tags: meetingStore.getTags(req.params.id),
+        // 題目標籤與上面的 tags 分成兩個欄位送（契約檔有寫為什麼不能併）
+        topicTags: meetingStore.getTopicTags(req.params.id),
         seamReport: meetingStore.getSeamReport(req.params.id),
       });
     } catch (err) {
