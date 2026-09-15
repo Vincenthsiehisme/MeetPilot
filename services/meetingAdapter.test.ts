@@ -187,6 +187,7 @@ describe('meetingDetailToJob', () => {
     transcript: { segments: [{ start: 0, end: 1, text: '嗨' }], polished_content: '嗨。' },
     analysis,
     tags: ['週會'],
+    seamReport: null,
     ...overrides,
   });
 
@@ -368,6 +369,7 @@ describe('action_items 的往返無損', () => {
 
     const shown = meetingDetailToJob({
       meeting: makeMeeting({ status: 'READY' }),
+      seamReport: null,
       transcript: null,
       analysis: original,
       tags: [],
@@ -387,6 +389,7 @@ describe('action_items 的往返無損', () => {
     // 再走一圈也不會多出東西
     const shownAgain = meetingDetailToJob({
       meeting: makeMeeting({ status: 'READY' }),
+      seamReport: null,
       transcript: null,
       analysis: roundTripped,
       tags: [],
@@ -547,8 +550,8 @@ describe('切換會議時的舊回應（C-P1）', () => {
     // 兩個 deferred：A 先送出、後回來，剛好是會把 A 寫進 B 的那個順序
     let resolveA: (v: MeetingDetailResponse) => void = () => {};
     let resolveB: (v: MeetingDetailResponse) => void = () => {};
-    const detailA = { meeting: makeMeeting({ meeting_id: 'm_A', status: 'READY' }), transcript: null, analysis: null, tags: [] };
-    const detailB = { meeting: makeMeeting({ meeting_id: 'm_B', status: 'READY' }), transcript: null, analysis: null, tags: [] };
+    const detailA = { seamReport: null, meeting: makeMeeting({ meeting_id: 'm_A', status: 'READY' }), transcript: null, analysis: null, tags: [] };
+    const detailB = { seamReport: null, meeting: makeMeeting({ meeting_id: 'm_B', status: 'READY' }), transcript: null, analysis: null, tags: [] };
 
     const fetchDetail = vi.fn((id: string) => new Promise<MeetingDetailResponse>(resolve => {
       if (id === 'm_A') resolveA = resolve; else resolveB = resolve;

@@ -2,125 +2,108 @@ import { describe, it, expect } from 'vitest';
 import { mergeSliceTranscript, SLICE_OVERLAP_SECONDS } from './transcriptMerge';
 import { TranscriptSegment } from '../types';
 
-const seg = (start: number, end: number, text: string): TranscriptSegment => ({ start, end, text, speaker: 'A' });
+const seg = (start: number, end: number, text: string): TranscriptSegment =>
+  ({ start, end, text, speaker: 'Speaker 1' });
+
+// fixture 是照真實模型輸出的**形狀**編的，不是真的逐字稿：同一段話被轉兩次、用字有出入
+// （「排程」對「排成」這種同音錯字、贅字增減），這正是不能用逐字比對的理由。
+// 不放真實會議內容進 repo。也不要換成「600s 開始的內容」那種公式化字串——
+// 那種文字相鄰段落天生就像，測不到真正的行為（實測相似度 0.93）
+const TAIL = [
+  seg(249.5, 257.0, '所以那個時候我就跟主管提,說我想做一個共用的排程模組,讓每一組自己排自己的批次,不要每次都回來找我們手動跑一遍。'),
+  seg(257.0, 260.0, '而不是用工單的數量當指標,而是看他們的批次有沒有準時跑完。'),
+  seg(260.0, 262.0, '這樣我才知道說,某一組看起來自動化很高,'),
+];
+const HEAD_DUP = seg(600.0, 609.9, '然後我就跟主管提說,我想做一個共用的排成模組,讓每一組自己排自己的批次,不要每次都回來找我們手動跑。');
+const HEAD_DUP2 = seg(610.5, 618.6, '而不是用工單數量當指標,是看他們的批次有沒有準時跑完,這樣我才知道某一組看起來自動化很高,但其他組完全沒有,對,這是我在意的地方。');
+const HEAD_NEW = seg(620.3, 622.8, '那當初這件事你覺得最挑戰的會是什麼?');
+const HEAD_NEW2 = seg(624.4, 626.2, '是在溝通這一段嗎?');
 
 describe('mergeSliceTranscript', () => {
-  it('第一片全收，不過濾', () => {
-    const incoming = [seg(0, 4, 'a'), seg(4, 9, 'b'), seg(9, 14, 'c')];
-    expect(mergeSliceTranscript([], incoming, 0, true)).toEqual([
-      seg(0, 4, 'a'), seg(4, 9, 'b'), seg(9, 14, 'c')
-    ]);
+  it('第一片全收、不比對，seam 是 null', () => {
+    const incoming = [HEAD_DUP, HEAD_NEW];
+    const result = mergeSliceTranscript([], incoming, 0, true);
+    expect(result.segments).toEqual(incoming);
+    expect(result.seam).toBeNull();
   });
 
   it('第一片即使 existing 非空也全部接上', () => {
-    const existing = [seg(0, 3, 'x')];
-    const incoming = [seg(1, 2, 'y')];
-    expect(mergeSliceTranscript(existing, incoming, 0, true)).toEqual([
-      seg(0, 3, 'x'), seg(1, 2, 'y')
-    ]);
+    const result = mergeSliceTranscript(TAIL, [HEAD_DUP], 600, true);
+    expect(result.segments).toEqual([...TAIL, HEAD_DUP]);
+    expect(result.seam).toBeNull();
   });
 
-  it('第二片裡 end 落在 coveredUntil + tolerance 之內的段落被丟', () => {
-    // 第一片涵蓋到 615 秒（600 + 15 秒 overlap），第二片從 600 開始
-    const existing = [seg(590, 600, 'p'), seg(600, 608, 'q'), seg(608, 615, 'r')];
+  it('接縫對得上時丟掉重複的那一段，新內容一段都不丟', () => {
+    const incoming = [HEAD_DUP, HEAD_DUP2, HEAD_NEW, HEAD_NEW2];
+    const result = mergeSliceTranscript(TAIL, incoming, 600, false);
+    expect(result.seam?.verdict).toBe('duplicate');
+    // HEAD_DUP 整段落在 overlap 區（end 609.9 <= 600 + 15 + 0.5）→ 刪。
+    // HEAD_DUP2 的 end 是 618.6，超出 overlap 區，**即使文字上是重複也留著**：
+    // 那條線之外的音檔前一片根本沒有，刪它就有掉字的風險（見實作的幾何上限）
+    expect(result.segments).toEqual([...TAIL, HEAD_DUP2, HEAD_NEW, HEAD_NEW2]);
+    expect(result.seam?.duplicateSegments).toBe(1);
+  });
+
+  it('幾何上限擋得住過度刪除：文字判定要刪 4 段，超出 overlap 區的一段都不刪', () => {
+    // 這條擋的是文字自相似造成的多砍。合成資料最明顯（「600s 開始的內容」那種），
+    // 真實會議的套語重複也一樣，而多砍就是掉字
+    const incoming = [HEAD_DUP, HEAD_DUP2, HEAD_NEW, HEAD_NEW2];
+    const generous = mergeSliceTranscript(TAIL, incoming, 600, false, { threshold: 0.01 });
+    expect(generous.seam?.duplicateSegments).toBeLessThanOrEqual(1);
+    expect(generous.segments).toContain(HEAD_NEW);
+    expect(generous.segments).toContain(HEAD_NEW2);
+  });
+
+  it('時間戳被壓縮也照樣去重：這是換掉時間比對的全部理由', () => {
+    // 舊做法看 coveredUntil = min(existing 最後的 end, sliceStart + 15)。
+    // 這裡 existing 最後一段的 end 是 262，而 incoming 從 600 開始，
+    // 舊規則算出 coveredUntil = 262，incoming 全部放行，同一段話進去兩次
+    const incoming = [HEAD_DUP, HEAD_DUP2, HEAD_NEW];
+    const result = mergeSliceTranscript(TAIL, incoming, 600, false);
+    expect(TAIL[TAIL.length - 1].end).toBeLessThan(incoming[0].start - 300);
+    expect(result.seam?.verdict).toBe('duplicate');
+    expect(result.segments).toEqual([...TAIL, HEAD_DUP2, HEAD_NEW]);
+  });
+
+  it('接縫對不上時全部接上，判定是 gap：那代表有一片沒轉完，呼叫端要講出去', () => {
     const incoming = [
-      seg(600, 608, 'q-dup'),   // end 608 <= 615.5，丟
-      seg(608, 615, 'r-dup'),   // end 615 <= 615.5，丟
-      seg(615, 615.5, 'edge'),  // end 615.5 <= 615.5，丟（邊界含等號）
-      seg(615.5, 620, 's'),     // end 620 > 615.5，留
-      seg(620, 630, 't')
+      seg(1800.0, 1801.7, '那倉儲那邊呢。'),
+      seg(1801.7, 1805.4, '棧板的數量從上個月開始就一直不夠用。'),
+      seg(1805.4, 1810.3, '採購說最快也要月底才補得到貨,中間這段只能先調度。'),
     ];
-    expect(mergeSliceTranscript(existing, incoming, 600, false)).toEqual([
-      seg(590, 600, 'p'), seg(600, 608, 'q'), seg(608, 615, 'r'),
-      seg(615.5, 620, 's'), seg(620, 630, 't')
-    ]);
+    const result = mergeSliceTranscript(TAIL, incoming, 1800, false);
+    expect(result.seam?.verdict).toBe('gap');
+    expect(result.segments).toEqual([...TAIL, ...incoming]);
   });
 
-  it('start 早於 coveredUntil 但 end 超過 tolerance 的段落保留', () => {
-    const existing = [seg(600, 612, 'q')];
-    const incoming = [seg(610, 618, 'straddle'), seg(618, 625, 'next')];
-    expect(mergeSliceTranscript(existing, incoming, 600, false)).toEqual([
-      seg(600, 612, 'q'), seg(610, 618, 'straddle'), seg(618, 625, 'next')
-    ]);
+  it('判不出來時全部接上：寧可留一小段重複，不可掉字', () => {
+    const result = mergeSliceTranscript([seg(0, 1, '對。')], [seg(1, 2, '嗯。')], 0, false);
+    expect(result.seam?.verdict).toBe('inconclusive');
+    expect(result.segments).toHaveLength(2);
   });
 
-  it('existing 為空的非第一片以 sliceStartTime 當 coveredUntil', () => {
-    const incoming = [seg(598, 600.4, 'before'), seg(600, 600.5, 'edge'), seg(600.2, 603, 'after')];
-    expect(mergeSliceTranscript([], incoming, 600, false)).toEqual([
-      seg(600.2, 603, 'after')
-    ]);
-  });
-
-  it('tolerance 可自訂', () => {
-    const existing = [seg(0, 10, 'a')];
-    const incoming = [seg(9, 11, 'b'), seg(11, 13, 'c')];
-    expect(mergeSliceTranscript(existing, incoming, 0, false, 2)).toEqual([
-      seg(0, 10, 'a'), seg(11, 13, 'c')
-    ]);
-  });
-
-  it('existing 最後一段 end 超過 overlap 區時，coveredUntil 以 sliceStartTime + overlapSeconds 為上限', () => {
-    // 前一片 LLM 時間戳高估到 640（sliceStart 600 + 40，超過 overlap 15），不能拿 640 當 coveredUntil
-    const existing = [seg(600, 640, 'overshoot')];
+  it('接縫之外真的重複說的話不會被砍掉', () => {
+    const existing = [seg(100, 104, '那我們就照這個方向走，下週再對一次進度好嗎。')];
     const incoming = [
-      seg(600, 612, 'in-overlap'),  // end 612 <= 615.5，丟
-      seg(612, 620, 'must-keep'),   // end 620 > 615.5，留（舊規則會因 620 <= 640.5 掉字）
-      seg(620, 630, 'next')
+      seg(104, 108, '好，那先講第二件事情，關於報價的部分。'),
+      seg(108, 112, '那我們就照這個方向走，下週再對一次進度好嗎。'),
     ];
-    expect(mergeSliceTranscript(existing, incoming, 600, false)).toEqual([
-      seg(600, 640, 'overshoot'), seg(612, 620, 'must-keep'), seg(620, 630, 'next')
-    ]);
+    const result = mergeSliceTranscript(existing, incoming, 104, false);
+    expect(result.segments).toEqual([...existing, ...incoming]);
   });
 
-  it('existing 最後一段 end 在 overlap 區內時，行為跟原本一樣', () => {
-    const existing = [seg(600, 610, 'short')];
-    const incoming = [
-      seg(600, 605, 'dup'),        // end 605 <= 610.5，丟
-      seg(605, 610.5, 'edge'),     // end 610.5 <= 610.5，丟
-      seg(610, 614, 'keep'),       // end 614 > 610.5，留
-      seg(614, 620, 'next')
-    ];
-    expect(mergeSliceTranscript(existing, incoming, 600, false)).toEqual([
-      seg(600, 610, 'short'), seg(610, 614, 'keep'), seg(614, 620, 'next')
-    ]);
-  });
-
-  it('overlapSeconds 可自訂', () => {
-    const existing = [seg(600, 640, 'overshoot')];
-    const incoming = [seg(600, 630, 'a'), seg(630, 636, 'b')];
-    expect(mergeSliceTranscript(existing, incoming, 600, false, 0.5, 30)).toEqual([
-      seg(600, 640, 'overshoot'), seg(630, 636, 'b')
-    ]);
-  });
-
-  it('overlapSeconds 預設值就是 SLICE_OVERLAP_SECONDS（15），省略第 6 參數跟明傳 15 一樣', () => {
-    // 常數被改值或 default 沒接上常數時，這條會壞；planSlices 與 transcriptionPipeline 都靠這個值對齊
+  it('SLICE_OVERLAP_SECONDS 仍是 15：planSlices 靠它切出重疊區，沒有重疊就沒有可對齊的內容', () => {
     expect(SLICE_OVERLAP_SECONDS).toBe(15);
-
-    const existing = [seg(600, 640, 'overshoot')];
-    const incoming = [
-      seg(600, 612, 'in-overlap'),  // end 612 <= 600 + 15 + 0.5，丟
-      seg(612, 620, 'must-keep'),
-      seg(620, 630, 'next')
-    ];
-    const expected = [
-      seg(600, 640, 'overshoot'), seg(612, 620, 'must-keep'), seg(620, 630, 'next')
-    ];
-    expect(mergeSliceTranscript(existing, incoming, 600, false)).toEqual(expected);
-    expect(mergeSliceTranscript(existing, incoming, 600, false, 0.5, 15)).toEqual(expected);
   });
 
   it('不 mutate 輸入陣列', () => {
-    const existing = [seg(0, 10, 'a')];
-    const incoming = [seg(5, 10, 'dup'), seg(10, 15, 'b')];
+    const existing = TAIL.map(s => ({ ...s }));
+    const incoming = [HEAD_DUP, HEAD_NEW].map(s => ({ ...s }));
     const existingSnapshot = JSON.stringify(existing);
     const incomingSnapshot = JSON.stringify(incoming);
-    const result = mergeSliceTranscript(existing, incoming, 0, false);
-    expect(result).toEqual([seg(0, 10, 'a'), seg(10, 15, 'b')]);
+    const result = mergeSliceTranscript(existing, incoming, 600, false);
     expect(JSON.stringify(existing)).toBe(existingSnapshot);
     expect(JSON.stringify(incoming)).toBe(incomingSnapshot);
-    expect(existing).toHaveLength(1);
-    expect(incoming).toHaveLength(2);
-    expect(result).not.toBe(existing);
+    expect(result.segments).not.toBe(existing);
   });
 });

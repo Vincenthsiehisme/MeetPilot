@@ -351,6 +351,7 @@ export function createApp(deps: AppDeps): express.Express {
         transcript: meetingStore.getTranscript(req.params.id),
         analysis: meetingStore.getAnalysis(req.params.id),
         tags: meetingStore.getTags(req.params.id),
+        seamReport: meetingStore.getSeamReport(req.params.id),
       });
     } catch (err) {
       handleStoreError(err, res);
