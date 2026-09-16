@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { LlmCallInput } from './llmTelemetry';
+import { LlmCallInput, extractFinishReason } from './llmTelemetry';
 
 // @google/genai 整包換掉：這些測試要驗的是 prompt 組裝、fallback 鏈與回應解析，
 // 不是真的去打 Gemini。vi.hoisted 是因為 vi.mock 的 factory 會被提到 import 之前執行
@@ -16,6 +16,7 @@ vi.mock('@google/genai', () => ({
     };
   },
   Type: { OBJECT: 'OBJECT', ARRAY: 'ARRAY', STRING: 'STRING', NUMBER: 'NUMBER', BOOLEAN: 'BOOLEAN' },
+  ThinkingLevel: { UNSPECIFIED: 'THINKING_LEVEL_UNSPECIFIED', LOW: 'LOW', MEDIUM: 'MEDIUM', HIGH: 'HIGH' },
 }));
 
 const {
@@ -102,6 +103,17 @@ describe('transcribeSlice', () => {
     expect(request.model).toBe('gemini-3.8-flash');
   });
 
+  it('thinking level 調低，降低 thinking 吃光 maxOutputTokens 讓 response.text 變空的機率', async () => {
+    generateContent.mockResolvedValue({ text: '{"segments":[]}' });
+    await client().transcribeSlice({ base64Data: 'AAAA' });
+
+    const request = generateContent.mock.calls[0][0] as any;
+    expect(request.config.thinkingConfig).toEqual({ thinkingLevel: 'LOW' });
+    // 沒設 maxOutputTokens：這支呼叫本來就是三支裡唯一沒設上限的一支，配上調低的 thinking
+    // level 是同一個問題的兩面，log 裡的 configuredMaxOutputTokens 要老實記成 null
+    expect(request.config.maxOutputTokens).toBeUndefined();
+  });
+
   it('圍欄包住的合法 segments 要正確解析，不能變成一段 JSON 原始碼的假逐字稿', async () => {
     // cleanJsonString 整支函式存在的理由就是剝圍欄，代表這個 repo 認為圍欄會發生
     generateContent.mockResolvedValue({
@@ -173,6 +185,9 @@ describe('fallback 鏈', () => {
       { text: '', usageMetadata: { thoughtsTokenCount: 21, totalTokenCount: 21 } },
       { text: '{}', usageMetadata: { thoughtsTokenCount: 13, totalTokenCount: 13 } },
     ]);
+    // 這兩筆是空輸出，不是限流：跟下面 503 那個案例要分得開，才查得出「這場會因為
+    // thinking 吃光預算重試幾次」跟「因為限流重試幾次」
+    expect(logged.slice(0, 2).map(l => l.transientReason)).toEqual(['empty_output', 'empty_output']);
   });
 
   it('transient 錯誤重試同一個 model 兩次後才退到下一個，紀錄留下 modelIndex', async () => {
@@ -192,6 +207,8 @@ describe('fallback 鏈', () => {
     expect(logged.map(l => l.outcome)).toEqual(['transient', 'transient', 'ok']);
     expect(logged.map(l => l.modelIndex)).toEqual([0, 0, 1]);
     expect(logged.every(l => l.kind === 'transcribe' && l.streamed === false)).toBe(true);
+    // 503 是限流過載，不是空輸出：跟上面那個案例是兩種不同成因
+    expect(logged.slice(0, 2).map(l => l.transientReason)).toEqual(['rate_limited', 'rate_limited']);
   });
 
   it('不可重試的錯誤第一次就往上拋，不退到 fallback 鏈後面', async () => {
@@ -200,6 +217,20 @@ describe('fallback 鏈', () => {
     await expect(client().transcribeSlice({ base64Data: 'AAAA' })).rejects.toThrow('400 Invalid argument');
     expect(generateContent).toHaveBeenCalledTimes(1);
     expect(logged.map(l => l.outcome)).toEqual(['fatal']);
+    // fatal 不是 transient，transientReason 不該有值
+    expect(logged.map(l => l.transientReason)).toEqual([null]);
+  });
+
+  it('finishReason 跟著 response 記下來，MAX_TOKENS 直接證實是撞到輸出上限', async () => {
+    generateContent.mockResolvedValueOnce({
+      text: '',
+      candidates: [{ finishReason: 'MAX_TOKENS' }],
+    });
+    generateContent.mockResolvedValueOnce({ text: '{"segments":[]}' });
+
+    await client().transcribeSlice({ base64Data: 'AAAA' });
+
+    expect(logged.map(l => extractFinishReason(l.response))).toEqual(['MAX_TOKENS', null]);
   });
 });
 
@@ -226,6 +257,14 @@ describe('analyzeTranscript', () => {
     generateContent.mockResolvedValue({ text: '抱歉，我無法處理' });
     await expect(client().analyzeTranscript({ transcript: [{ start: 0, end: 1, text: 'x' }] }))
       .rejects.toThrow();
+  });
+
+  it('紀錄的 configuredMaxOutputTokens 是這支呼叫實際設的上限，跟 transcribe 沒設的 null 不一樣', async () => {
+    generateContent.mockResolvedValue({
+      text: '{"overview":"x","topics":[],"decisions":[],"action_items":[]}',
+    });
+    await client().analyzeTranscript({ transcript: [{ start: 0, end: 1, text: 'x' }] });
+    expect(logged.map(l => l.configuredMaxOutputTokens)).toEqual([8192]);
   });
 });
 
