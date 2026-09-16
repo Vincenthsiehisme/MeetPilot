@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import {
   extractUsage,
   extractFinishReason,
+  extractBlockReason,
+  extractCandidatesCount,
   describeLlmError,
   buildLlmRecord,
   resolveLlmLogPath,
@@ -75,6 +77,37 @@ describe('extractFinishReason', () => {
     expect(extractFinishReason({ candidates: [{ finishReason: 123 }] })).toBeNull();
     expect(extractFinishReason(null)).toBeNull();
     expect(extractFinishReason(undefined)).toBeNull();
+  });
+});
+
+describe('extractBlockReason', () => {
+  it('promptFeedback.blockReason 是字串時原樣取出：finishReason 是 null 時查這個才知道是不是被擋在候選產生之前', () => {
+    expect(extractBlockReason({ promptFeedback: { blockReason: 'SAFETY' } })).toBe('SAFETY');
+  });
+
+  it('沒有 promptFeedback、blockReason 不是字串時給 null', () => {
+    expect(extractBlockReason({})).toBeNull();
+    expect(extractBlockReason({ promptFeedback: {} })).toBeNull();
+    expect(extractBlockReason({ promptFeedback: { blockReason: 1 } })).toBeNull();
+    expect(extractBlockReason(null)).toBeNull();
+    expect(extractBlockReason(undefined)).toBeNull();
+  });
+});
+
+describe('extractCandidatesCount', () => {
+  it('candidates 是陣列時給長度', () => {
+    expect(extractCandidatesCount({ candidates: [{}, {}] })).toBe(2);
+    expect(extractCandidatesCount({ candidates: [] })).toBe(0);
+  });
+
+  it('response 存在但沒有 candidates 陣列時給 0：這是「模型回了、零個候選」的真資訊，不是不知道', () => {
+    expect(extractCandidatesCount({})).toBe(0);
+    expect(extractCandidatesCount({ candidates: 'not-an-array' })).toBe(0);
+  });
+
+  it('response 整個沒拿到（呼叫端還沒收到 HTTP 回應就先拋錯）才是 null', () => {
+    expect(extractCandidatesCount(null)).toBeNull();
+    expect(extractCandidatesCount(undefined)).toBeNull();
   });
 });
 
@@ -162,6 +195,8 @@ describe('buildLlmRecord', () => {
       totalTokens: 1200,
       finishReason: null,
       configuredMaxOutputTokens: null,
+      blockReason: null,
+      candidatesCount: 0,
       errorStatus: null,
       errorMessage: null,
     });
@@ -255,6 +290,41 @@ describe('buildLlmRecord', () => {
     expect(record.finishReason).toBe('MAX_TOKENS');
     // null 代表這通呼叫沒設上限，不是「設了但沒查到」——跟 promptTokens 的 null／0 原則一樣
     expect(record.configuredMaxOutputTokens).toBeNull();
+  });
+
+  it('finishReason 是 null 時，blockReason 與 candidatesCount 補得出「是不是在候選產生之前就被擋下」', () => {
+    // 2026-09-16 的真實案例：空輸出的 finishReason 全部是 null，candidates 陣列本身是空的，
+    // 這兩個欄位就是為了不用再靠猜——這裡驗的是「被安全過濾擋在候選產生之前」那種形狀
+    const blocked = buildLlmRecord({
+      kind: 'transcribe',
+      model: 'gemini-3.8-flash',
+      modelIndex: 0,
+      attempt: 1,
+      streamed: false,
+      latencyMs: 100,
+      outcome: 'transient',
+      transientReason: 'empty_output',
+      response: { promptFeedback: { blockReason: 'SAFETY' }, candidates: [] },
+      now: FIXED_NOW,
+    });
+    expect(blocked.finishReason).toBeNull();
+    expect(blocked.blockReason).toBe('SAFETY');
+    expect(blocked.candidatesCount).toBe(0);
+
+    // 對照組：response 整個沒收到（HTTP 層的錯，不是回應內容的問題）
+    const noResponse = buildLlmRecord({
+      kind: 'transcribe',
+      model: 'gemini-3.8-flash',
+      modelIndex: 0,
+      attempt: 1,
+      streamed: false,
+      latencyMs: 100,
+      outcome: 'transient',
+      transientReason: 'rate_limited',
+      now: FIXED_NOW,
+    });
+    expect(noResponse.candidatesCount).toBeNull();
+    expect(noResponse.blockReason).toBeNull();
   });
 
   it('退到 fallback 鏈第二個模型時 modelIndex 記得下來', () => {

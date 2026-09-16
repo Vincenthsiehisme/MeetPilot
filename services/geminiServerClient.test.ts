@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { LlmCallInput, extractFinishReason } from './llmTelemetry';
+import { LlmCallInput, extractFinishReason, extractBlockReason, extractCandidatesCount } from './llmTelemetry';
 
 // @google/genai 整包換掉：這些測試要驗的是 prompt 組裝、fallback 鏈與回應解析，
 // 不是真的去打 Gemini。vi.hoisted 是因為 vi.mock 的 factory 會被提到 import 之前執行
@@ -231,6 +231,23 @@ describe('fallback 鏈', () => {
     await client().transcribeSlice({ base64Data: 'AAAA' });
 
     expect(logged.map(l => extractFinishReason(l.response))).toEqual(['MAX_TOKENS', null]);
+  });
+
+  it('finishReason 是 null 又沒有候選時，blockReason／candidatesCount 補得出是不是被安全過濾擋下', async () => {
+    generateContent.mockResolvedValueOnce({
+      text: '',
+      candidates: [],
+      promptFeedback: { blockReason: 'SAFETY' },
+    });
+    generateContent.mockResolvedValueOnce({
+      text: '{"segments":[]}',
+      candidates: [{ finishReason: 'STOP' }],
+    });
+
+    await client().transcribeSlice({ base64Data: 'AAAA' });
+
+    expect(logged.map(l => extractBlockReason(l.response))).toEqual(['SAFETY', null]);
+    expect(logged.map(l => extractCandidatesCount(l.response))).toEqual([0, 1]);
   });
 });
 
