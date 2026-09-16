@@ -85,6 +85,11 @@ export interface LlmCallRecord {
   // 空輸出是不是真的撞到輸出上限、還是被安全過濾擋下，一行紀錄直接看得出來，不用回頭猜
   finishReason: string | null;
   configuredMaxOutputTokens: number | null;
+  // prompt 在產生候選之前就被擋下的原因（promptFeedback.blockReason）。finishReason 是
+  // null 又想知道是不是這種情況時看這個欄位
+  blockReason: string | null;
+  // candidates 陣列的長度，0 是「模型回了、零個候選」，null 是「根本沒收到 response」
+  candidatesCount: number | null;
   errorStatus: number | null;
   errorMessage: string | null;
 }
@@ -116,6 +121,25 @@ export function extractFinishReason(response: unknown): string | null {
     ?.candidates;
   const reason = candidates?.[0]?.finishReason;
   return typeof reason === 'string' ? reason : null;
+}
+
+// finishReason 掛在 candidates[0] 上，如果 Gemini 在產生候選「之前」就把整個 prompt 擋下
+// （安全過濾），candidates 會是空的，finishReason 自然拿不到。promptFeedback.blockReason
+// 是另一個獨立欄位，專門回答「是不是這種情況」——2026-09-16 的空輸出調查發現 finishReason
+// 全部是 null，需要這個欄位才知道是不是撞到這裡，不是繼續猜
+export function extractBlockReason(response: unknown): string | null {
+  const reason = (response as { promptFeedback?: { blockReason?: unknown } } | null | undefined)
+    ?.promptFeedback?.blockReason;
+  return typeof reason === 'string' ? reason : null;
+}
+
+// candidates 陣列的長度。response 存在但拿不到陣列就是 0——這是真的資訊（模型回了、
+// 但零個候選），不是「不知道」。只有整個 response 都沒拿到（呼叫端還沒收到 HTTP 回應
+// 就先拋錯，例如網路層的錯誤）才是 null，跟 extractUsage 的 null／0 原則一致
+export function extractCandidatesCount(response: unknown): number | null {
+  if (response === null || response === undefined) return null;
+  const candidates = (response as { candidates?: unknown }).candidates;
+  return Array.isArray(candidates) ? candidates.length : 0;
 }
 
 // 抽 HTTP 狀態碼與訊息。與 server.ts 的 handleApiError 看的是同兩個地方
@@ -168,6 +192,8 @@ export function buildLlmRecord(input: LlmCallInput): LlmCallRecord {
     totalTokens: usage.totalTokens,
     finishReason: extractFinishReason(input.response),
     configuredMaxOutputTokens: input.configuredMaxOutputTokens ?? null,
+    blockReason: extractBlockReason(input.response),
+    candidatesCount: extractCandidatesCount(input.response),
     errorStatus: error?.status ?? null,
     errorMessage: error?.message ?? null,
   };
