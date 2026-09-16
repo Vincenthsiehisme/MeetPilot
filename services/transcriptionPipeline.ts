@@ -102,6 +102,7 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
         previousContext: buildPreviousContext(transcript),
         mimeType: 'audio/wav',
         sliceDurationSeconds: slice.durationSeconds,
+        meetingId,
       });
 
       const merged = mergeSliceTranscript(transcript, segments, slice.startSeconds, slice.index === 0);
@@ -124,6 +125,7 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
                 previousContext: buildPreviousContext(transcript),
                 mimeType: 'audio/wav',
                 sliceDurationSeconds: durationSeconds,
+                meetingId,
               });
             },
           },
@@ -198,6 +200,7 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
       transcript: transcript.segments,
       meetingTags: store.getTags(meetingId),
       meetingContext: meeting.meeting_context ?? '',
+      meetingId,
     });
     store.saveAnalysis(meetingId, upgradeAnalysisToV2(v1, meetingId, now()), now());
   };

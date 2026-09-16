@@ -117,12 +117,15 @@ export interface TranscribeSliceInput {
   mimeType?: string;
   /** 這片音訊的實際長度（秒，含 overlap）。undefined 代表解不出長度，那就不把時間夾回切片範圍 */
   sliceDurationSeconds?: number;
+  /** 這片屬於哪一場會議，記進 llm.jsonl 才查得出單場會議的 token 花費 */
+  meetingId?: string;
 }
 
 export interface AnalyzeTranscriptInput {
   transcript: TranscriptSegment[];
   meetingTags?: string[];
   meetingContext?: string;
+  meetingId?: string;
 }
 
 /** 模型回的一條題目標籤。落地前還要算比對鍵，見 services/topicExtractor.ts */
@@ -218,9 +221,9 @@ export interface GeminiServerClient {
   polishTranscript(transcript: TranscriptSegment[]): Promise<string>;
   analyzeTranscript(input: AnalyzeTranscriptInput): Promise<GeminiOutput>;
   /** 題目標籤抽取（W3）。回空陣列是合法結果（模型說這份逐字稿沒有可抽的題目），不是錯誤 */
-  extractTopicTags(input: { transcript: TranscriptSegment[] }): Promise<ExtractedTopicTag[]>;
+  extractTopicTags(input: { transcript: TranscriptSegment[]; meetingId?: string }): Promise<ExtractedTopicTag[]>;
   /** 題目標籤的 embedding（W4，S2 召回的原料）。回傳順序與送進去的順序一致 */
-  embedTopicTags(texts: readonly string[]): Promise<EmbeddingBatch>;
+  embedTopicTags(texts: readonly string[], meetingId?: string): Promise<EmbeddingBatch>;
   /** 兩場會是不是在討論同一題目（W4，S3）。判不出來就拋，不回一個猜的 false */
   judgeMeetingPair(input: JudgeMeetingPairInput): Promise<PairJudgement>;
 }
@@ -231,6 +234,7 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
     ai: GoogleGenAI,
     request: {
       kind: LlmCallKind;
+      meetingId?: string;
       contents: any;
       config?: any;
       preferredModel?: string;
@@ -262,6 +266,7 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
           request.validateResponse?.(response);
           llmLogger.log({
             kind: request.kind,
+            meetingId: request.meetingId ?? null,
             model,
             modelIndex,
             attempt: attempt + 1,
@@ -277,6 +282,7 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
 
           llmLogger.log({
             kind: request.kind,
+            meetingId: request.meetingId ?? null,
             model,
             modelIndex,
             attempt: attempt + 1,
@@ -311,6 +317,7 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
         previousContext = '',
         mimeType = 'audio/wav',
         sliceDurationSeconds,
+        meetingId,
       } = input;
 
       const ai = getAI();
@@ -358,6 +365,7 @@ Output JSON format:
 
       const response = await generateContentWithFallback(ai, {
         kind: 'transcribe',
+        meetingId,
         preferredModel: 'gemini-3.8-flash',
         contents: { parts },
         config: promptConfig,
@@ -455,7 +463,7 @@ ${fullText}`,
     },
 
     async analyzeTranscript(input: AnalyzeTranscriptInput): Promise<GeminiOutput> {
-      const { transcript, meetingTags = [], meetingContext = '' } = input;
+      const { transcript, meetingTags = [], meetingContext = '', meetingId } = input;
 
       const ai = getAI();
       const formattedTranscript = formatTranscriptForAI(transcript);
@@ -466,6 +474,7 @@ ${fullText}`,
 
       const response = await generateContentWithFallback(ai, {
         kind: 'analyze',
+        meetingId,
         preferredModel: 'gemini-3.8-flash',
         contents: `請將這份會議記錄整理成結構化的「議題討論紀錄」。
 這是一份逐字稿，可能包含口語贅字。請在分析時自動進行潤飾與歸納。
@@ -513,11 +522,12 @@ ${formattedTranscript}`,
       return JSON.parse(jsonStr) as GeminiOutput;
     },
 
-    async extractTopicTags(input: { transcript: TranscriptSegment[] }): Promise<ExtractedTopicTag[]> {
+    async extractTopicTags(input: { transcript: TranscriptSegment[]; meetingId?: string }): Promise<ExtractedTopicTag[]> {
       const ai = getAI();
 
       const response = await generateContentWithFallback(ai, {
         kind: 'extract-tags',
+        meetingId: input.meetingId,
         // 不指定 preferredModel：fallback 鏈就是評測跑出 15 到 25 那個結果時用的那條
         // （eval/lib/client.ts 的 ANALYZE_MODELS），加一個首選等於換掉受測對象
         contents: `會議逐字稿：\n${formatTranscriptWithTimeForAI(input.transcript)}`,
@@ -575,7 +585,7 @@ ${formattedTranscript}`,
       });
     },
 
-    async embedTopicTags(texts: readonly string[]): Promise<EmbeddingBatch> {
+    async embedTopicTags(texts: readonly string[], meetingId?: string): Promise<EmbeddingBatch> {
       // 沒有標籤時不打 API，也不回一個假的維度：0 維在下游會讓 canCompare 判成「可以比」
       if (texts.length === 0) return { model: EMBEDDING_MODEL, dimensions: 0, vectors: [] };
 
@@ -592,6 +602,7 @@ ${formattedTranscript}`,
         } catch (err) {
           llmLogger.log({
             kind: 'embed',
+            meetingId: meetingId ?? null,
             model: EMBEDDING_MODEL,
             modelIndex: 0,
             attempt: 1,
@@ -605,6 +616,7 @@ ${formattedTranscript}`,
         }
         llmLogger.log({
           kind: 'embed',
+          meetingId: meetingId ?? null,
           model: EMBEDDING_MODEL,
           modelIndex: 0,
           attempt: 1,
@@ -655,6 +667,9 @@ ${formattedTranscript}`,
 
       const response = await generateContentWithFallback(ai, {
         kind: 'link-judge',
+        // 記 idA：呼叫端（TopicLinker.link）一律傳「正在跑關聯的那場會」當 idA，
+        // 這通呼叫的額度算在它頭上，跟 idB（被比對的歷史會議）無關
+        meetingId: input.idA,
         // 不指定 preferredModel：理由同 extractTopicTags，評測跑出那組數字時走的就是這條預設鏈
         contents: `會議 ${input.idA} 討論的題目：
 ${formatTagsForJudge(input.tagsA)}
