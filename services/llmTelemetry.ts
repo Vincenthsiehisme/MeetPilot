@@ -18,6 +18,12 @@ export type LlmCallKind =
 // 合成一個 success boolean 就分不出來了。
 export type LlmOutcome = 'ok' | 'transient' | 'fatal';
 
+// transient 底下還分兩種成因，混在同一個 outcome 值裡查不出「這場會因為空輸出重試幾次」
+// 跟「因為限流重試幾次」——兩者要採取的對策完全不同（前者是 thinking 預算或 prompt 問題，
+// 後者是額度或退避）。empty_output：HTTP 成功但回應沒有可用文字（RetryableLlmResponseError）。
+// rate_limited：HTTP 層的 503／429／overloaded。只在 outcome 是 transient 時有值
+export type LlmTransientReason = 'empty_output' | 'rate_limited';
+
 export interface LlmUsage {
   // 每一項都可能缺。SDK 沒回就是 null，不補 0：
   // 0 是「真的沒用 token」，null 是「不知道」。混成同一個值之後，
@@ -46,10 +52,15 @@ export interface LlmCallInput {
   // 串流專用：到第一個 chunk 的毫秒數。非串流是 null
   ttfbMs?: number | null;
   outcome: LlmOutcome;
+  // outcome 是 transient 時這次重試是哪一種成因。ok／fatal 不填
+  transientReason?: LlmTransientReason | null;
   // 成功時傳 SDK 的 response（或串流裡最後一個帶 usageMetadata 的 chunk）
   response?: unknown;
   // 失敗時傳 caught 的 error
   error?: unknown;
+  // 這通呼叫實際帶的 maxOutputTokens。沒設就是 null——「沒設」跟「設了但拿不到」
+  // 要分得開，不然之後改了設定也對不回舊紀錄裡哪些呼叫當時有沒有上限
+  configuredMaxOutputTokens?: number | null;
   // 測試注入用；正式呼叫不要傳
   now?: Date;
 }
@@ -65,10 +76,15 @@ export interface LlmCallRecord {
   latencyMs: number;
   ttfbMs: number | null;
   outcome: LlmOutcome;
+  transientReason: LlmTransientReason | null;
   promptTokens: number | null;
   outputTokens: number | null;
   thoughtsTokens: number | null;
   totalTokens: number | null;
+  // SDK 的 candidates[0].finishReason：STOP／MAX_TOKENS／SAFETY／…。純 metadata 不含內容，
+  // 空輸出是不是真的撞到輸出上限、還是被安全過濾擋下，一行紀錄直接看得出來，不用回頭猜
+  finishReason: string | null;
+  configuredMaxOutputTokens: number | null;
   errorStatus: number | null;
   errorMessage: string | null;
 }
@@ -92,6 +108,14 @@ export function extractUsage(response: unknown): LlmUsage {
     thoughtsTokens: readTokenCount(meta?.thoughtsTokenCount),
     totalTokens: readTokenCount(meta?.totalTokenCount),
   };
+}
+
+// 從 SDK 的 response 抽 candidates[0].finishReason。拿不到就 null，跟 extractUsage 同一套原則
+export function extractFinishReason(response: unknown): string | null {
+  const candidates = (response as { candidates?: Array<{ finishReason?: unknown }> } | null | undefined)
+    ?.candidates;
+  const reason = candidates?.[0]?.finishReason;
+  return typeof reason === 'string' ? reason : null;
 }
 
 // 抽 HTTP 狀態碼與訊息。與 server.ts 的 handleApiError 看的是同兩個地方
@@ -137,10 +161,13 @@ export function buildLlmRecord(input: LlmCallInput): LlmCallRecord {
     latencyMs: input.latencyMs,
     ttfbMs: input.ttfbMs ?? null,
     outcome: input.outcome,
+    transientReason: input.outcome === 'transient' ? input.transientReason ?? null : null,
     promptTokens: usage.promptTokens,
     outputTokens: usage.outputTokens,
     thoughtsTokens: usage.thoughtsTokens,
     totalTokens: usage.totalTokens,
+    finishReason: extractFinishReason(input.response),
+    configuredMaxOutputTokens: input.configuredMaxOutputTokens ?? null,
     errorStatus: error?.status ?? null,
     errorMessage: error?.message ?? null,
   };

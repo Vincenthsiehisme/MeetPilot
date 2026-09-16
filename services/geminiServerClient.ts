@@ -9,7 +9,7 @@
  * 這個檔是搬家不是改寫：prompt、responseSchema、fallback 鏈、錯誤訊息與紀錄欄位
  * 全部照 server.ts 原樣搬過來，路由那邊只剩參數檢查與 res 的形狀。
  */
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import { GeminiOutput, TranscriptSegment } from '../types';
 import { normalizeTranscribedSegments } from './transcribeSegments';
 import { LlmCallKind, LlmLogger } from './llmTelemetry';
@@ -274,11 +274,15 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
             latencyMs: Date.now() - startedAt,
             outcome: 'ok',
             response,
+            configuredMaxOutputTokens: request.config?.maxOutputTokens ?? null,
           });
           return response;
         } catch (err: any) {
           lastError = err;
-          const isTransient = err instanceof RetryableLlmResponseError || isTransientLlmError(err);
+          // 兩種 transient 成因在這裡本來就是分開判斷的，記進紀錄時不要再壓平成同一個值：
+          // 空輸出（thinking 吃光預算或被安全過濾）跟限流過載要採取的對策完全不同
+          const isEmptyOutput = err instanceof RetryableLlmResponseError;
+          const isTransient = isEmptyOutput || isTransientLlmError(err);
 
           llmLogger.log({
             kind: request.kind,
@@ -289,8 +293,10 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
             streamed: false,
             latencyMs: Date.now() - startedAt,
             outcome: isTransient ? 'transient' : 'fatal',
+            transientReason: isTransient ? (isEmptyOutput ? 'empty_output' : 'rate_limited') : null,
             response,
             error: err,
+            configuredMaxOutputTokens: request.config?.maxOutputTokens ?? null,
           });
 
           console.warn(`[Gemini Request] Model ${model} (attempt ${attempt + 1}) failed:`, err?.message || err);
@@ -342,6 +348,11 @@ RULES:
 
 Output JSON format:
 { "segments": [{ "start": 0.0, "end": 5.5, "text": "完整的句子內容...", "speaker": "Speaker 1" }] }`,
+        // 逐字稿是機械式的照抄任務，不需要推理，調低 thinking level 降低「thinking 吃光
+        // maxOutputTokens、response.text 變空」的機率（2026-09-16 查證：Gemini 3 系列的
+        // thinking token 算進 maxOutputTokens，這支呼叫又沒設上限）。不是保證消除，是降低機率：
+        // llm.jsonl 的 finishReason 欄位之後能直接看出還有沒有撞到 MAX_TOKENS
+        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
         responseMimeType: 'application/json',
         responseSchema: {
           type: Type.OBJECT,

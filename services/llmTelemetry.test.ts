@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   extractUsage,
+  extractFinishReason,
   describeLlmError,
   buildLlmRecord,
   resolveLlmLogPath,
@@ -59,6 +60,21 @@ describe('extractUsage', () => {
     expect(
       extractUsage({ usageMetadata: { promptTokenCount: '1200', candidatesTokenCount: NaN } })
     ).toEqual({ promptTokens: null, outputTokens: null, thoughtsTokens: null, totalTokens: null });
+  });
+});
+
+describe('extractFinishReason', () => {
+  it('candidates[0].finishReason 是字串時原樣取出', () => {
+    expect(extractFinishReason({ candidates: [{ finishReason: 'MAX_TOKENS' }] })).toBe('MAX_TOKENS');
+  });
+
+  it('沒有 candidates、空陣列、finishReason 不是字串時給 null', () => {
+    expect(extractFinishReason({})).toBeNull();
+    expect(extractFinishReason({ candidates: [] })).toBeNull();
+    expect(extractFinishReason({ candidates: [{}] })).toBeNull();
+    expect(extractFinishReason({ candidates: [{ finishReason: 123 }] })).toBeNull();
+    expect(extractFinishReason(null)).toBeNull();
+    expect(extractFinishReason(undefined)).toBeNull();
   });
 });
 
@@ -139,10 +155,13 @@ describe('buildLlmRecord', () => {
       latencyMs: 4200,
       ttfbMs: null,
       outcome: 'ok',
+      transientReason: null,
       promptTokens: 1000,
       outputTokens: 200,
       thoughtsTokens: null,
       totalTokens: 1200,
+      finishReason: null,
+      configuredMaxOutputTokens: null,
       errorStatus: null,
       errorMessage: null,
     });
@@ -173,6 +192,69 @@ describe('buildLlmRecord', () => {
       now: FIXED_NOW,
     });
     expect(withoutId.meetingId).toBeNull();
+  });
+
+  it('transientReason 記得下來：空輸出跟限流是兩種不同成因，不能壓平成同一個值', () => {
+    const emptyOutput = buildLlmRecord({
+      kind: 'transcribe',
+      model: 'gemini-3.8-flash',
+      modelIndex: 0,
+      attempt: 1,
+      streamed: false,
+      latencyMs: 100,
+      outcome: 'transient',
+      transientReason: 'empty_output',
+      now: FIXED_NOW,
+    });
+    expect(emptyOutput.transientReason).toBe('empty_output');
+
+    const rateLimited = buildLlmRecord({
+      kind: 'transcribe',
+      model: 'gemini-3.8-flash',
+      modelIndex: 0,
+      attempt: 1,
+      streamed: false,
+      latencyMs: 100,
+      outcome: 'transient',
+      transientReason: 'rate_limited',
+      now: FIXED_NOW,
+    });
+    expect(rateLimited.transientReason).toBe('rate_limited');
+  });
+
+  it('outcome 不是 transient 時 transientReason 一律 null，就算呼叫端手滑傳了值', () => {
+    const record = buildLlmRecord({
+      kind: 'transcribe',
+      model: 'gemini-3.8-flash',
+      modelIndex: 0,
+      attempt: 1,
+      streamed: false,
+      latencyMs: 100,
+      outcome: 'ok',
+      // 呼叫端本來就不該在 ok 傳這個，但欄位本身要頂得住，不能讓髒資料混進 ok 那一列
+      transientReason: 'empty_output',
+      now: FIXED_NOW,
+    });
+    expect(record.transientReason).toBeNull();
+  });
+
+  it('finishReason 從 response 抽出來，配上 configuredMaxOutputTokens 才知道是不是真撞到上限', () => {
+    const record = buildLlmRecord({
+      kind: 'transcribe',
+      model: 'gemini-3.8-flash',
+      modelIndex: 0,
+      attempt: 1,
+      streamed: false,
+      latencyMs: 100,
+      outcome: 'transient',
+      transientReason: 'empty_output',
+      response: { candidates: [{ finishReason: 'MAX_TOKENS' }] },
+      configuredMaxOutputTokens: null,
+      now: FIXED_NOW,
+    });
+    expect(record.finishReason).toBe('MAX_TOKENS');
+    // null 代表這通呼叫沒設上限，不是「設了但沒查到」——跟 promptTokens 的 null／0 原則一樣
+    expect(record.configuredMaxOutputTokens).toBeNull();
   });
 
   it('退到 fallback 鏈第二個模型時 modelIndex 記得下來', () => {
