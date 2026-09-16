@@ -411,4 +411,50 @@ describe('judgeMeetingPair（W4 的 S3）', () => {
     judgeReply({ sameTopic: true, confidence: 0.9, reason: '理由', sharedTopics: [{ x: 1 }] });
     await expect(judge()).rejects.toThrow(/sharedTopics 不是字串陣列/);
   });
+
+  it('紀錄的 meetingId 是 idA（發起關聯的那場會），不是 idB', async () => {
+    judgeReply({ sameTopic: true, confidence: 0.9, reason: '理由', sharedTopics: [] });
+    await judge();
+    expect(logged.map(l => l.meetingId)).toEqual(['m-1']);
+  });
+});
+
+describe('meetingId 記進 telemetry，事後才查得出單場會議花了多少 token', () => {
+  it('transcribeSlice 有傳 meetingId 就記得下來', async () => {
+    generateContent.mockResolvedValue({ text: '{"segments":[]}' });
+    await client().transcribeSlice({ base64Data: 'AAAA', meetingId: 'meeting-1' });
+    expect(logged.map(l => l.meetingId)).toEqual(['meeting-1']);
+  });
+
+  it('transcribeSlice 沒傳 meetingId 就記 null，不是猜一個值', async () => {
+    generateContent.mockResolvedValue({ text: '{"segments":[]}' });
+    await client().transcribeSlice({ base64Data: 'AAAA' });
+    expect(logged.map(l => l.meetingId)).toEqual([null]);
+  });
+
+  it('analyzeTranscript 有傳 meetingId 就記得下來', async () => {
+    generateContent.mockResolvedValue({
+      text: '{"overview":"x","topics":[],"decisions":[],"action_items":[]}',
+    });
+    await client().analyzeTranscript({
+      transcript: [{ start: 0, end: 1, text: 'x', speaker: 'A' }],
+      meetingId: 'meeting-2',
+    });
+    expect(logged.map(l => l.meetingId)).toEqual(['meeting-2']);
+  });
+
+  it('extractTopicTags 有傳 meetingId 就記得下來', async () => {
+    generateContent.mockResolvedValue({ text: '{"tags":[]}' });
+    await client().extractTopicTags({
+      transcript: [{ start: 0, end: 1, text: 'x', speaker: 'A' }],
+      meetingId: 'meeting-3',
+    });
+    expect(logged.map(l => l.meetingId)).toEqual(['meeting-3']);
+  });
+
+  it('embedTopicTags 有傳 meetingId 就記得下來', async () => {
+    embedContent.mockResolvedValue({ embeddings: [{ values: [1, 0, 0] }] });
+    await client().embedTopicTags(['一段字'], 'meeting-4');
+    expect(logged.map(l => l.meetingId)).toEqual(['meeting-4']);
+  });
 });

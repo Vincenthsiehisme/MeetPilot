@@ -50,7 +50,7 @@ export function createTopicExtractor(deps: TopicExtractorDeps) {
 
     let extracted;
     try {
-      extracted = await gemini.extractTopicTags({ transcript: transcript.segments });
+      extracted = await gemini.extractTopicTags({ transcript: transcript.segments, meetingId });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       store.saveTopicExtraction(meetingId, { status: 'failed', error: message }, now());

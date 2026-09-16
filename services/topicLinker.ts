@@ -103,7 +103,7 @@ export function createTopicLinker(deps: TopicLinkerDeps) {
     const missing = store.listTagsNeedingVectors(meetingId, gemini.embeddingModel);
     if (missing.length === 0) return;
 
-    const batch = await gemini.embedTopicTags(missing.map(tag => embeddingTextOf(tag.title, tag.content)));
+    const batch = await gemini.embedTopicTags(missing.map(tag => embeddingTextOf(tag.title, tag.content)), meetingId);
     if (batch.vectors.length !== missing.length) {
       throw new Error(`Meeting ${meetingId} 送出 ${missing.length} 條標籤，embedding 回來 ${batch.vectors.length} 條`);
     }

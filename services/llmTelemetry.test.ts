@@ -131,6 +131,7 @@ describe('buildLlmRecord', () => {
     ).toEqual({
       ts: '2026-09-14T08:30:00.000Z',
       kind: 'transcribe',
+      meetingId: null,
       model: 'gemini-3.8-flash',
       modelIndex: 0,
       attempt: 1,
@@ -145,6 +146,33 @@ describe('buildLlmRecord', () => {
       errorStatus: null,
       errorMessage: null,
     });
+  });
+
+  it('meetingId 有傳就記得下來，沒傳（含前端 polish／chat-stream 舊路由）記 null', () => {
+    const withId = buildLlmRecord({
+      kind: 'transcribe',
+      meetingId: 'meeting-123',
+      model: 'gemini-3.8-flash',
+      modelIndex: 0,
+      attempt: 1,
+      streamed: false,
+      latencyMs: 100,
+      outcome: 'ok',
+      now: FIXED_NOW,
+    });
+    expect(withId.meetingId).toBe('meeting-123');
+
+    const withoutId = buildLlmRecord({
+      kind: 'chat-stream',
+      model: 'gemini-3.8-flash',
+      modelIndex: 0,
+      attempt: 1,
+      streamed: true,
+      latencyMs: 100,
+      outcome: 'ok',
+      now: FIXED_NOW,
+    });
+    expect(withoutId.meetingId).toBeNull();
   });
 
   it('退到 fallback 鏈第二個模型時 modelIndex 記得下來', () => {

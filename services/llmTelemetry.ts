@@ -30,6 +30,10 @@ export interface LlmUsage {
 
 export interface LlmCallInput {
   kind: LlmCallKind;
+  // 這場呼叫算在哪一場會議頭上，事後才查得出「這場會燒了多少 token」。
+  // null／缺省代表這次呼叫真的沒有單一會議可歸——目前只有前端兩條舊路由
+  // （polish、chat-stream）還沒把 meetingId 帶進請求，其餘 kind 一律會傳
+  meetingId?: string | null;
   // 這次實際打的 model id
   model: string;
   // 它在 fallback 鏈的第幾個，0 是首選。>0 就代表首選模型當時不能用
@@ -53,6 +57,7 @@ export interface LlmCallInput {
 export interface LlmCallRecord {
   ts: string;
   kind: LlmCallKind;
+  meetingId: string | null;
   model: string;
   modelIndex: number;
   attempt: number;
@@ -124,6 +129,7 @@ export function buildLlmRecord(input: LlmCallInput): LlmCallRecord {
   return {
     ts: (input.now ?? new Date()).toISOString(),
     kind: input.kind,
+    meetingId: input.meetingId ?? null,
     model: input.model,
     modelIndex: input.modelIndex,
     attempt: input.attempt,
