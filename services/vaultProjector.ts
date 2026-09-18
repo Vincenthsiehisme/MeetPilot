@@ -17,6 +17,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
+import { TranscriptSegment } from '../types';
 import { ActionItemV2 } from './analysisContract';
 import { MeetingStatus } from './meetingState';
 import { MeetingStore } from './meetingStore';
@@ -29,11 +30,25 @@ const DEFAULT_VAULT_DIR = join(homedir(), 'MeetPilot Vault');
  * `MEETPILOT_VAULT` 未設定時用 `~/MeetPilot Vault`（D-014，使用者 2026-09-14 裁決）。
  * 不放進 `/Users/vincent/AI Memory`：那個 vault 的 `vault-check.py` 對會議 markdown 有三條
  * 硬衝突（`status` 合法值、`INDEX_MIN`、遞迴全掃無排除清單），細節見 SDD 1.3.1〈落地位置〉。
+ *
+ * **設成家目錄本身直接拒絕**（code review 2026-09-18 抓到）：`MEETPILOT_VAULT=~` 這種輸入會讓
+ * `raw.slice(1)` 變空字串，`vaultDir` 解析成 `homedir()` 自己。`mkdirSync` 對已存在的目錄是
+ * no-op，server 會「成功」啟動，然後把會議 markdown 直接寫進使用者整個家目錄，`scanVaultIndex`
+ * 也會開始把家目錄裡所有 `.md` 檔當成候選掃——這種設定錯誤沒有寫入失敗那種天然的啟動期示警，
+ * 所以要自己補一個。
  */
 export const resolveVaultDir = (env: NodeJS.ProcessEnv): string => {
   const raw = (env.MEETPILOT_VAULT ?? '').trim();
-  if (!raw) return DEFAULT_VAULT_DIR;
-  return raw.startsWith('~') ? resolve(join(homedir(), raw.slice(1))) : resolve(raw);
+  const resolved = raw === '' ? DEFAULT_VAULT_DIR : raw.startsWith('~')
+    ? resolve(join(homedir(), raw.slice(1)))
+    : resolve(raw);
+  if (resolved === resolve(homedir())) {
+    throw new Error(
+      `MEETPILOT_VAULT 不能是家目錄本身（目前解析成 ${resolved}）。`
+      + '請指定一個子目錄，例如 ~/MeetPilot Vault，否則會議 markdown 會混進整個家目錄',
+    );
+  }
+  return resolved;
 };
 
 const AUTO_START = '<!-- meetpilot:auto:start 這一區每次由系統整份重寫，改了會被蓋掉 -->';
@@ -45,13 +60,33 @@ const CONFLICT_INFIX = '.conflict-';
 const MANUAL_SYNTAX_VERSION = 1;
 
 /**
- * 標題取 overview 前 30 字，移除路徑與 wikilink 會壞掉的字元與前後空白（SDD 1.3.1〈檔名與身分〉）。
- * `[` `]` 不在 SDD 列的字集裡，但留著會讓 `[[<標題>]]` 這個 wikilink 本身斷掉，所以一併移除。
+ * 標題取 overview 前 30 個字元，移除路徑與 wikilink 會壞掉的字元、控制字元與前後空白
+ * （SDD 1.3.1〈檔名與身分〉）。`[` `]` 不在 SDD 列的字集裡，但留著會讓 `[[<標題>]]` 這個
+ * wikilink 本身斷掉，所以一併移除；換行與其他控制字元同理——一個標題裡的換行會讓 `# <標題>`
+ * 這個 heading 與 `[[<標題>]]` 這個 wikilink 都變成非法 markdown（code review 2026-09-18）。
+ *
+ * 用 `Array.from` 而不是 `.slice(0, 30)`：後者按 UTF-16 code unit 切，遇到 surrogate pair
+ * （例如某些 emoji）可能切在字元中間，留下一個孤立的 surrogate，變成檔名裡一個無法呈現的字元。
+ * `Array.from` 按 code point 迭代，30 個 code point 不會切壞任何一個字元。
  */
 export const sanitizeTitle = (overview: string): string =>
-  overview.slice(0, 30).replace(/[/\\:*?"<>|[\]]/g, '').trim() || '未命名會議';
+  Array.from(overview).slice(0, 30).join('')
+    .replace(/[/\\:*?"<>|[\]]/g, '').replace(/\p{Cc}/gu, '')
+    .trim() || '未命名會議';
 
 const pad2 = (n: number): string => String(n).padStart(2, '0');
+
+/**
+ * 檔名主體（不含 `.md`），供檔名本體與 wikilink 顯示文字共用——原本兩處各自呼叫
+ * `buildFileName` 再 `.replace(/\.md$/, '')` 剝掉副檔名，副檔名的字面值因此要對齊兩個地方
+ * （code review 2026-09-18：simplification）。
+ */
+const buildFileStem = (createdAtMs: number, title: string): string => {
+  const d = new Date(createdAtMs);
+  const stamp = `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())} `
+    + `${pad2(d.getUTCHours())}${pad2(d.getUTCMinutes())}`;
+  return `${stamp} ${sanitizeTitle(title)}`;
+};
 
 /**
  * 檔名：`YYYY-MM-DD HHmm <標題>.md`（SDD 1.3.1）。**決定時機：首次寫入時，之後系統永不更改**
@@ -60,16 +95,26 @@ const pad2 = (n: number): string => String(n).padStart(2, '0');
  * 用 UTC 元件算，不用系統時區：同一個 `created_at` 在任何機器上、任何時候都算出同一個檔名，
  * 測試才不會因為跑測試的機器時區不同而得到不同結果。
  */
-export const buildFileName = (createdAtMs: number, title: string): string => {
-  const d = new Date(createdAtMs);
-  const stamp = `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())} `
-    + `${pad2(d.getUTCHours())}${pad2(d.getUTCMinutes())}`;
-  return `${stamp} ${sanitizeTitle(title)}.md`;
-};
+export const buildFileName = (createdAtMs: number, title: string): string => `${buildFileStem(createdAtMs, title)}.md`;
 
 /** frontmatter 的 `auto_checksum`：系統區內容（AUTO_START 與 AUTO_END 之間，不含標記本身）的 sha256 */
 export const computeChecksum = (systemRegion: string): string =>
   `sha256:${createHash('sha256').update(systemRegion, 'utf8').digest('hex')}`;
+
+/**
+ * 一場會的總長度（分鐘），從逐字稿最後一段的結束時間推。純函式抽出來是為了能單獨測：
+ * `Math.max(...segments.map(s => s.end))` 這種寫法在 segment 數量夠多時會因為引數展開超過
+ * V8 的呼叫堆疊上限而丟 `RangeError`（code review 2026-09-18）——長會議切很多片、逐句斷句時
+ * 上萬個 segment 不是不可能，改用迴圈比大小沒有這個上限。
+ */
+export const computeDurationMinutes = (segments: readonly TranscriptSegment[]): number | null => {
+  if (segments.length === 0) return null;
+  let maxEnd = 0;
+  for (const s of segments) {
+    if (s.end > maxEnd) maxEnd = s.end;
+  }
+  return Math.round(maxEnd / 60);
+};
 
 export type MeetpilotStatus = 'linked' | 'linking' | 'link_failed';
 
@@ -263,11 +308,24 @@ const extractFrontmatterField = (raw: string, key: string): string | null => {
 };
 
 /**
+ * 讀一個 vault 檔案並把 CRLF 正規化成 LF（code review 2026-09-18）。**系統一律只寫 `\n`**
+ * （見 `AUTO_PADDING`、`buildManualBlock`），但 Obsidian、OS 或同步工具可能把整份檔案的換行
+ * 改成 `\r\n`——不正規化的話，`extractSystemRegion` 找的是字面 `\n\n`，對到 `\r\n\r\n` 會直接
+ * 判定「格式跑掉」，把完全沒被人動過的系統區誤判成被改過，觸發不必要的 conflict。
+ * `extractFrontmatterField` 的 `(.*)$`／`m` 也會把行尾的 `\r`吃進值裡，讓 `meetpilot_id`
+ * 帶著看不見的尾碼，跟索引裡乾淨的 id 對不起來——這是同一個成因的另一個症狀，同一處正規化解決。
+ */
+const readVaultFile = (path: string): string => readFileSync(path, 'utf8').replace(/\r\n/g, '\n');
+
+/**
  * 掃整個 vault，建 `meetpilot_id → path` 的索引（SDD 1.3.1〈找檔方式〉：一律靠 id，不靠檔名）。
  *
  * **每次 `project()` 都重掃，不是只在建構時掃一次快取。** vault 預期量級一年約 1,040 個檔（SDD
- * 6.4），逐檔只讀 frontmatter 那幾行，掃一次是毫秒級；換來的是人在 Obsidian 更名後不用重啟
- * server 就找得到，而且外部（人手動複製）造成的同 id 兩檔能在下一次投影就抓到，不用等重啟。
+ * 6.4），掃一次是毫秒級；換來的是人在 Obsidian 更名後不用重啟 server 就找得到，而且外部（人手動
+ * 複製）造成的同 id 兩檔能在下一次投影就抓到，不用等重啟。**逐檔讀的是整份內容不是只有
+ * frontmatter**（先前這裡的註解寫得不誠實）：現在的量級下差異可忽略，但單檔內容變大（討論題目
+ * 全文、多輪人工修正）之後這裡的成本會跟著漲；vault 檔案數量級漲到几千份時要重新評估要不要改成
+ * 只讀檔頭一小段。
  *
  * 同一個 id 出現在兩個檔：停下來報錯，不猜、不挑一個寫（成因通常是人複製了檔案）。
  * frontmatter 缺 `meetpilot_id` 但含 `meetpilot:auto:start` 標記：報錯，不重新產生——這種檔是
@@ -280,7 +338,7 @@ const scanVaultIndex = (vaultDir: string): Map<string, string> => {
   for (const name of readdirSync(vaultDir)) {
     if (!name.endsWith('.md') || name.includes(CONFLICT_INFIX)) continue;
     const path = join(vaultDir, name);
-    const raw = readFileSync(path, 'utf8');
+    const raw = readVaultFile(path);
     const id = extractFrontmatterField(raw, 'meetpilot_id');
 
     if (!id) {
@@ -350,9 +408,7 @@ export const createVaultProjector = (deps: VaultProjectorDeps) => {
     const title = sanitizeTitle(analysis.overview);
 
     const transcript = store.getTranscript(meetingId);
-    const durationMinutes = transcript && transcript.segments.length > 0
-      ? Math.round(Math.max(...transcript.segments.map((s) => s.end)) / 60)
-      : null;
+    const durationMinutes = computeDurationMinutes(transcript?.segments ?? []);
 
     const links = store.getLinks(meetingId);
     const linkRun = store.getLinkRun(meetingId);
@@ -363,28 +419,41 @@ export const createVaultProjector = (deps: VaultProjectorDeps) => {
     // **只讀對方的 Meeting／Analysis，不動對方的檔案**：不 cascade 投影連結到的會議，
     // 也不去讀或改對方的 link_run——那正是 AC-3 要擋的「舊會議那一側被誤寫成剛重新計算過」。
     // 對方若還沒被投影過（尚未有檔案），wikilink 用同一套檔名規則預先算出目標檔名；
-    // 在 Obsidian 裡會先顯示未解析，等那場會自己被投影後才接上（W5 已知的範圍邊界，見 plan）
-    const related: RelatedMeetingRender[] = links.map((link) => {
+    // 在 Obsidian 裡會先顯示未解析，等那場會自己被投影後才接上（W5 已知的範圍邊界，見 plan）。
+    //
+    // **對方的資料讀不到或壞掉時，只跳過那一則關聯，不讓它拖垮這場會自己的投影**（code review
+    // 2026-09-18：原本 `store.getAnalysis(otherId)` 對 contract_version 不是 2 的資料會直接
+    // 拋錯，而這裡的拋錯發生在 `.map()` 裡，會讓整個 `project(meetingId)` 連同這場會自己完全
+    // 合法的結論／待辦都寫不出來，而且是永久性的——只要那筆壞掉的關聯還在，這場會每次投影都會
+    // 撞同一個錯。壞掉的是對方的資料，不該連坐這場會自己的內容；錯誤仍然大聲記在 log 裡，不吞。
+    const related: RelatedMeetingRender[] = [];
+    for (const link of links) {
       const otherId = link.meeting_a === meetingId ? link.meeting_b : link.meeting_a;
-      const otherMeeting = store.getMeeting(otherId);
-      const otherAnalysis = store.getAnalysis(otherId);
-      if (!otherMeeting || !otherAnalysis) {
-        throw new Error(
-          `Meeting ${meetingId} 關聯到 ${otherId}，但那場會沒有 Meeting 或分析資料，資料不一致`,
+      try {
+        const otherMeeting = store.getMeeting(otherId);
+        const otherAnalysis = store.getAnalysis(otherId);
+        if (!otherMeeting || !otherAnalysis) {
+          throw new Error('那場會沒有 Meeting 或分析資料');
+        }
+        const existingOtherPath = index.get(otherId);
+        const displayName = existingOtherPath
+          ? basename(existingOtherPath, '.md')
+          : buildFileStem(otherMeeting.created_at, otherAnalysis.overview);
+        related.push({
+          displayName,
+          confidence: link.confidence,
+          sharedTopics: link.shared_topics,
+          evidence: link.evidence,
+          decisions: otherAnalysis.decisions,
+        });
+      } catch (err) {
+        console.error(
+          `[VaultProjector] Meeting ${meetingId} 關聯到 ${otherId}，但讀那場會的資料時出錯，`
+          + '這則關聯先跳過、其餘內容照常投影：',
+          err,
         );
       }
-      const existingOtherPath = index.get(otherId);
-      const displayName = existingOtherPath
-        ? basename(existingOtherPath, '.md')
-        : buildFileName(otherMeeting.created_at, otherAnalysis.overview).replace(/\.md$/, '');
-      return {
-        displayName,
-        confidence: link.confidence,
-        sharedTopics: link.shared_topics,
-        evidence: link.evidence,
-        decisions: otherAnalysis.decisions,
-      };
-    });
+    }
 
     // 失敗原因讀 meeting.error 不是 linkRun.error：前者是狀態機自己對 LINK_FAILED 的權威欄位
     // （SDD 1.4，setStatus 的 keepsError 規則強制它跟 LINK_FAILED 綁在一起），topicLinker 目前
@@ -406,21 +475,34 @@ export const createVaultProjector = (deps: VaultProjectorDeps) => {
     const meetingDate = new Date(meeting.created_at).toISOString().slice(0, 10);
     const linkAlgoVersion = linkRun?.algo_version ?? LINK_ALGO_VERSION;
 
+    /** 三個分支都要 buildFrontmatter + writeAtomic，這裡收成一個小助手，欄位只在一個地方組 */
+    const writeProjection = (path: string, manualRegionRaw: string, manualSyntaxVersion: number): void => {
+      const frontmatter = buildFrontmatter({
+        meetpilotId: meetingId, meetingDate, durationMinutes, meetpilotStatus, linkAlgoVersion,
+        manualSyntaxVersion, generatedAt, autoChecksum,
+      });
+      writeAtomic(path, assembleFile(frontmatter, systemRegion, manualRegionRaw));
+    };
+
     const existingPath = index.get(meetingId);
 
     // 從沒投影過：檔名現在才決定，之後系統永不更改（SDD 1.3.1〈檔名與身分〉）
     if (!existingPath) {
-      const path = join(vaultDir, buildFileName(meeting.created_at, title));
-      const frontmatter = buildFrontmatter({
-        meetpilotId: meetingId, meetingDate, durationMinutes, meetpilotStatus, linkAlgoVersion,
-        manualSyntaxVersion: MANUAL_SYNTAX_VERSION, generatedAt, autoChecksum,
-      });
-      writeAtomic(path, assembleFile(frontmatter, systemRegion, ''));
+      const stem = buildFileStem(meeting.created_at, title);
+      let path = join(vaultDir, `${stem}.md`);
+      if (existsSync(path)) {
+        // 同一分鐘、標題正規化後撞名：這個檔名已經有別的內容佔著（通常是另一場會，也可能是人
+        // 自己放的筆記），不能不驗證就蓋過去——那正是「同一個 id 永遠對到同一個檔」這個不變量
+        // 要擋的事，只是這次是反過來（同一個檔名對到兩個不同的 id）。加短 id 後綴消歧義，
+        // 不猜哪一份對（code review 2026-09-18）
+        path = join(vaultDir, `${stem} (${meetingId.slice(0, 8)}).md`);
+      }
+      writeProjection(path, '', MANUAL_SYNTAX_VERSION);
       return { status: 'written', path };
     }
 
     // 已經投影過：驗證系統區沒被人動過，才能安全整份重寫
-    const existingRaw = readFileSync(existingPath, 'utf8');
+    const existingRaw = readVaultFile(existingPath);
     const existingChecksum = extractFrontmatterField(existingRaw, 'auto_checksum');
     const existingSystemRegion = extractSystemRegion(existingRaw);
     const systemRegionIntact = existingSystemRegion !== null
@@ -432,26 +514,21 @@ export const createVaultProjector = (deps: VaultProjectorDeps) => {
       const conflictSuffix = new Date(now()).toISOString().replace(/[:.]/g, '-');
       const conflictPath = `${existingPath.slice(0, -3)}${CONFLICT_INFIX}${conflictSuffix}.md`;
       renameSync(existingPath, conflictPath);
-      const frontmatter = buildFrontmatter({
-        meetpilotId: meetingId, meetingDate, durationMinutes, meetpilotStatus, linkAlgoVersion,
-        manualSyntaxVersion: MANUAL_SYNTAX_VERSION, generatedAt, autoChecksum,
-      });
-      writeAtomic(existingPath, assembleFile(frontmatter, systemRegion, ''));
+      writeProjection(existingPath, '', MANUAL_SYNTAX_VERSION);
       return { status: 'conflict', path: existingPath, conflictPath };
     }
 
     // 正常路徑：系統區整份重寫，人工區原樣保留（不解析、不動內容，那是 W6 的事）
     const manualRegionRaw = extractManualRegion(existingRaw);
     const manualSyntaxVersionRaw = extractFrontmatterField(existingRaw, 'manual_syntax_version');
-    const manualSyntaxVersion = manualSyntaxVersionRaw !== null
-      ? Number(manualSyntaxVersionRaw)
+    // 讀不到或不是乾淨整數（例如人手動改壞）一律退回目前版本，不把 NaN 寫回檔案（code review
+    // 2026-09-18）：這個欄位是系統自己要保持乾淨給 W6 讀的契約，寫進一個非數字的值是自己汙染自己
+    const parsedManualSyntaxVersion = manualSyntaxVersionRaw !== null ? Number(manualSyntaxVersionRaw) : NaN;
+    const manualSyntaxVersion = Number.isInteger(parsedManualSyntaxVersion)
+      ? parsedManualSyntaxVersion
       : MANUAL_SYNTAX_VERSION;
 
-    const frontmatter = buildFrontmatter({
-      meetpilotId: meetingId, meetingDate, durationMinutes, meetpilotStatus, linkAlgoVersion,
-      manualSyntaxVersion, generatedAt, autoChecksum,
-    });
-    writeAtomic(existingPath, assembleFile(frontmatter, systemRegion, manualRegionRaw));
+    writeProjection(existingPath, manualRegionRaw, manualSyntaxVersion);
     return { status: 'written', path: existingPath };
   };
 
@@ -459,3 +536,32 @@ export const createVaultProjector = (deps: VaultProjectorDeps) => {
 };
 
 export type VaultProjector = ReturnType<typeof createVaultProjector>;
+
+/**
+ * 呼叫端共用的「投影並記 log」小工具（4 個呼叫點都要一樣的行為，抽出來避免各自漏寫）。
+ *
+ * 原本每個呼叫點都是 `if (vaultProjector) { try { vaultProjector.project(id) } catch { log } }`，
+ * 把回傳值直接丟掉——`status: 'conflict'` 因此完全不會被記錄，只有真的拋出例外才留得下痕跡
+ * （code review 2026-09-18〈altitude〉：conflict 的訊號被呼叫端自己弄丟了，使用者除了在 vault
+ * 裡發現一個沒人跟他說過的 `.conflict-*.md` 檔之外，沒有任何管道知道系統改動過他的檔案）。
+ *
+ * `vaultProjector` 可以是 `null`（測試不需要驗證投影行為時不用注入一個真的），是的話整支是 no-op。
+ */
+export const runProjection = (
+  vaultProjector: VaultProjector | null | undefined,
+  meetingId: string,
+  logPrefix: string,
+): void => {
+  if (!vaultProjector) return;
+  try {
+    const result = vaultProjector.project(meetingId);
+    if (result.status === 'conflict') {
+      console.warn(
+        `${logPrefix} Meeting ${meetingId} 投影時發現系統區被人改過，`
+        + `舊版已另存 ${result.conflictPath}，新版寫進 ${result.path}`,
+      );
+    }
+  } catch (projectErr) {
+    console.error(`${logPrefix} Meeting ${meetingId} 投影到 vault 時拋出錯誤`, projectErr);
+  }
+};

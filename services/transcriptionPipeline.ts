@@ -21,7 +21,7 @@ import { DEFAULT_SEAM_REPAIR, RepairResult, SeamRepairConfig, repairSeamGap } fr
 import { TopicExtractor } from './topicExtractor';
 import { TopicLinker } from './topicLinker';
 import { SLICE_OVERLAP_SECONDS, mergeSliceTranscript } from './transcriptMerge';
-import { VaultProjector } from './vaultProjector';
+import { runProjection, VaultProjector } from './vaultProjector';
 
 /** 一片 10 分鐘，與搬家前瀏覽器那套的 sliceDurationMin = 10 一致 */
 export const SLICE_DURATION_SECONDS = 10 * 60;
@@ -283,13 +283,7 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
 
         // 投影排在關聯之後、跟關聯同一條「不能拖累可見性」的原則：結論與關聯（或關聯尚未完成的
         // 事實）都已經落地，vault 寫不進去只記 log，不讓一場成功的會因為檔案系統的問題變成 FAILED
-        if (vaultProjector) {
-          try {
-            vaultProjector.project(meetingId);
-          } catch (projectErr) {
-            console.error(`[Transcription] Meeting ${meetingId} 投影到 vault 時拋出錯誤`, projectErr);
-          }
-        }
+        runProjection(vaultProjector, meetingId, '[Transcription]');
       } catch (err) {
         markFailed(meetingId, err instanceof Error ? err.message : String(err), err);
         throw err;

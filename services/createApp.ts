@@ -22,7 +22,7 @@ import { AudioFileStore } from './audioFileStore';
 import { TranscriptionQueue } from './transcriptionQueue';
 import { deleteMeetingRequest, patchAnalysisRequest, patchTranscriptRequest } from './meetingEdits';
 import { TopicLinker } from './topicLinker';
-import { VaultProjector } from './vaultProjector';
+import { runProjection, VaultProjector } from './vaultProjector';
 
 export interface AppDeps {
   listenConfig: ListenConfig;
@@ -413,13 +413,7 @@ export function createApp(deps: AppDeps): express.Express {
 
       // 手動重算之後同步重投影，理由同 transcriptionPipeline：vault 寫不進去只記 log，
       // 不讓這個請求因為檔案系統的問題而失敗——關聯已經落地，回應本來就該是成功的
-      if (vaultProjector) {
-        try {
-          vaultProjector.project(meetingId);
-        } catch (projectErr) {
-          console.error(`[MeetPilot] Meeting ${meetingId} 投影到 vault 時拋出錯誤`, projectErr);
-        }
-      }
+      runProjection(vaultProjector, meetingId, '[MeetPilot]');
 
       res.json({
         meeting: toView(meetingStore.getMeeting(meetingId)!),
@@ -475,6 +469,10 @@ export function createApp(deps: AppDeps): express.Express {
   app.patch('/api/meetings/:id/transcript', (req, res) => {
     try {
       const outcome = patchTranscriptRequest({ store: meetingStore }, req.params.id, req.body, Date.now());
+      // 逐字稿的總長度會投影成 vault 檔的 duration_minutes，編輯成功就要重投影，
+      // 不然 vault 內容會跟 SQLite 永久對不起來（code review 2026-09-18：這兩條 PATCH
+      // 路由原本沒接線，是唯一會改到投影內容卻不會觸發重投影的路徑）
+      if (outcome.status === 200) runProjection(vaultProjector, req.params.id, '[MeetPilot]');
       res.status(outcome.status).json(outcome.body);
     } catch (err) {
       handleStoreError(err, res);
@@ -485,6 +483,9 @@ export function createApp(deps: AppDeps): express.Express {
   app.patch('/api/meetings/:id/analysis', (req, res) => {
     try {
       const outcome = patchAnalysisRequest({ store: meetingStore }, req.params.id, req.body, Date.now());
+      // 理由同上面的 /transcript：結論、待辦、討論題目、標題全部來自 analysis，
+      // 人工修正之後不重投影的話 vault 檔會永遠停在修正前的版本
+      if (outcome.status === 200) runProjection(vaultProjector, req.params.id, '[MeetPilot]');
       res.status(outcome.status).json(outcome.body);
     } catch (err) {
       handleStoreError(err, res);

@@ -8,6 +8,7 @@ import { createMeetingStore, MeetingStore } from './meetingStore';
 import {
   buildFileName,
   computeChecksum,
+  computeDurationMinutes,
   createVaultProjector,
   renderSystemRegion,
   resolveVaultDir,
@@ -119,6 +120,10 @@ describe('resolveVaultDir', () => {
     expect(resolved.endsWith('custom-vault')).toBe(true);
     expect(resolved.startsWith('~')).toBe(false);
   });
+
+  it('設成家目錄本身直接拒絕，不會把會議 markdown 混進整個家目錄', () => {
+    expect(() => resolveVaultDir({ MEETPILOT_VAULT: '~' })).toThrow(/不能是家目錄本身/);
+  });
 });
 
 describe('sanitizeTitle 與 buildFileName', () => {
@@ -133,6 +138,34 @@ describe('sanitizeTitle 與 buildFileName', () => {
   it('檔名格式是 YYYY-MM-DD HHmm <標題>.md，用 UTC 元件算', () => {
     // T0 = 2023-11-14T22:13:20.000Z
     expect(buildFileName(T0, '定價會議')).toBe('2023-11-14 2213 定價會議.md');
+  });
+
+  it('換行與其他控制字元被移除，不會讓標題跨行、弄壞 heading 或 wikilink', () => {
+    const title = sanitizeTitle('定價會議\n供應商報價\t備註');
+    expect(title).not.toMatch(/[\n\t]/);
+  });
+
+  it('標題不會在 surrogate pair（例如 emoji）中間切斷', () => {
+    // 第 29、30 個字元是同一個 emoji 的一對 surrogate；用 code point 切不會切壞它
+    const overview = `${'字'.repeat(29)}😀尾巴`;
+    const title = sanitizeTitle(overview);
+    expect(title).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
+  });
+});
+
+describe('computeDurationMinutes', () => {
+  it('沒有逐字稿時回 null', () => {
+    expect(computeDurationMinutes([])).toBeNull();
+  });
+
+  it('取最後結束時間換算分鐘', () => {
+    expect(computeDurationMinutes([{ start: 0, end: 30, text: 'a' }, { start: 30, end: 630, text: 'b' }])).toBe(11);
+  });
+
+  it('segment 數量很大時不會因為引數展開撞到呼叫堆疊上限（Math.max(...array) 的已知限制）', () => {
+    const many = Array.from({ length: 200_000 }, (_, i) => ({ start: i, end: i + 1, text: 'x' }));
+    expect(() => computeDurationMinutes(many)).not.toThrow();
+    expect(computeDurationMinutes(many)).toBe(Math.round(200_000 / 60));
   });
 });
 
@@ -207,6 +240,26 @@ describe('project：AC-1 檔名與 frontmatter、找檔靠 id 不靠檔名', () 
 
     expect(listMdFiles(vaultDir)).toEqual([firstFileName]);
     expect(readOnlyFile(vaultDir)).toContain('# 改過的標題');
+  });
+
+  it('兩場會同一分鐘、標題正規化後算出同一個檔名時，不會蓋掉對方，各自留一個有內容的檔案', () => {
+    const a = makeReadyMeeting({ id: 'm-a', overview: '週會', decisions: ['A 的結論'] });
+    const b = makeReadyMeeting({ id: 'm-b', overview: '週會', decisions: ['B 的結論'] });
+
+    const resultA = projector.project(a);
+    const resultB = projector.project(b);
+
+    expect(resultA.status).toBe('written');
+    expect(resultB.status).toBe('written');
+    if (resultA.status !== 'written' || resultB.status !== 'written') throw new Error('unreachable');
+    expect(resultA.path).not.toBe(resultB.path); // 沒有互相覆蓋
+
+    const contentA = readFileSync(resultA.path, 'utf8');
+    const contentB = readFileSync(resultB.path, 'utf8');
+    expect(contentA).toContain('A 的結論');
+    expect(contentB).toContain('B 的結論');
+    expect(contentA).toContain('meetpilot_id: m-a');
+    expect(contentB).toContain('meetpilot_id: m-b');
   });
 });
 
@@ -302,6 +355,22 @@ describe('project：AC-3 三種關聯狀態分得開', () => {
     expect(raw).toContain(`關聯計算失敗：模型額度用完。重試方式：\`POST /api/meetings/${id}/link\`。`);
   });
 
+  it('連到的另一場會資料讀不到時，只跳過那一則關聯，不讓它拖垮這場會自己的結論與待辦', () => {
+    const a = makeReadyMeeting({ id: 'm-a', overview: '新會議 M', decisions: ['M 自己的結論'] });
+    const b = makeReadyMeeting({ id: 'm-b', overview: '壞掉的歷史會議' });
+    linkMeetings(a, b);
+    // 模擬對方的分析事後被清掉（resetTranscriptionProgress 會連 analyses 一起刪），
+    // topic_links 那一列還在，但 store.getAnalysis(b) 回 null
+    store.resetTranscriptionProgress(b, T0 + 1);
+
+    const result = projector.project(a);
+
+    expect(result.status).toBe('written');
+    const raw = readOnlyFile(vaultDir);
+    expect(raw).toContain('M 自己的結論'); // 自己的內容不受牽連
+    expect(raw).not.toContain('壞掉的歷史會議'); // 讀不到的那則關聯被跳過，不是編出一則假的
+  });
+
   it('投影 M 連到的歷史會議 H 時，不會動 H 自己的檔案（H 那一側的 link_run 不被誤寫成剛重新計算過）', () => {
     const b = makeReadyMeeting({ id: 'm-b', overview: '歷史會議 H', decisions: ['既有結論'] });
     store.setStatus(b, 'LINKING', T0);
@@ -348,6 +417,18 @@ describe('project：AC-4 checksum 與錯誤路徑', () => {
     expect(readFileSync(result.path, 'utf8')).toContain('原始結論'); // 新版是系統重新產生的
   });
 
+  it('檔案被正規化成 CRLF 換行時，沒被人真的動過的系統區不會被誤判成衝突', () => {
+    const id = makeReadyMeeting({ overview: '週會', decisions: ['原始結論'] });
+    projector.project(id);
+    const path = join(vaultDir, listMdFiles(vaultDir)[0]);
+    const original = readFileSync(path, 'utf8');
+    // 模擬 Obsidian／OS／同步工具把整份檔案的換行改成 CRLF，內容本身一個字都沒變
+    writeFileSync(path, original.replace(/\n/g, '\r\n'));
+
+    const result = projector.project(id);
+    expect(result.status).toBe('written'); // 不是 conflict
+  });
+
   it('同一個 meetpilot_id 出現在兩個（非 conflict）檔案時投影直接報錯，不猜不挑', () => {
     const id = makeReadyMeeting({ overview: '週會' });
     projector.project(id);
@@ -380,6 +461,18 @@ describe('project：AC-4 checksum 與錯誤路徑', () => {
     const id = makeReadyMeeting({ overview: '週會' });
     expect(() => projector.project(id)).not.toThrow();
     expect(listMdFiles(vaultDir)).toHaveLength(2);
+  });
+
+  it('manual_syntax_version 被人改壞成非數字時，重投影退回目前版本，不會把 NaN 寫回檔案', () => {
+    const id = makeReadyMeeting({ overview: '週會' });
+    projector.project(id);
+    const path = join(vaultDir, listMdFiles(vaultDir)[0]);
+    writeFileSync(path, readFileSync(path, 'utf8').replace('manual_syntax_version: 1', 'manual_syntax_version: 壞掉了'));
+
+    projector.project(id);
+
+    expect(readFileSync(path, 'utf8')).toContain('manual_syntax_version: 1');
+    expect(readFileSync(path, 'utf8')).not.toContain('NaN');
   });
 });
 

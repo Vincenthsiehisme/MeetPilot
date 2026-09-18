@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
 import { createServer, Server } from 'node:http';
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AudioFileStore, createAudioFileStore } from './audioFileStore';
@@ -13,6 +13,7 @@ import { MeetingStore, createMeetingStore } from './meetingStore';
 import { MATCH_KEY_VERSION } from './topicTag';
 import { TranscriptionQueue } from './transcriptionQueue';
 import { TopicLinker } from './topicLinker';
+import { createVaultProjector, VaultProjector } from './vaultProjector';
 
 /**
  * 路由層測試：跑的是 server.ts 真的用的那個 app（同一支 createApp、同一組 middleware 順序）。
@@ -59,6 +60,7 @@ const startWith = async (options: {
   queue?: TranscriptionQueue;
   audioStore?: AudioFileStore;
   topicLinker?: TopicLinker | null;
+  vaultProjector?: VaultProjector | null;
 } = {}) => {
   const app = createApp({
     listenConfig: {
@@ -78,6 +80,8 @@ const startWith = async (options: {
     llmLogger: { log: () => {} },
     // 預設不給 linker：既有的測試不該因為 W4 多出一條背景呼叫而改變行為
     topicLinker: options.topicLinker ?? null,
+    // 預設不給 projector：既有的測試不該因為 W5 多出一條檔案 I/O 而改變行為
+    vaultProjector: options.vaultProjector ?? null,
   });
   server = createServer(app);
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -88,6 +92,7 @@ const start = (options: {
   listenConfig?: Partial<ListenConfig>;
   queue?: TranscriptionQueue;
   topicLinker?: TopicLinker | null;
+  vaultProjector?: VaultProjector | null;
 } = {}) =>
   startWith(options);
 
@@ -605,5 +610,95 @@ describe('W4：關聯的路由', () => {
 
     release();
     expect((await first).status).toBe(200);
+  });
+});
+
+describe('W5：PATCH 逐字稿／分析之後同步重投影', () => {
+  /**
+   * 這兩條路由原本沒接 vaultProjector（code review 2026-09-18 抓到）：改逐字稿會改
+   * duration_minutes、改分析會改結論／待辦／標題，兩者都是投影的內容，編輯成功卻不重投影，
+   * vault 檔會永遠停在編輯前的版本，跟 SQLite 的真相源永久對不起來。
+   */
+  let vaultDir: string;
+
+  const readyMeeting = (id = 'm-1') => {
+    store.createMeeting({ meeting_id: id, created_at: T0, source_file_name: 'a.m4a', source_file_size: 1 });
+    store.setStatus(id, 'TRANSCRIBING', T0);
+    store.saveTranscript(id, { segments: [{ start: 0, end: 60, text: '第一版逐字稿' }], polished_content: null }, T0);
+    store.setStatus(id, 'ANALYZING', T0);
+    store.saveAnalysis(id, {
+      contract_version: 2, overview: '第一版標題', topics: [], decisions: ['第一版結論'], action_items: [],
+    }, T0);
+    store.setStatus(id, 'READY', T0);
+  };
+
+  const vaultFileContent = (): string => {
+    const files = readdirSync(vaultDir).filter(n => n.endsWith('.md'));
+    return readFileSync(join(vaultDir, files[0]), 'utf8');
+  };
+
+  beforeEach(() => {
+    vaultDir = mkdtempSync(join(tmpdir(), 'meetpilot-app-vault-'));
+  });
+
+  afterEach(() => {
+    rmSync(vaultDir, { recursive: true, force: true });
+  });
+
+  it('PATCH /transcript 成功之後 vault 檔反映新的逐字稿長度', async () => {
+    readyMeeting();
+    const vaultProjector = createVaultProjector({ store, vaultDir, now: () => T0 });
+    vaultProjector.project('m-1'); // 先投影一次，模擬轉錄鏈跑完之後的既有狀態
+    await start({ vaultProjector });
+
+    const res = await fetch(`${url}/api/meetings/m-1/transcript`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ segments: [{ start: 0, end: 600, text: '改過的逐字稿' }] }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(vaultFileContent()).toContain('duration_minutes: 10'); // 600 秒
+  });
+
+  it('PATCH /analysis 成功之後 vault 檔反映新的結論與標題', async () => {
+    readyMeeting();
+    const vaultProjector = createVaultProjector({ store, vaultDir, now: () => T0 });
+    vaultProjector.project('m-1');
+    await start({ vaultProjector });
+
+    const res = await fetch(`${url}/api/meetings/m-1/analysis`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        analysis: {
+          contract_version: 2, overview: '人工修正過的標題', topics: [], decisions: ['人工修正過的結論'], action_items: [],
+        },
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    const content = vaultFileContent();
+    expect(content).toContain('# 人工修正過的標題');
+    expect(content).toContain('人工修正過的結論');
+    expect(content).not.toContain('第一版結論');
+  });
+
+  it('PATCH 失敗（驗證錯誤）不會觸發重投影，vault 檔維持原樣', async () => {
+    readyMeeting();
+    const vaultProjector = createVaultProjector({ store, vaultDir, now: () => T0 });
+    vaultProjector.project('m-1');
+    await start({ vaultProjector });
+    const before = vaultFileContent();
+
+    // meetingEdits 的驗證錯誤：analysis 缺必要欄位應該回非 200
+    const res = await fetch(`${url}/api/meetings/m-1/analysis`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+
+    expect(res.status).not.toBe(200);
+    expect(vaultFileContent()).toBe(before);
   });
 });
