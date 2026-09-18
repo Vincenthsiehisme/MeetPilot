@@ -22,6 +22,7 @@ import { AudioFileStore } from './audioFileStore';
 import { TranscriptionQueue } from './transcriptionQueue';
 import { deleteMeetingRequest, patchAnalysisRequest, patchTranscriptRequest } from './meetingEdits';
 import { TopicLinker } from './topicLinker';
+import { VaultProjector } from './vaultProjector';
 
 export interface AppDeps {
   listenConfig: ListenConfig;
@@ -32,11 +33,14 @@ export interface AppDeps {
   llmLogger: LlmLogger;
   /** 跨會議關聯（W4）。null 代表這台 server 把關聯關掉了（`MEETPILOT_LINKING=off`） */
   topicLinker?: TopicLinker | null;
+  /** 投影到 Obsidian vault（W5）。跟 topicLinker 不同，這裡沒有對應的 off 開關，見 vaultProjector.ts 檔頭 */
+  vaultProjector?: VaultProjector | null;
 }
 
 export function createApp(deps: AppDeps): express.Express {
   const { listenConfig, meetingStore, audioStore, transcriptionQueue, geminiClient, llmLogger } = deps;
   const topicLinker = deps.topicLinker ?? null;
+  const vaultProjector = deps.vaultProjector ?? null;
 
   /**
    * 正在算關聯的會（W4）。同一場會兩個重算請求同時進來時，第二個回 409。
@@ -405,6 +409,16 @@ export function createApp(deps: AppDeps): express.Express {
         await topicLinker.link(meetingId);
       } finally {
         linking.delete(meetingId);
+      }
+
+      // 手動重算之後同步重投影，理由同 transcriptionPipeline：vault 寫不進去只記 log，
+      // 不讓這個請求因為檔案系統的問題而失敗——關聯已經落地，回應本來就該是成功的
+      if (vaultProjector) {
+        try {
+          vaultProjector.project(meetingId);
+        } catch (projectErr) {
+          console.error(`[MeetPilot] Meeting ${meetingId} 投影到 vault 時拋出錯誤`, projectErr);
+        }
       }
 
       res.json({

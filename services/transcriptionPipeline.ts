@@ -21,6 +21,7 @@ import { DEFAULT_SEAM_REPAIR, RepairResult, SeamRepairConfig, repairSeamGap } fr
 import { TopicExtractor } from './topicExtractor';
 import { TopicLinker } from './topicLinker';
 import { SLICE_OVERLAP_SECONDS, mergeSliceTranscript } from './transcriptMerge';
+import { VaultProjector } from './vaultProjector';
 
 /** 一片 10 分鐘，與搬家前瀏覽器那套的 sliceDurationMin = 10 一致 */
 export const SLICE_DURATION_SECONDS = 10 * 60;
@@ -42,6 +43,12 @@ export interface TranscriptionPipelineDeps {
    * 開關本身在 server.ts 解析（SDD 4.2：Recall 要能在不重新部署的情況下停用）。
    */
   topicLinker?: TopicLinker | null;
+  /**
+   * 投影到 Obsidian vault（W5）。**型別上是 optional／nullable，但不是使用者可關的功能開關**
+   * ——跟 `topicLinker` 不同，這裡沒有對應 `MEETPILOT_LINKING` 的 off 選項，`server.ts` 一律建
+   * 一個真的。optional 只是為了讓不驗證投影行為的測試不用注入一個真的 VaultProjector。
+   */
+  vaultProjector?: VaultProjector | null;
   /** 破洞修復的設定。不傳就用預設（開啟、一場會最多 6 次額外轉錄） */
   seamRepair?: SeamRepairConfig;
   /** 測試注入用；正式呼叫不要傳 */
@@ -67,6 +74,7 @@ export function buildPreviousContext(transcript: readonly TranscriptSegment[]): 
 export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
   const { store, audioStore, slicer, gemini, topicExtractor } = deps;
   const topicLinker = deps.topicLinker ?? null;
+  const vaultProjector = deps.vaultProjector ?? null;
   const now = deps.now ?? (() => Date.now());
   const repairConfig = deps.seamRepair ?? DEFAULT_SEAM_REPAIR;
 
@@ -270,6 +278,16 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
             await topicLinker.link(meetingId);
           } catch (linkErr) {
             console.error(`[Transcription] Meeting ${meetingId} 的關聯計算拋出預期外的錯誤`, linkErr);
+          }
+        }
+
+        // 投影排在關聯之後、跟關聯同一條「不能拖累可見性」的原則：結論與關聯（或關聯尚未完成的
+        // 事實）都已經落地，vault 寫不進去只記 log，不讓一場成功的會因為檔案系統的問題變成 FAILED
+        if (vaultProjector) {
+          try {
+            vaultProjector.project(meetingId);
+          } catch (projectErr) {
+            console.error(`[Transcription] Meeting ${meetingId} 投影到 vault 時拋出錯誤`, projectErr);
           }
         }
       } catch (err) {
