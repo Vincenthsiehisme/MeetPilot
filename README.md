@@ -235,6 +235,40 @@ Obsidian vault 的受控區塊，之後才做），保護與測試先做在這�
 **目前沒有關聯品質的實測數字。** 這一版的機制有測試把關，但兩段式組合起來對評測集的
 precision / recall 還沒跑過，門檻是沿用兩段各自單獨跑的結果推的。
 
+### 投影到 Obsidian vault：一場會一份 markdown
+
+會議有分析結果之後（`READY` 起，之後每次關聯重算），`VaultProjector`（`services/vaultProjector.ts`）
+把它投影成獨立 Obsidian vault 裡的一份 markdown，路徑由 `MEETPILOT_VAULT` 指定，預設
+`~/MeetPilot Vault`。**SQLite 是真相源，markdown 是可以整份重建的投影**：檔案砍掉重來不損失資料。
+
+檔案分兩區：
+
+- **系統區**（`<!-- meetpilot:auto:start -->` 到 `<!-- meetpilot:auto:end -->` 之間）：每次投影
+  整份重寫，含結論、待辦、討論題目、題目標籤、相關會議。frontmatter 的 `auto_checksum` 是這一區
+  內容的 sha256，**每次寫入前先驗證現場的值符不符**——不符代表人手動改過系統區，這時**不覆寫**，
+  現有檔案（含它的人工區）整份另存為 `<原檔名>.conflict-<timestamp>.md`，新版才寫進原檔名。
+- **人工區**（`## 我的修正` 底下 `<!-- meetpilot:manual:start -->` 到 `:manual:end`）：系統只讀不寫。
+  **W5 只保留原文，不解析、不回寫**——解析人工區的指令（標不相關、修正題目標籤）並把它讀回 SQLite
+  是 W6 才做的事。
+
+身分靠 frontmatter 的 `meetpilot_id`（＝ `meeting_id`），**不靠檔名**：每次投影都重新掃一次 vault
+建 `meetpilot_id → path` 的索引，所以人在 Obsidian 把檔案改名或搬動之後，下一次投影仍然找得到、
+寫回原檔。檔名（`YYYY-MM-DD HHmm <標題>.md`，標題取 overview 前 30 字）只在第一次投影時決定，
+之後系統永不更改，即使之後重新分析換了摘要，檔名也不會跟著變——wikilink 才不會全部一起斷掉。
+**同一個 `meetpilot_id` 出現在兩個檔案（通常是人複製了檔案）會讓投影直接報錯**，不猜、不挑一個寫。
+
+`meetpilot_status` 只在畫面上分三種，**空集合與未完成絕不能寫成同一句話**：`linked`（含空陣列，
+即「算過了、沒有同題目的會」）、`linking`（還沒算完，涵蓋 `READY`／`MEETPILOT_LINKING=off` 的
+穩定終態）、`link_failed`（帶原因與重試指令）。連結到的歷史會議若還沒被投影過，wikilink 用同一套
+命名規則預先算出目標檔名，在 Obsidian 裡會先顯示未解析，等那場會自己被投影後才接上——**W5 不會
+連帶投影它連結到的其他會議**，理由是那正是 W4 剩餘風險點名的「舊會議那一側被誤寫成剛重新計算過」。
+
+寫入一律先寫暫存檔再原子 `rename`，理由同音檔上傳：同一個 vault 可能同時開著 Obsidian，非原子寫入
+會讓它讀到截斷的檔。**不要把 `MEETPILOT_VAULT` 設成 AI Memory 那個 vault**：那個 vault 的
+`vault-check.py` 對會議 markdown 有三條硬衝突（`status` 只收五個合法值、`INDEX_MIN` 要求每份筆記
+被 index 列到、遞迴全掃沒有排除清單），而且它是 git repo、每個 session 自動快照，會議逐字稿的結論
+與待辦會全部進版控。
+
 ### 把舊紀錄搬到 server
 
 搬遷由使用者在本機那一區按「搬到伺服器」發動，不會自動觸發（server 讀不到 IndexedDB）：
@@ -268,6 +302,9 @@ POST /api/meetings/import   { jobs: Job[], blobIds: string[] }
 資料庫的 schema 版本比程式碼新時也拒絕開啟，不用舊程式碼往裡面寫。`npm run dev` 與 `npm start` 用 Node 的 `--env-file-if-exists=.env` 讀 `.env`，沒有那個檔就只吃 shell 環境變數。`HOST` 不是本機位址時必須設 `MEETPILOT_BASIC_AUTH_USER` 與 `MEETPILOT_BASIC_AUTH_PASSWORD`，server 才會啟動。`/api/*` 每個 IP 每分鐘最多 `MEETPILOT_API_RATE_LIMIT` 次（預設 60）。放在反向代理後面時所有使用者會共用同一個 IP 的額度，Express 沒設 `trust proxy`，這是刻意的：設了又沒限定代理位址，`X-Forwarded-For` 就能繞過限流。
 
 `MEETPILOT_LINKING=off` 關掉跨會議關聯（預設開啟），關掉時會議停在 `READY`。
+
+`MEETPILOT_VAULT` 是會議 markdown 投影到的 Obsidian vault 路徑，預設 `~/MeetPilot Vault`，沒有
+off 開關；目錄不可寫時 server 直接起不來。細節見上面〈投影到 Obsidian vault〉。
 
 每次 Gemini 呼叫會在 `MEETPILOT_LLM_LOG`（預設 `logs/llm.jsonl`）追加一行 JSON，設成 `off` 關閉。一次嘗試一行，fallback 鏈退了幾個模型、重試幾次都各自有一行，所以它回答得了「首選模型多常不可用」「撞限流時實際等多久」「一場會議燒多少 token」。**只記 metadata，不記逐字稿、提問或模型回覆**；拿不到的 token 數記成 `null`，不是 `0`。啟動時就開檔，路徑不可寫會直接讓 server 起不來。
 

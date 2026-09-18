@@ -22,6 +22,7 @@ import { AudioFileStore } from './audioFileStore';
 import { TranscriptionQueue } from './transcriptionQueue';
 import { deleteMeetingRequest, patchAnalysisRequest, patchTranscriptRequest } from './meetingEdits';
 import { TopicLinker } from './topicLinker';
+import { runProjection, VaultProjector } from './vaultProjector';
 
 export interface AppDeps {
   listenConfig: ListenConfig;
@@ -32,11 +33,14 @@ export interface AppDeps {
   llmLogger: LlmLogger;
   /** 跨會議關聯（W4）。null 代表這台 server 把關聯關掉了（`MEETPILOT_LINKING=off`） */
   topicLinker?: TopicLinker | null;
+  /** 投影到 Obsidian vault（W5）。跟 topicLinker 不同，這裡沒有對應的 off 開關，見 vaultProjector.ts 檔頭 */
+  vaultProjector?: VaultProjector | null;
 }
 
 export function createApp(deps: AppDeps): express.Express {
   const { listenConfig, meetingStore, audioStore, transcriptionQueue, geminiClient, llmLogger } = deps;
   const topicLinker = deps.topicLinker ?? null;
+  const vaultProjector = deps.vaultProjector ?? null;
 
   /**
    * 正在算關聯的會（W4）。同一場會兩個重算請求同時進來時，第二個回 409。
@@ -407,6 +411,10 @@ export function createApp(deps: AppDeps): express.Express {
         linking.delete(meetingId);
       }
 
+      // 手動重算之後同步重投影，理由同 transcriptionPipeline：vault 寫不進去只記 log，
+      // 不讓這個請求因為檔案系統的問題而失敗——關聯已經落地，回應本來就該是成功的
+      runProjection(vaultProjector, meetingId, '[MeetPilot]');
+
       res.json({
         meeting: toView(meetingStore.getMeeting(meetingId)!),
         links: meetingStore.getLinks(meetingId),
@@ -461,6 +469,10 @@ export function createApp(deps: AppDeps): express.Express {
   app.patch('/api/meetings/:id/transcript', (req, res) => {
     try {
       const outcome = patchTranscriptRequest({ store: meetingStore }, req.params.id, req.body, Date.now());
+      // 逐字稿的總長度會投影成 vault 檔的 duration_minutes，編輯成功就要重投影，
+      // 不然 vault 內容會跟 SQLite 永久對不起來（code review 2026-09-18：這兩條 PATCH
+      // 路由原本沒接線，是唯一會改到投影內容卻不會觸發重投影的路徑）
+      if (outcome.status === 200) runProjection(vaultProjector, req.params.id, '[MeetPilot]');
       res.status(outcome.status).json(outcome.body);
     } catch (err) {
       handleStoreError(err, res);
@@ -471,6 +483,9 @@ export function createApp(deps: AppDeps): express.Express {
   app.patch('/api/meetings/:id/analysis', (req, res) => {
     try {
       const outcome = patchAnalysisRequest({ store: meetingStore }, req.params.id, req.body, Date.now());
+      // 理由同上面的 /transcript：結論、待辦、討論題目、標題全部來自 analysis，
+      // 人工修正之後不重投影的話 vault 檔會永遠停在修正前的版本
+      if (outcome.status === 200) runProjection(vaultProjector, req.params.id, '[MeetPilot]');
       res.status(outcome.status).json(outcome.body);
     } catch (err) {
       handleStoreError(err, res);

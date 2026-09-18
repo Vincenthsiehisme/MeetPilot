@@ -14,6 +14,7 @@ import { createTopicLinker, isLinkingEnabled } from './services/topicLinker';
 import { resolveSeamRepairConfig } from './services/seamRepair';
 import { createTranscriptionQueue } from './services/transcriptionQueue';
 import { createApp } from './services/createApp';
+import { createVaultProjector, resolveVaultDir } from './services/vaultProjector';
 
 // 這個檔只做三件事：把真的依賴組出來、交給 createApp、listen。
 // 路由與 middleware 全部在 services/createApp.ts，理由見那個檔的檔頭（測得動）。
@@ -47,6 +48,12 @@ if (!topicLinker) {
   console.log('[MeetPilot] MEETPILOT_LINKING=off，跨會議關聯關閉，會議會停在 READY');
 }
 
+// 投影到 Obsidian vault（W5）。跟 topicLinker 不同，沒有 off 開關：目錄不可寫要在啟動時就爆，
+// 不要等到第一場會 READY 才發現寫不進去（同一套理由見上面 audioStore／llmLogger 的註解）
+const vaultDir = resolveVaultDir(process.env);
+const vaultProjector = createVaultProjector({ store: meetingStore, vaultDir });
+console.log(`[MeetPilot] 會議 markdown 投影到 ${vaultDir}`);
+
 const transcriptionPipeline = createTranscriptionPipeline({
   store: meetingStore,
   seamRepair,
@@ -55,6 +62,7 @@ const transcriptionPipeline = createTranscriptionPipeline({
   gemini: geminiClient,
   topicExtractor: createTopicExtractor({ store: meetingStore, gemini: geminiClient }),
   topicLinker,
+  vaultProjector,
 });
 // in-process 序列佇列：同一時間只跑一場會（理由見 services/transcriptionQueue.ts 檔頭）
 const transcriptionQueue = createTranscriptionQueue(transcriptionPipeline.run);
@@ -67,6 +75,7 @@ const app = createApp({
   geminiClient,
   llmLogger,
   topicLinker,
+  vaultProjector,
 });
 
 // Vite middleware & Production static serving
