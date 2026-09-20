@@ -3,6 +3,7 @@ import React, { useRef, useEffect } from 'react';
 import { Job } from '../types';
 import { ActionItemV3, AnalysisV3, DecisionV3, Evidence, OpenQuestionV3 } from '../services/analysisContract';
 import { exportSummaryAsMarkdown, exportSummaryAsText } from '../services/exportUtils';
+import { jobDisplayName } from '../services/meetingTitle';
 import { buildPrintDocument } from '../services/printDocument';
 
 interface SummaryViewProps {
@@ -138,7 +139,7 @@ const SummaryView: React.FC<SummaryViewProps> = ({ analysis, jobMetadata, onUpda
         <div className="px-8 sm:px-12 pt-12 pb-8 border-b border-slate-100">
            <div className="flex justify-between items-start">
              <div>
-               <h1 className="text-2xl sm:text-3xl font-serif font-bold text-slate-900 mb-2">{jobMetadata.title ?? '會議記錄'}</h1>
+               <h1 className="text-2xl sm:text-3xl font-serif font-bold text-slate-900 mb-2">{jobDisplayName(jobMetadata)}</h1>
                <div className="text-xs text-slate-500 font-medium flex gap-4">
                  <span><i className="fa-regular fa-file-audio mr-1.5"></i>{jobMetadata.fileName}</span>
                  <span><i className="fa-regular fa-calendar mr-1.5"></i>{new Date(jobMetadata.createdAt).toLocaleDateString()}</span>

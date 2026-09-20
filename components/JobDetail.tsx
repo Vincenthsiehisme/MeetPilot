@@ -1,5 +1,5 @@
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Job, JobStatus, StepStatus } from '../types';
 import TranscriptView from './TranscriptView';
 import SummaryView from './SummaryView';
@@ -17,6 +17,13 @@ const JobDetail: React.FC<JobDetailProps> = ({ job, onUpdateJob, onAlert, onRetr
   const [activeTab, setActiveTab] = useState<'status' | 'transcript' | 'summary'>('status');
   // null 是「沒在編輯標題」；編輯中是輸入框裡的草稿
   const [titleDraft, setTitleDraft] = useState<string | null>(null);
+
+  // 換會議時把草稿清掉：這個元件實例不會因為切換選中對象而重新掛載（沒有 key），
+  // 沒有這行的話，會議 A 編輯到一半沒存就切去 B，按儲存會把 A 的草稿寫成 B 的標題
+  // （2026-09-20 Codex review 抓到）
+  useEffect(() => {
+    setTitleDraft(null);
+  }, [job.id]);
 
   const saveTitle = () => {
     const check = checkMeetingTitle(titleDraft);
