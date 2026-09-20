@@ -1,7 +1,7 @@
 
 import { Job, TranscriptSegment } from "../types";
 import { ActionItemV3, AnalysisV3, DecisionV3, Evidence, OpenQuestionV3 } from "./analysisContract";
-import { jobDownloadBaseName } from "./meetingTitle";
+import { jobDisplayName, jobDownloadBaseName } from "./meetingTitle";
 
 /**
  * revoke 要等的時間。
@@ -110,7 +110,7 @@ export const exportSummaryAsMarkdown = (job: Pick<Job, 'title' | 'fileName'>, an
   const topicsSection = topics.map((t) => `### ${t.title}\n${t.content}`).join('\n\n');
 
   const md = `
-# ${job.title ?? '會議記錄'}
+# ${jobDisplayName(job)}
 **來源檔名：** ${job.fileName}
 **產出時間：** ${new Date().toLocaleString()}
 
@@ -144,7 +144,7 @@ export const exportSummaryAsText = (job: Pick<Job, 'title' | 'fileName'>, analys
    const topicsSection = topics.map((t) => `【${t.title}】\n${t.content}`).join('\n\n');
 
    const txt = `
- ${job.title ?? '會議記錄'}
+ ${jobDisplayName(job)}
  來源檔名：${job.fileName}
  ----------------------------------------
 
@@ -152,7 +152,7 @@ export const exportSummaryAsText = (job: Pick<Job, 'title' | 'fileName'>, analys
  ${overview}
 
  [2] 議題討論紀錄
- ${topicsSection}
+ ${topicsSection || '(本場沒有討論題目)'}
 
  [3] 決議事項
  ${decisions.length > 0 ? decisions.map((d) => `• ${renderDecisionLine(d)}`).join('\n') : '(無)'}

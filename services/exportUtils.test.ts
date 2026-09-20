@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { downloadBlob } from './exportUtils';
+import { downloadBlob, exportSummaryAsMarkdown, exportSummaryAsText } from './exportUtils';
+import { AnalysisV3 } from './analysisContract';
 
 // 這個檔只測 downloadBlob 的兩個時序，那兩件事都是「失敗時沒有任何錯誤訊息」的那種壞法：
 // detached anchor 在部分 Firefox 版本按了沒反應，同步 revoke 在 Safari 會下載到空檔。
@@ -82,5 +83,64 @@ describe('downloadBlob 的下載時序', () => {
 
     vi.advanceTimersByTime(1);
     expect(revokeObjectURL).toHaveBeenCalledWith('blob:fake-url');
+  });
+});
+
+// exportSummaryAsMarkdown／exportSummaryAsText 沒有標題時要退回原始檔名，不能顯示固定的
+// 「會議記錄」（2026-09-20 Codex review 抓到：畫面、列印都已經退回檔名，這兩支匯出漏了）；
+// 空的討論題目也要顯式寫「本場沒有討論題目」，不能讓 join 出一個空字串留一段空白
+describe('exportSummaryAsMarkdown／exportSummaryAsText 的標題與空題目', () => {
+  let dom: ReturnType<typeof makeDom>;
+
+  const analysis: AnalysisV3 = {
+    contract_version: 3,
+    overview: '主旨',
+    topics: [],
+    decisions: [],
+    action_items: [],
+    open_questions: [],
+  };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    dom = makeDom();
+    vi.stubGlobal('document', dom.document);
+    vi.stubGlobal('URL', { createObjectURL: vi.fn(() => 'blob:fake-url'), revokeObjectURL: vi.fn() });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  // 每次呼叫後讀最新一次的 blob，不是固定 index 0：同一個測試裡呼叫兩次匯出函式，
+  // mock.calls 會累積兩筆，只讀 [0] 會一直讀到第一次那份，讓第二個斷言其實沒測到東西
+  const lastBlob = (): Blob => {
+    const calls = (globalThis.URL.createObjectURL as ReturnType<typeof vi.fn>).mock.calls;
+    return calls[calls.length - 1][0];
+  };
+
+  it('Markdown：有標題用標題，沒有退回檔名', async () => {
+    exportSummaryAsMarkdown({ title: '週會', fileName: 'a.m4a' }, analysis);
+    expect(await lastBlob().text()).toContain('# 週會');
+
+    exportSummaryAsMarkdown({ fileName: 'a.m4a' }, analysis);
+    expect(await lastBlob().text()).toContain('# a.m4a');
+  });
+
+  it('Text：有標題用標題，沒有退回檔名', async () => {
+    exportSummaryAsText({ title: '週會', fileName: 'a.m4a' }, analysis);
+    const withTitle = await lastBlob().text();
+    expect(withTitle.startsWith('週會\n')).toBe(true);
+    expect(withTitle).toContain('來源檔名：a.m4a');
+
+    exportSummaryAsText({ fileName: 'a.m4a' }, analysis);
+    const withoutTitle = await lastBlob().text();
+    expect(withoutTitle.startsWith('a.m4a\n')).toBe(true);
+  });
+
+  it('Text：沒有討論題目時顯式寫「本場沒有討論題目」，不是空白', async () => {
+    exportSummaryAsText({ fileName: 'a.m4a' }, analysis);
+    expect(await lastBlob().text()).toContain('(本場沒有討論題目)');
   });
 });

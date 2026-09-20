@@ -21,6 +21,7 @@ import { GeminiServerClient } from './geminiServerClient';
 import { AudioFileStore } from './audioFileStore';
 import { TranscriptionQueue } from './transcriptionQueue';
 import { deleteMeetingRequest, patchAnalysisRequest, patchTitleRequest, patchTranscriptRequest } from './meetingEdits';
+import { checkMeetingTitle } from './meetingTitle';
 import { TopicLinker } from './topicLinker';
 import { runProjection, VaultProjector } from './vaultProjector';
 
@@ -324,8 +325,14 @@ export function createApp(deps: AppDeps): express.Express {
       if (!Array.isArray(tags) || !tags.every((tag: unknown) => typeof tag === 'string')) {
         return res.status(400).json({ error: 'tags 必須是字串陣列' });
       }
-      if (title !== undefined && typeof title !== 'string') {
-        return res.status(400).json({ error: 'title 必須是字串' });
+      // 跟 PATCH /title 走同一支檢查：不然一個帶空白／超長／控制字元標題的建立請求能繞過驗證，
+      // 把不合規則的值直接存成 title，pipeline 的「title === null 才填建議」判斷因此永遠不會補正
+      // （2026-09-20 Codex review 抓到），畫面上就會一直顯示那個壞掉的值
+      let checkedTitle: string | null = null;
+      if (title !== undefined) {
+        const check = checkMeetingTitle(title);
+        if (check.ok === false) return res.status(400).json({ error: check.reason });
+        checkedTitle = check.title;
       }
       if (meetingContext !== undefined && typeof meetingContext !== 'string') {
         return res.status(400).json({ error: 'meetingContext 必須是字串' });
@@ -335,7 +342,7 @@ export function createApp(deps: AppDeps): express.Express {
       const meetingId = randomUUID();
       const meeting = meetingStore.createMeeting({
         meeting_id: meetingId,
-        title: title ?? null,
+        title: checkedTitle,
         created_at: Date.now(),
         source_file_name: fileName,
         source_file_size: fileSize,
