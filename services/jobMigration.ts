@@ -9,13 +9,15 @@
  * 靜默跳過的那幾筆在報告裡跟「本來就沒有」長得一模一樣。
  */
 import { GeminiOutput, Job, JobStatus, Meeting, TranscriptSegment } from '../types';
-import { AnalysisV2, isAnalysisSemanticallyEmpty, upgradeAnalysisToV2 } from './analysisContract';
+import { AnalysisV3, isAnalysisSemanticallyEmpty, upgradeAnalysisToV2, upgradeAnalysisV2ToV3 } from './analysisContract';
 import { MeetingStatus } from './meetingState';
 
 export interface MigrationRecord {
   meeting: Meeting;
   transcript: { segments: TranscriptSegment[]; polished_content: string | null } | null;
-  analysis: AnalysisV2 | null;
+  /** IndexedDB 只有 v1（`GeminiOutput`），這裡一路升到 v3 才落地：v1 → v2 → v3 兩段都是
+   * 純函式、都不編造資料，逐筆比對比的就是升到底之後的值 */
+  analysis: AnalysisV3 | null;
   /** 既有的 meetingTags（人工輸入、只當 prompt 背景），不是 TopicTag */
   tags: string[];
 }
@@ -137,7 +139,7 @@ export const toMigrationRecord = (raw: unknown): MigrationOutcome => {
   if (tags.length !== rawTags.length) {
     notes.push(`meetingTags 有 ${rawTags.length - tags.length} 個元素不是字串，已丟棄`);
   }
-  const upgraded = analysis ? upgradeAnalysisToV2(analysis, id, createdAt) : null;
+  const upgraded = analysis ? upgradeAnalysisV2ToV3(upgradeAnalysisToV2(analysis, id, createdAt)) : null;
 
   const meeting: Meeting = {
     meeting_id: id,

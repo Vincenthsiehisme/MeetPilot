@@ -1,5 +1,6 @@
 
 import React, { useRef } from 'react';
+import { ACCEPTED_AUDIO_ACCEPT_ATTR } from '../services/droppedFiles';
 
 interface FileUploadProps {
   onFileSelect: (file: File) => void;
@@ -27,7 +28,7 @@ const FileUpload: React.FC<FileUploadProps> = ({ onFileSelect }) => {
         type="file"
         ref={fileInputRef}
         onChange={handleChange}
-        accept="audio/*,video/*,.mov,.m4a,.mp4,.mp3,.wav,.webm"
+        accept={ACCEPTED_AUDIO_ACCEPT_ATTR}
         className="hidden"
       />
       <button

@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { buildPrintDocument } from './printDocument';
-import { GeminiOutput, Job, JobStatus } from '../types';
+import { Job, JobStatus } from '../types';
+import { AnalysisV3 } from './analysisContract';
 
 const baseJob: Job = {
   id: 'job-1',
@@ -13,11 +14,19 @@ const baseJob: Job = {
   steps: [],
 };
 
-const baseAnalysis: GeminiOutput = {
+const baseAnalysis: AnalysisV3 = {
+  contract_version: 3,
   overview: '討論 Q4 目標',
   topics: [{ title: '預算', content: '第一行\n第二行' }],
-  decisions: ['決議一', '決議二'],
-  action_items: ['待辦一'],
+  decisions: [
+    { text: '決議一', evidence: null, decided_by: null },
+    { text: '決議二', evidence: { start: 60, end: 65 }, decided_by: '小美' },
+  ],
+  action_items: [{
+    text: '待辦一', source_meeting_id: 'job-1', created_at: 1, status: 'unknown',
+    assignee: null, due: null, evidence: null,
+  }],
+  open_questions: [],
 };
 
 describe('buildPrintDocument', () => {
@@ -36,7 +45,7 @@ describe('buildPrintDocument', () => {
   });
 
   it('topic content 含 <img onerror> 時被跳脫', () => {
-    const analysis: GeminiOutput = {
+    const analysis: AnalysisV3 = {
       ...baseAnalysis,
       topics: [{ title: '<b>標題</b>', content: '<img src=x onerror="alert(1)">' }],
     };
@@ -49,27 +58,45 @@ describe('buildPrintDocument', () => {
     );
   });
 
-  it('overview、decisions、action_items 都經過跳脫', () => {
-    const analysis: GeminiOutput = {
+  it('overview、decisions、action_items、open_questions 都經過跳脫', () => {
+    const analysis: AnalysisV3 = {
+      contract_version: 3,
       overview: 'A & B <c>',
       topics: [],
-      decisions: ['<i>x</i>'],
-      action_items: ['"y"'],
+      decisions: [{ text: '<i>x</i>', evidence: null, decided_by: '<b>人</b>' }],
+      action_items: [{
+        text: '"y"', source_meeting_id: 'job-1', created_at: 1, status: 'unknown',
+        assignee: '<b>人</b>', due: null, evidence: null,
+      }],
+      open_questions: [{ text: '<u>z</u>', evidence: null }],
     };
     const html = buildPrintDocument(baseJob, analysis);
 
     expect(html).toContain('<div class="pre">A &amp; B &lt;c&gt;</div>');
-    expect(html).toContain('<ul><li>&lt;i&gt;x&lt;/i&gt;</li></ul>');
-    expect(html).toContain('<ul><li>&quot;y&quot;</li></ul>');
+    expect(html).toContain(
+      '<li>&lt;i&gt;x&lt;/i&gt; <span class="meta-inline">（拍板：&lt;b&gt;人&lt;/b&gt;）</span></li>'
+    );
+    expect(html).toContain(
+      '<li>&quot;y&quot; <span class="meta-inline">（負責人：&lt;b&gt;人&lt;/b&gt;）</span></li>'
+    );
+    expect(html).toContain('<li>&lt;u&gt;z&lt;/u&gt;</li>');
     expect(html).toContain('<p class="empty">無議題</p>');
   });
 
-  it('空 decisions 印出「無明確決議」，空 action_items 印出「無待辦事項」', () => {
-    const analysis: GeminiOutput = { ...baseAnalysis, decisions: [], action_items: [] };
+  it('空 decisions／action_items／open_questions 各印出對應的空狀態文字', () => {
+    const analysis: AnalysisV3 = { ...baseAnalysis, decisions: [], action_items: [], open_questions: [] };
     const html = buildPrintDocument(baseJob, analysis);
 
-    expect(html).toContain('<h2>決議事項</h2>\n<p class="empty">無明確決議</p>');
-    expect(html).toContain('<h2>待辦事項</h2>\n<p class="empty">無待辦事項</p>');
+    expect(html).toContain('<h2>決議</h2>\n<p class="empty">本場沒有明確決議</p>');
+    expect(html).toContain('<h2>待辦</h2>\n<p class="empty">本場沒有待辦</p>');
+    expect(html).toContain('<h2>未決事項</h2>\n<p class="empty">本場沒有未決事項</p>');
+  });
+
+  it('決議帶拍板者與時間戳，缺的部分省略（純 null 不印任何括號）', () => {
+    const html = buildPrintDocument(baseJob, baseAnalysis);
+
+    expect(html).toContain('<li>決議一</li>');
+    expect(html).toContain('<li>決議二 <span class="meta-inline">（拍板：小美，01:00–01:05）</span></li>');
   });
 
   it('正常內容照順序輸出，多行內容原樣保留在 pre-wrap 容器裡', () => {
@@ -82,9 +109,9 @@ describe('buildPrintDocument', () => {
     expect(html).toContain(
       '<div class="topic-item"><span class="topic-title">預算</span><div class="pre">第一行\n第二行</div></div>'
     );
-    expect(html).toContain('<h2>決議事項</h2>\n<ul><li>決議一</li><li>決議二</li></ul>');
-    expect(html).toContain('<h2>待辦事項</h2>\n<ul><li>待辦一</li></ul>');
-    expect(html.indexOf('<h2>議題</h2>')).toBeLessThan(html.indexOf('<h2>決議事項</h2>'));
-    expect(html.indexOf('<h2>決議事項</h2>')).toBeLessThan(html.indexOf('<h2>待辦事項</h2>'));
+    expect(html).toContain('<li>待辦一</li>');
+    expect(html.indexOf('<h2>討論</h2>')).toBeLessThan(html.indexOf('<h2>決議</h2>'));
+    expect(html.indexOf('<h2>決議</h2>')).toBeLessThan(html.indexOf('<h2>待辦</h2>'));
+    expect(html.indexOf('<h2>待辦</h2>')).toBeLessThan(html.indexOf('<h2>未決事項</h2>'));
   });
 });

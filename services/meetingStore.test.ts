@@ -45,11 +45,15 @@ const migrated = (id: string, overrides: Partial<MigrationRecord['meeting']> = {
   },
   transcript: { segments: [{ start: 0, end: 1, text: 'hi' }], polished_content: null },
   analysis: {
-    contract_version: 2,
+    contract_version: 3,
     overview: '標題',
     topics: [],
-    decisions: ['決定 A'],
-    action_items: [{ text: 't', source_meeting_id: id, created_at: T0, status: 'unknown' }],
+    decisions: [{ text: '決定 A', evidence: null, decided_by: null }],
+    action_items: [{
+      text: 't', source_meeting_id: id, created_at: T0, status: 'unknown',
+      assignee: null, due: null, evidence: null,
+    }],
+    open_questions: [],
   },
   tags: ['採購'],
 });
@@ -173,21 +177,25 @@ describe('transcript 與 analysis', () => {
   it('analysis 的巢狀欄位還原成物件，不是字串', () => {
     newMeeting();
     const analysis = {
-      contract_version: 2 as const,
+      contract_version: 3 as const,
       overview: 'x',
       topics: [{ title: 'a', content: 'b' }],
-      decisions: ['d'],
-      action_items: [{ text: 't', source_meeting_id: 'm-1', created_at: T0, status: 'unknown' as const }],
+      decisions: [{ text: 'd', evidence: { start: 0, end: 1 }, decided_by: null }],
+      action_items: [{
+        text: 't', source_meeting_id: 'm-1', created_at: T0, status: 'unknown' as const,
+        assignee: null, due: null, evidence: null,
+      }],
+      open_questions: [{ text: 'q', evidence: null }],
     };
     store.saveAnalysis('m-1', analysis, T0);
     expect(store.getAnalysis('m-1')).toEqual(analysis);
   });
 
-  it('四個欄位全空的分析不給存，標準與空逐字稿一致', () => {
+  it('五個欄位全空的分析不給存，標準與空逐字稿一致', () => {
     newMeeting();
     expect(() => store.saveAnalysis('m-1', {
-      contract_version: 2, overview: '  ', topics: [], decisions: [], action_items: [],
-    }, T0)).toThrow(/四個欄位都是空的/);
+      contract_version: 3, overview: '  ', topics: [], decisions: [], action_items: [], open_questions: [],
+    }, T0)).toThrow(/五個欄位都是空的/);
   });
 
   it('沒有資料時回 null', () => {
@@ -198,15 +206,42 @@ describe('transcript 與 analysis', () => {
 
   it('Meeting 不存在時寫入拋錯', () => {
     expect(() => store.saveAnalysis('nope', {
-      contract_version: 2, overview: 'x', topics: [], decisions: [], action_items: [],
+      contract_version: 3, overview: 'x', topics: [], decisions: [], action_items: [], open_questions: [],
     }, T0)).toThrow(/找不到 Meeting/);
   });
 
-  it('讀到不是 v2 的分析時拋錯，不硬當成 v2 解讀', () => {
+  it('讀到 v1（既不是 v2 也不是 v3）時拋錯，不硬當成已知版本解讀', () => {
     newMeeting();
     db.prepare(`INSERT INTO analyses (meeting_id, contract_version, overview, topics, decisions, action_items, created_at)
                 VALUES (?, 1, '', '[]', '[]', '[]', ?)`).run('m-1', T0);
-    expect(() => store.getAnalysis('m-1')).toThrow(/C-ANALYSIS v1/);
+    expect(() => store.getAnalysis('m-1')).toThrow(/這一版只讀 v2 與 v3/);
+  });
+
+  it('讀到 v2 資料時 lazy 升成 v3：出處與人名補 null，資料列本身不改寫', () => {
+    newMeeting();
+    // 直接插入舊格式（沒有 open_questions 之外，decisions／action_items 也是 v2 的扁平形狀），
+    // 模擬「還沒被下一次寫入覆蓋過」的既有資料
+    db.prepare(`INSERT INTO analyses (meeting_id, contract_version, overview, topics, decisions, action_items, created_at)
+                VALUES (?, 2, 'x', '[]', '["舊決議"]',
+                        '[{"text":"舊待辦","source_meeting_id":"m-1","created_at":${T0},"status":"unknown"}]', ?)`)
+      .run('m-1', T0);
+
+    expect(store.getAnalysis('m-1')).toEqual({
+      contract_version: 3,
+      overview: 'x',
+      topics: [],
+      decisions: [{ text: '舊決議', evidence: null, decided_by: null }],
+      action_items: [{
+        text: '舊待辦', source_meeting_id: 'm-1', created_at: T0, status: 'unknown',
+        assignee: null, due: null, evidence: null,
+      }],
+      open_questions: [],
+    });
+
+    // 資料列本身沒被重寫：contract_version 直接查資料庫仍是 2
+    const row = db.prepare('SELECT contract_version FROM analyses WHERE meeting_id = ?').get('m-1') as
+      { contract_version: number };
+    expect(row.contract_version).toBe(2);
   });
 });
 
@@ -317,11 +352,15 @@ describe('resetTranscriptionProgress', () => {
       'm-1', { segments: [{ start: 0, end: 3, text: '舊音檔的內容' }], polished_content: null }, 1, 1, T0 + 1,
     );
     store.saveAnalysis('m-1', {
-      contract_version: 2 as const,
+      contract_version: 3 as const,
       overview: '舊音檔的結論',
       topics: [{ title: 'a', content: 'b' }],
-      decisions: ['d'],
-      action_items: [{ text: 't', source_meeting_id: 'm-1', created_at: T0, status: 'unknown' as const }],
+      decisions: [{ text: 'd', evidence: null, decided_by: null }],
+      action_items: [{
+        text: 't', source_meeting_id: 'm-1', created_at: T0, status: 'unknown' as const,
+        assignee: null, due: null, evidence: null,
+      }],
+      open_questions: [],
     }, T0 + 1);
 
     store.resetTranscriptionProgress('m-1', T0 + 2);
@@ -360,7 +399,7 @@ describe('importMigrated', () => {
     expect(report).toEqual({ imported: ['job-1'], skippedExisting: [] });
     expect(store.getMeeting('job-1')?.origin).toBe('migrated');
     expect(store.getTranscript('job-1')?.segments).toHaveLength(1);
-    expect(store.getAnalysis('job-1')?.decisions).toEqual(['決定 A']);
+    expect(store.getAnalysis('job-1')?.decisions).toEqual([{ text: '決定 A', evidence: null, decided_by: null }]);
     expect(store.getTags('job-1')).toEqual(['採購']);
   });
 

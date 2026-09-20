@@ -63,6 +63,9 @@ base64**：base64 會先把整個檔案變成一條字串留在記憶體裡還�
 server 端一次只跑一場會（序列佇列），理由是 Gemini 的限流與每日額度，不是資源不夠。續傳游標是
 `meetings.processed_slices`。音檔在**分析成功之後**才刪，轉錄或分析失敗時保留供重試。
 
+`ANALYZING`（產出結論、待辦、未決事項）的規範正本在 `prompts/meeting-record-spec.md`，
+`analyzeTranscript` 啟動時讀進 systemInstruction，不在程式碼裡另外抄一份規則。
+
 重啟時會掃一次，三種處境分開處理：
 
 | 重啟當下的狀態 | 處置 |

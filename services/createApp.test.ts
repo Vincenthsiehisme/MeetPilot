@@ -35,7 +35,7 @@ let cancelled: string[];
 const fakeGemini = (): GeminiServerClient => ({
   transcribeSlice: async () => [],
   polishTranscript: async () => '潤過的',
-  analyzeTranscript: async () => ({ overview: 'x', topics: [], decisions: [], action_items: [] }),
+  analyzeTranscript: async () => ({ overview: 'x', topics: [], decisions: [], action_items: [], open_questions: [] }),
   // 路由這一層不跑轉錄鏈，抽標籤也不會被呼叫到；形狀要在，缺了型別就對不上
   extractTopicTags: async () => [],
   embeddingModel: 'fake-embedding',
@@ -627,7 +627,9 @@ describe('W5：PATCH 逐字稿／分析之後同步重投影', () => {
     store.saveTranscript(id, { segments: [{ start: 0, end: 60, text: '第一版逐字稿' }], polished_content: null }, T0);
     store.setStatus(id, 'ANALYZING', T0);
     store.saveAnalysis(id, {
-      contract_version: 2, overview: '第一版標題', topics: [], decisions: ['第一版結論'], action_items: [],
+      contract_version: 3, overview: '第一版標題', topics: [],
+      decisions: [{ text: '第一版結論', evidence: null, decided_by: null }],
+      action_items: [], open_questions: [],
     }, T0);
     store.setStatus(id, 'READY', T0);
   };
@@ -672,7 +674,9 @@ describe('W5：PATCH 逐字稿／分析之後同步重投影', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         analysis: {
-          contract_version: 2, overview: '人工修正過的標題', topics: [], decisions: ['人工修正過的結論'], action_items: [],
+          contract_version: 3, overview: '人工修正過的標題', topics: [],
+          decisions: [{ text: '人工修正過的結論', evidence: null, decided_by: null }],
+          action_items: [], open_questions: [],
         },
       }),
     });

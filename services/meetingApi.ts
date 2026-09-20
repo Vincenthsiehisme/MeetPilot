@@ -8,7 +8,7 @@
  * （`meetingStore.ts` 會把 `node:sqlite` 帶進前端 bundle，所以逐字稿的形狀在這裡自己寫一份）。
  */
 import { Job, Meeting, TranscriptSegment } from '../types';
-import { AnalysisV2 } from './analysisContract';
+import { AnalysisV3 } from './analysisContract';
 import { TopicTag } from './topicTag';
 import { LinkRun, TopicLink } from './topicLink';
 
@@ -64,7 +64,7 @@ export interface MeetingListResponse {
 export interface MeetingDetailResponse {
   meeting: MeetingView;
   transcript: { segments: TranscriptSegment[]; polished_content: string | null } | null;
-  analysis: AnalysisV2 | null;
+  analysis: AnalysisV3 | null;
   /** 使用者建立會議時自己打的會議標籤（`meeting_tags`），只當 prompt 背景 */
   tags: string[];
   /**
@@ -134,11 +134,11 @@ export interface PatchTranscriptResponse {
 
 /** `PATCH /api/meetings/:id/analysis`。整份覆寫，前端送的是編輯後的完整 v2 */
 export interface PatchAnalysisRequest {
-  analysis: AnalysisV2;
+  analysis: AnalysisV3;
 }
 
 export interface PatchAnalysisResponse {
-  analysis: AnalysisV2;
+  analysis: AnalysisV3;
 }
 
 /**

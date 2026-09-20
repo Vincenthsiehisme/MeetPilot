@@ -1,5 +1,6 @@
 import { MeetingStatus } from './services/meetingState';
 import { TopicExtractionStatus } from './services/topicTag';
+import type { AnalysisV3 } from './services/analysisContract';
 export enum JobStatus {
   PENDING = 'PENDING',
   RUNNING = 'RUNNING',
@@ -43,7 +44,9 @@ export interface Job {
   error?: string;
   transcript?: TranscriptSegment[];
   polishedContent?: string; // 新增：儲存 AI 修潤後的完整文章
-  analysis?: GeminiOutput;
+  // C-ANALYSIS v3（analysisContract.ts）。IndexedDB 舊資料是 v1（GeminiOutput）形狀，
+  // 進 state 前一律先升到 v3（App.tsx 載入本機任務時做），畫面上不會出現 v1／v2 形狀
+  analysis?: AnalysisV3;
   meetingTags?: string[]; // 新增：會議標籤 (Context Tags)
   meetingContext?: string; // 新增：一句話補充背景
   processedSlices?: number;

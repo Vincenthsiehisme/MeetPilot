@@ -11,7 +11,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import { Meeting, TranscriptSegment } from '../types';
-import { AnalysisV2, isAnalysisV2SemanticallyEmpty } from './analysisContract';
+import { AnalysisV3, isAnalysisV3SemanticallyEmpty, upgradeAnalysisV2ToV3 } from './analysisContract';
 import { MigrationRecord } from './jobMigration';
 import { SeamReportEntry } from './meetingApi';
 import { MeetingStatus, assertTransition, isMeetingStatus } from './meetingState';
@@ -254,8 +254,9 @@ export const createMeetingStore = (db: DatabaseSync) => {
       created_at = excluded.created_at
   `);
   const insertAnalysis = db.prepare(`
-    INSERT OR REPLACE INTO analyses (meeting_id, contract_version, overview, topics, decisions, action_items, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT OR REPLACE INTO analyses
+      (meeting_id, contract_version, overview, topics, decisions, action_items, open_questions, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertTag = db.prepare('INSERT OR IGNORE INTO meeting_tags (meeting_id, tag) VALUES (?, ?)');
   const insertTopicTag = db.prepare(`
@@ -296,9 +297,13 @@ export const createMeetingStore = (db: DatabaseSync) => {
 
   const readAnalysisRow = (id: string) =>
     db.prepare(
-      'SELECT contract_version, overview, topics, decisions, action_items FROM analyses WHERE meeting_id = ?',
+      'SELECT contract_version, overview, topics, decisions, action_items, open_questions '
+      + 'FROM analyses WHERE meeting_id = ?',
     ).get(id) as {
       contract_version: number; overview: string; topics: string; decisions: string; action_items: string;
+      // v2 資料列沒有走過第 5 條 migration 前的資料一律有預設值 '[]'（ALTER TABLE 的
+      // DEFAULT），所以這裡不會是 null，但型別仍寫 nullable 以防手動插入的舊測試資料漏帶
+      open_questions: string | null;
     } | undefined;
 
   const writeTranscript = (id: string, transcript: TranscriptRecord, createdAt: number) => {
@@ -321,7 +326,7 @@ export const createMeetingStore = (db: DatabaseSync) => {
     );
   };
 
-  const writeAnalysis = (id: string, analysis: AnalysisV2, createdAt: number) => {
+  const writeAnalysis = (id: string, analysis: AnalysisV3, createdAt: number) => {
     insertAnalysis.run(
       id,
       analysis.contract_version,
@@ -329,6 +334,7 @@ export const createMeetingStore = (db: DatabaseSync) => {
       JSON.stringify(analysis.topics),
       JSON.stringify(analysis.decisions),
       JSON.stringify(analysis.action_items),
+      JSON.stringify(analysis.open_questions),
       createdAt,
     );
   };
@@ -509,14 +515,14 @@ export const createMeetingStore = (db: DatabaseSync) => {
     },
 
     /**
-     * 人工編輯會議記錄：整份覆寫（前端送的是編輯後的完整 v2）。
+     * 人工編輯會議記錄：整份覆寫（前端送的是編輯後的完整 v3）。
      * 還沒有分析的會拋錯，理由同 updateTranscript。
      */
-    replaceAnalysis: (id: string, analysis: AnalysisV2, updatedAt: number): void => {
+    replaceAnalysis: (id: string, analysis: AnalysisV3, updatedAt: number): void => {
       requireMeeting(id);
       if (!readAnalysisRow(id)) throw new Error(`Meeting ${id} 還沒有分析結果，沒有東西可以編輯`);
-      if (isAnalysisV2SemanticallyEmpty(analysis)) {
-        throw new Error(`Meeting ${id} 的分析四個欄位都是空的，不寫入`);
+      if (isAnalysisV3SemanticallyEmpty(analysis)) {
+        throw new Error(`Meeting ${id} 的分析五個欄位都是空的，不寫入`);
       }
 
       db.exec('BEGIN');
@@ -540,12 +546,12 @@ export const createMeetingStore = (db: DatabaseSync) => {
       writeTranscript(id, transcript, createdAt);
     },
 
-    saveAnalysis: (id: string, analysis: AnalysisV2, createdAt: number): void => {
+    saveAnalysis: (id: string, analysis: AnalysisV3, createdAt: number): void => {
       requireMeeting(id);
-      if (isAnalysisV2SemanticallyEmpty(analysis)) {
-        // 與 saveTranscript 同一條標準（SDD 1.5）：四個欄位全空卻寫成成功，
+      if (isAnalysisV3SemanticallyEmpty(analysis)) {
+        // 與 saveTranscript 同一條標準（SDD 1.5）：五個欄位全空卻寫成成功，
         // 在畫面上跟「這場會沒什麼結論」長得一樣，而且不會有任何錯誤
-        throw new Error(`Meeting ${id} 的分析四個欄位都是空的，不寫入`);
+        throw new Error(`Meeting ${id} 的分析五個欄位都是空的，不寫入`);
       }
       writeAnalysis(id, analysis, createdAt);
     },
@@ -568,18 +574,33 @@ export const createMeetingStore = (db: DatabaseSync) => {
       }
     },
 
-    getAnalysis: (id: string): AnalysisV2 | null => {
+    /**
+     * 讀出來的一律是 v3。v2 的舊資料在這裡 lazy 升級（`upgradeAnalysisV2ToV3`），
+     * 不改寫資料列本身——升級只是讀取時呈現的形狀，資料列維持 `contract_version = 2`
+     * 直到下一次真的被覆寫（`saveAnalysis`／`replaceAnalysis` 只寫 v3）。
+     */
+    getAnalysis: (id: string): AnalysisV3 | null => {
       const row = readAnalysisRow(id);
       if (!row) return null;
-      if (row.contract_version !== 2) {
-        throw new Error(`Meeting ${id} 的分析是 C-ANALYSIS v${row.contract_version}，這一版只讀 v2`);
+      if (row.contract_version === 2) {
+        return upgradeAnalysisV2ToV3({
+          contract_version: 2,
+          overview: row.overview,
+          topics: JSON.parse(row.topics),
+          decisions: JSON.parse(row.decisions),
+          action_items: JSON.parse(row.action_items),
+        });
+      }
+      if (row.contract_version !== 3) {
+        throw new Error(`Meeting ${id} 的分析是 C-ANALYSIS v${row.contract_version}，這一版只讀 v2 與 v3`);
       }
       return {
-        contract_version: 2,
+        contract_version: 3,
         overview: row.overview,
         topics: JSON.parse(row.topics),
         decisions: JSON.parse(row.decisions),
         action_items: JSON.parse(row.action_items),
+        open_questions: JSON.parse(row.open_questions ?? '[]'),
       };
     },
 

@@ -1,6 +1,6 @@
 # 會議記錄規範
 
-這份檔案有兩個讀者：人（審這份規範對不對）與模型（`services/analysisClient.ts` 在啟動時整份讀進 systemInstruction）。只有一份正本，不要在碼裡另抄一份。
+這份檔案有兩個讀者：人（審這份規範對不對）與模型（`services/geminiServerClient.ts` 的 `analyzeTranscript` 在建 client 時整份讀進 systemInstruction）。只有一份正本，不要在碼裡另抄一份。
 
 改這份檔案等於改分析的行為，屬於 SDD 4.1 的 L2 變更：改完至少用一場真實錄音跑一次，看決議與待辦有沒有硬湊、時間戳回查得到。
 

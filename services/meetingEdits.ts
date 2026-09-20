@@ -9,7 +9,7 @@
  * 這些操作都不改 Meeting 的 status，只動內容與 updated_at。
  */
 import { TranscriptSegment } from '../types';
-import { AnalysisV2, isAnalysisV2SemanticallyEmpty } from './analysisContract';
+import { AnalysisV3, isAnalysisV3SemanticallyEmpty } from './analysisContract';
 import { AudioFileStore } from './audioFileStore';
 import { BUSY_STATUSES } from './meetingApi';
 import { MeetingStatus } from './meetingState';
@@ -132,34 +132,63 @@ export function patchTranscriptRequest(
 }
 
 /**
+ * `evidence` 是 null（v2 升上來的舊資料）或 `{ start, end }` 兩個有限數字且 `start <= end`。
+ * 只驗「是不是物件」不夠：`{ start: '0' }` 這種型別錯的值會原樣落地，之後拿它算秒數會
+ * 直接是 NaN，而那時已經看不出來是哪一次編輯寫進去的。
+ */
+const isEvidence = (v: unknown): boolean =>
+  v === null
+  || (
+    isObject(v)
+    && typeof v.start === 'number' && Number.isFinite(v.start)
+    && typeof v.end === 'number' && Number.isFinite(v.end)
+    && v.start <= v.end
+  );
+
+const isDecisionV3 = (v: unknown): boolean =>
+  isObject(v)
+  && typeof v.text === 'string'
+  && isEvidence(v.evidence)
+  && (v.decided_by === null || typeof v.decided_by === 'string');
+
+/**
  * action_items 的每一筆都要完整驗。
  *
  * 只驗 text 的話，`created_at: "不是數字"`、`status: "完成了嗎"` 會原樣落地而且回 200，
  * 之後任何把 created_at 當數字排序、把 status 當三值列舉的程式（W3 的跨會議待辦）
  * 會在讀取端拿到字串，而那時已經看不出是哪一次編輯寫進去的。
- * assignee 的來源未定（U-007），欄位可缺，但給了就必須是字串。
+ * assignee、due 在 v3 明寫成 `string | null`（不是 optional），U-007 仍未關閉。
  */
-const isActionItemV2 = (v: unknown): boolean =>
+const isActionItemV3 = (v: unknown): boolean =>
   isObject(v)
   && typeof v.text === 'string'
   && typeof v.source_meeting_id === 'string'
   && typeof v.created_at === 'number'
   && Number.isFinite(v.created_at)
   && (v.status === 'unknown' || v.status === 'open' || v.status === 'done')
-  && (v.assignee === undefined || typeof v.assignee === 'string');
+  && (v.assignee === null || typeof v.assignee === 'string')
+  && (v.due === null || typeof v.due === 'string')
+  && isEvidence(v.evidence);
 
-// contract_version 之外的欄位也要驗：少驗一個，isAnalysisV2SemanticallyEmpty 會在
-// 非字串的 overview 上炸成 500，使用者看到的是「伺服器錯誤」而不是「你送的東西不對」
-const isAnalysisV2Shape = (v: unknown): v is AnalysisV2 =>
+const isOpenQuestionV3 = (v: unknown): boolean =>
   isObject(v)
-  && v.contract_version === 2
+  && typeof v.text === 'string'
+  && isEvidence(v.evidence);
+
+// contract_version 之外的欄位也要驗：少驗一個，isAnalysisV3SemanticallyEmpty 會在
+// 非字串的 overview 上炸成 500，使用者看到的是「伺服器錯誤」而不是「你送的東西不對」
+const isAnalysisV3Shape = (v: unknown): v is AnalysisV3 =>
+  isObject(v)
+  && v.contract_version === 3
   && typeof v.overview === 'string'
   && Array.isArray(v.topics)
   && v.topics.every(t => isObject(t) && typeof t.title === 'string' && typeof t.content === 'string')
   && Array.isArray(v.decisions)
-  && v.decisions.every(d => typeof d === 'string')
+  && v.decisions.every(isDecisionV3)
   && Array.isArray(v.action_items)
-  && v.action_items.every(isActionItemV2);
+  && v.action_items.every(isActionItemV3)
+  && Array.isArray(v.open_questions)
+  && v.open_questions.every(isOpenQuestionV3);
 
 export function patchAnalysisRequest(
   deps: { store: MeetingStore },
@@ -169,20 +198,20 @@ export function patchAnalysisRequest(
 ): EditOutcome {
   const analysis = isObject(body) ? body.analysis : undefined;
   if (!isObject(analysis)) return fail(400, 'analysis 必須是物件');
-  if (analysis.contract_version !== 2) {
-    return fail(400, `analysis 的 contract_version 必須是 2，收到 ${JSON.stringify(analysis.contract_version)}`);
+  if (analysis.contract_version !== 3) {
+    return fail(400, `analysis 的 contract_version 必須是 3，收到 ${JSON.stringify(analysis.contract_version)}`);
   }
-  if (!isAnalysisV2Shape(analysis)) {
+  if (!isAnalysisV3Shape(analysis)) {
     return fail(
       400,
-      'analysis 的欄位形狀不是 C-ANALYSIS v2：overview 要字串，topics/decisions 要陣列，'
-      + 'action_items 每筆要有字串 text 與 source_meeting_id、數字 created_at、'
-      + "status 是 unknown / open / done 其中之一",
+      'analysis 的欄位形狀不是 C-ANALYSIS v3：overview 要字串，topics/decisions/action_items/'
+      + 'open_questions 要陣列，decisions 與 action_items 與 open_questions 每筆的 evidence 要是 '
+      + 'null 或 { start, end }（start <= end），action_items 的 status 是 unknown / open / done 其中之一',
     );
   }
-  if (isAnalysisV2SemanticallyEmpty(analysis)) {
-    // 與 saveAnalysis 同一條標準：四個欄位全空卻存成成功，畫面上跟「這場會沒什麼結論」長得一樣
-    return fail(400, 'analysis 四個欄位都是空的，不寫入');
+  if (isAnalysisV3SemanticallyEmpty(analysis)) {
+    // 與 saveAnalysis 同一條標準：五個欄位全空卻存成成功，畫面上跟「這場會沒什麼結論」長得一樣
+    return fail(400, 'analysis 五個欄位都是空的，不寫入');
   }
 
   const meeting = deps.store.getMeeting(meetingId);

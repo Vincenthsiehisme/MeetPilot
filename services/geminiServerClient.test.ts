@@ -15,18 +15,30 @@ vi.mock('@google/genai', () => ({
       embedContent: (request: unknown) => embedContent(request),
     };
   },
-  Type: { OBJECT: 'OBJECT', ARRAY: 'ARRAY', STRING: 'STRING', NUMBER: 'NUMBER', BOOLEAN: 'BOOLEAN' },
+  Type: { OBJECT: 'OBJECT', ARRAY: 'ARRAY', STRING: 'STRING', NUMBER: 'NUMBER', BOOLEAN: 'BOOLEAN', INTEGER: 'INTEGER' },
   ThinkingLevel: { UNSPECIFIED: 'THINKING_LEVEL_UNSPECIFIED', LOW: 'LOW', MEDIUM: 'MEDIUM', HIGH: 'HIGH' },
 }));
+
+// node:fs 的 ESM 匯出不可重新定義，vi.spyOn 直接對它下手會拋
+// 「Cannot redefine property」，只能整個模組換掉，其餘函式原樣代理給真實實作。
+// 預設代理到真的 readFileSync，讓 analyzeTranscript 讀到真的規範檔；
+// 只有測「規範檔讀不到／是空的」那兩條才覆寫這個 mock 的回傳
+const { readFileSyncMock } = vi.hoisted(() => ({ readFileSyncMock: vi.fn() }));
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return { ...actual, readFileSync: (...args: Parameters<typeof actual.readFileSync>) => readFileSyncMock(...args) };
+});
 
 const {
   EMBEDDING_MODEL,
   cleanJsonString,
   createGeminiServerClient,
   formatTranscriptForAI,
+  formatTranscriptForAnalysis,
   formatTranscriptWithTimeForAI,
   isTransientLlmError,
 } = await import('./geminiServerClient');
+const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
 
 let logged: LlmCallInput[];
 const client = () => createGeminiServerClient({ log: (input) => logged.push(input) });
@@ -35,6 +47,7 @@ beforeEach(() => {
   logged = [];
   generateContent.mockReset();
   embedContent.mockReset();
+  readFileSyncMock.mockImplementation((...args: Parameters<typeof realFs.readFileSync>) => realFs.readFileSync(...args));
   process.env.GEMINI_API_KEY = 'test-key';
   vi.spyOn(console, 'warn').mockImplementation(() => {});
 });
@@ -251,38 +264,98 @@ describe('fallback 鏈', () => {
   });
 });
 
+describe('formatTranscriptForAnalysis', () => {
+  it('每段標成 [#n MM:SS-MM:SS] 講者: 內容，n 是 1-based 陣列索引', () => {
+    const out = formatTranscriptForAnalysis([
+      { start: 0, end: 5, text: '大家好', speaker: 'A' },
+      { start: 65, end: 72, text: '開始討論預算', speaker: 'B' },
+    ]);
+    expect(out).toBe('[#1 00:00-00:05] A: 大家好\n[#2 01:05-01:12] B: 開始討論預算');
+  });
+
+  it('沒有 speaker 的段落算 Unknown', () => {
+    expect(formatTranscriptForAnalysis([{ start: 0, end: 1, text: 'x' }])).toBe('[#1 00:00-00:01] Unknown: x');
+  });
+});
+
 describe('analyzeTranscript', () => {
-  it('回傳解析後的 GeminiOutput，並把標籤與背景帶進 prompt', async () => {
-    generateContent.mockResolvedValue({
-      text: '```json\n{"overview":"主旨","topics":[],"decisions":["d"],"action_items":["a"]}\n```',
-    });
+  const okOutput = {
+    overview: '討論預算',
+    topics: [{ title: '預算', content: '內容' }],
+    decisions: [{ text: '採用方案 A', segment_from: 1, segment_to: 1, decided_by: null }],
+    action_items: [{ text: '追蹤報價', segment_from: 1, segment_to: 1, assignee: null, due: null }],
+    open_questions: [],
+  };
+  const transcript = [{ start: 0, end: 5, text: '大家好', speaker: 'A' }];
 
-    const result = await client().analyzeTranscript({
-      transcript: [{ start: 0, end: 1, text: '討論採購', speaker: 'A' }],
-      meetingTags: ['採購'],
-      meetingContext: '第三次會',
-    });
+  it('讀不到規範檔時，建 client 當下就拋錯，不等第一次呼叫才發現', () => {
+    readFileSyncMock.mockImplementation(() => { throw new Error('ENOENT: no such file or directory'); });
+    expect(() => client()).toThrow(/規範檔.*讀取失敗/);
+  });
 
-    expect(result).toEqual({ overview: '主旨', topics: [], decisions: ['d'], action_items: ['a'] });
+  it('規範檔是空檔時拋錯', () => {
+    readFileSyncMock.mockReturnValue('   \n  ');
+    expect(() => client()).toThrow(/規範檔.*是空的/);
+  });
+
+  it('systemInstruction 是規範檔全文，逐字稿標段落編號送進 contents', async () => {
+    generateContent.mockResolvedValue({ text: JSON.stringify(okOutput) });
+
+    await client().analyzeTranscript({ transcript });
+
     const request = generateContent.mock.calls[0][0] as any;
-    expect(request.contents).toContain('會議標籤：採購');
-    expect(request.contents).toContain('背景補充：第三次會');
-    expect(request.contents).toContain('A: 討論採購');
+    expect(request.config.systemInstruction).toContain('會議記錄規範');
+    expect(request.contents).toContain('[#1 00:00-00:05] A: 大家好');
+    expect(request.model).toBe('gemini-3.8-flash');
+  });
+
+  it('會議標籤與背景補充帶進 prompt，沒給的話不留空段落', async () => {
+    generateContent.mockResolvedValue({ text: JSON.stringify(okOutput) });
+
+    await client().analyzeTranscript({ transcript, meetingTags: ['採購'], meetingContext: '第三次會' });
+    const withContext = (generateContent.mock.calls[0][0] as any).contents as string;
+    expect(withContext).toContain('會議標籤：採購');
+    expect(withContext).toContain('背景補充：第三次會');
+
+    generateContent.mockClear();
+    generateContent.mockResolvedValue({ text: JSON.stringify(okOutput) });
+    await client().analyzeTranscript({ transcript });
+    const withoutContext = (generateContent.mock.calls[0][0] as any).contents as string;
+    expect(withoutContext).not.toContain('會議標籤：');
+    expect(withoutContext).not.toContain('背景補充：');
+  });
+
+  it('responseSchema 對可為 null 的欄位用 nullable，不是 optional', async () => {
+    generateContent.mockResolvedValue({ text: JSON.stringify(okOutput) });
+    await client().analyzeTranscript({ transcript });
+
+    const schema = (generateContent.mock.calls[0][0] as any).config.responseSchema;
+    expect(schema.properties.decisions.items.properties.decided_by.nullable).toBe(true);
+    expect(schema.properties.action_items.items.properties.assignee.nullable).toBe(true);
+    expect(schema.properties.action_items.items.properties.due.nullable).toBe(true);
+  });
+
+  it('正常回應解析成 AnalysisModelOutput', async () => {
+    generateContent.mockResolvedValue({ text: JSON.stringify(okOutput) });
+    expect(await client().analyzeTranscript({ transcript })).toEqual(okOutput);
   });
 
   it('回的內容不是合法 JSON 時拋錯，不回一份空的分析', async () => {
     generateContent.mockResolvedValue({ text: '抱歉，我無法處理' });
-    await expect(client().analyzeTranscript({ transcript: [{ start: 0, end: 1, text: 'x' }] }))
-      .rejects.toThrow();
+    await expect(client().analyzeTranscript({ transcript })).rejects.toThrow();
+  });
+
+  it('解析出來的形狀不對時拋錯（responseSchema 不保證型別完全符合預期）', async () => {
+    generateContent.mockResolvedValue({ text: JSON.stringify({ ...okOutput, overview: 123 }) });
+    await expect(client().analyzeTranscript({ transcript })).rejects.toThrow(/overview/);
   });
 
   it('紀錄的 configuredMaxOutputTokens 是這支呼叫實際設的上限，跟 transcribe 沒設的 null 不一樣', async () => {
-    generateContent.mockResolvedValue({
-      text: '{"overview":"x","topics":[],"decisions":[],"action_items":[]}',
-    });
-    await client().analyzeTranscript({ transcript: [{ start: 0, end: 1, text: 'x' }] });
+    generateContent.mockResolvedValue({ text: JSON.stringify(okOutput) });
+    await client().analyzeTranscript({ transcript });
     expect(logged.map(l => l.configuredMaxOutputTokens)).toEqual([8192]);
   });
+
 });
 
 describe('polishTranscript', () => {
@@ -490,7 +563,7 @@ describe('meetingId 記進 telemetry，事後才查得出單場會議花了多�
 
   it('analyzeTranscript 有傳 meetingId 就記得下來', async () => {
     generateContent.mockResolvedValue({
-      text: '{"overview":"x","topics":[],"decisions":[],"action_items":[]}',
+      text: '{"overview":"x","topics":[],"decisions":[],"action_items":[],"open_questions":[]}',
     });
     await client().analyzeTranscript({
       transcript: [{ start: 0, end: 1, text: 'x', speaker: 'A' }],

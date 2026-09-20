@@ -11,7 +11,7 @@
  * 任何一段失敗都落到 `FAILED` 並保留音檔，重跑才有東西可跑。
  */
 import { TranscriptSegment } from '../types';
-import { upgradeAnalysisToV2 } from './analysisContract';
+import { buildAnalysisV3FromModelOutput } from './analysisContract';
 import { AudioFileStore } from './audioFileStore';
 import { AudioSlicer, planSlices } from './audioSlicer';
 import { GeminiServerClient } from './geminiServerClient';
@@ -204,13 +204,17 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
       throw new Error(`Meeting ${meetingId} 的每一片都沒有轉出內容，不進分析`);
     }
 
-    const v1 = await gemini.analyzeTranscript({
+    const output = await gemini.analyzeTranscript({
       transcript: transcript.segments,
       meetingTags: store.getTags(meetingId),
       meetingContext: meeting.meeting_context ?? '',
       meetingId,
     });
-    store.saveAnalysis(meetingId, upgradeAnalysisToV2(v1, meetingId, now()), now());
+    store.saveAnalysis(
+      meetingId,
+      buildAnalysisV3FromModelOutput(output, transcript.segments, meetingId, now()),
+      now(),
+    );
   };
 
   const markFailed = (meetingId: string, reason: string, cause: unknown): void => {
