@@ -20,6 +20,7 @@ import {
   MeetingResponse,
   MeetingView,
   PatchAnalysisResponse,
+  PatchTitleResponse,
   PatchTranscriptRequest,
   PatchTranscriptResponse,
 } from './meetingApi';
@@ -122,6 +123,16 @@ export const patchAnalysis = async (meetingId: string, analysis: AnalysisV3): Pr
     body: JSON.stringify({ analysis }),
   });
   return data.analysis;
+};
+
+/** 改標題。空字串、超過 100 字或含控制字元時 server 回 400；分析中回 409，訊息原樣顯示 */
+export const patchTitle = async (meetingId: string, title: string): Promise<string> => {
+  const data = await requestJson<PatchTitleResponse>(meetingPath(meetingId, '/title'), {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title }),
+  });
+  return data.title;
 };
 
 /**

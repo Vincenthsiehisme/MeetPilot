@@ -115,3 +115,18 @@ describe('buildPrintDocument', () => {
     expect(html.indexOf('<h2>待辦</h2>')).toBeLessThan(html.indexOf('<h2>未決事項</h2>'));
   });
 });
+
+describe('標題', () => {
+  it('有標題時 <title>（另存 PDF 的預設檔名）用清過的標題、h1 用原標題，FILE 仍是原始檔名', () => {
+    const html = buildPrintDocument({ ...baseJob, title: 'Q3/預算: 覆盤' }, baseAnalysis);
+    expect(html).toContain('<title>Q3預算 覆盤 - Meeting Minutes</title>');
+    expect(html).toContain('<h1>Q3/預算: 覆盤</h1>');
+    expect(html).toContain('FILE: meeting.mp3');
+  });
+
+  it('沒有標題時 h1 是「會議記錄」，<title> 是原始檔名（既有行為不變）', () => {
+    const html = buildPrintDocument(baseJob, baseAnalysis);
+    expect(html).toContain('<h1>會議記錄</h1>');
+    expect(html).toContain('<title>meeting.mp3 - Meeting Minutes</title>');
+  });
+});

@@ -388,6 +388,16 @@ export const createMeetingStore = (db: DatabaseSync) => {
     },
 
     /**
+     * 改標題。分析完成時 pipeline 用它填模型的建議（只在還是 null 時），之後使用者從畫面改。
+     * 值的規則（非空、長度、控制字元）在 meetingTitle.ts 由呼叫端先驗，這裡只寫。
+     */
+    setTitle: (id: string, title: string, updatedAt: number): Meeting => {
+      requireMeeting(id);
+      db.prepare('UPDATE meetings SET title = ?, updated_at = ? WHERE meeting_id = ?').run(title, updatedAt, id);
+      return requireMeeting(id);
+    },
+
+    /**
      * 只更新切片進度。轉錄開始前用來把 total_slices 寫下去：
      * 進度分母缺著的話，畫面只能顯示「已處理 3 片」而看不出還有多久。
      */

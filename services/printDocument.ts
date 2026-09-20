@@ -1,6 +1,7 @@
 import { Job } from '../types';
 import { ActionItemV3, AnalysisV3, DecisionV3, Evidence, OpenQuestionV3 } from './analysisContract';
 import { escapeHtml } from './escapeHtml';
+import { jobDownloadBaseName } from './meetingTitle';
 
 /**
  * 從結構化的 Job 與分析結果組出列印用的完整 HTML 字串。
@@ -76,17 +77,20 @@ const renderOpenQuestions = (questions: readonly OpenQuestionV3[], emptyText: st
 
 export function buildPrintDocument(job: Job, analysis: AnalysisV3): string {
   const fileName = escapeHtml(job.fileName);
+  // <title> 是瀏覽器「另存 PDF」的預設檔名，跟其他下載一樣用標題；h1 顯示原標題（不清字元）；FILE 仍是原始檔名
+  const documentName = escapeHtml(jobDownloadBaseName(job));
+  const heading = escapeHtml(job.title ?? '會議記錄');
   const date = escapeHtml(new Date(job.createdAt).toLocaleDateString());
 
   return `<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>${fileName} - Meeting Minutes</title>
+<title>${documentName} - Meeting Minutes</title>
 <style>${PRINT_STYLE}</style>
 </head>
 <body>
-<h1>會議記錄</h1>
+<h1>${heading}</h1>
 <div class="meta">FILE: ${fileName} | DATE: ${date}</div>
 <h3>會議主旨</h3>
 <div class="pre">${escapeHtml(analysis.overview)}</div>

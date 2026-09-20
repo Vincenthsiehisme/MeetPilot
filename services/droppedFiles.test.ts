@@ -52,9 +52,15 @@ describe('pickDroppedAudioFile', () => {
     expect(result).toEqual({ ok: true, file: f });
   });
 
-  it('沒有檔案時擋下來並說明原因', () => {
-    const result = pickDroppedAudioFile([]);
+  it('沒有檔案時擋下來，訊息列出 dataTransfer.types 讓使用者回報得出來源', () => {
+    const result = pickDroppedAudioFile([], ['text/plain', 'text/uri-list']);
     expect(result.ok === false && result.reason).toContain('沒有偵測到檔案');
+    expect(result.ok === false && result.reason).toContain('text/plain、text/uri-list');
+  });
+
+  it('沒有檔案也沒有型別時寫「無」，不留一個空的括號', () => {
+    const result = pickDroppedAudioFile([]);
+    expect(result.ok === false && result.reason).toContain('型別：無');
   });
 
   it('超過一個檔案時擋下來，不悄悄只送第一個（避免使用者以為其餘的也送出去了）', () => {

@@ -5,7 +5,8 @@ import { polishTranscript } from '../services/geminiService';
 import { exportTranscriptAsSRT, exportTranscriptAsText, exportPolishedContent } from '../services/exportUtils';
 
 interface TranscriptViewProps {
-  fileName: string;
+  /** 下載檔名的主體（標題或原始檔名，JobDetail 算好傳進來）。這個元件只拿它組匯出檔名 */
+  exportBaseName: string;
   segments: TranscriptSegment[];
   polishedContent?: string;
   onUpdate: (segments: TranscriptSegment[]) => void;
@@ -13,7 +14,7 @@ interface TranscriptViewProps {
   onAlert: (title: string, message: string) => void;
 }
 
-const TranscriptView: React.FC<TranscriptViewProps> = ({ fileName, segments, polishedContent, onUpdate, onSavePolished, onAlert }) => {
+const TranscriptView: React.FC<TranscriptViewProps> = ({ exportBaseName, segments, polishedContent, onUpdate, onSavePolished, onAlert }) => {
   const [viewMode, setViewMode] = useState<'original' | 'polished'>('original');
   const [editingIdx, setEditingIdx] = useState<number | null>(null);
   const [showTimestamps, setShowTimestamps] = useState<boolean>(false);
@@ -171,14 +172,14 @@ const TranscriptView: React.FC<TranscriptViewProps> = ({ fileName, segments, pol
                         字幕與時間軸
                       </div>
                       <button 
-                        onClick={() => { exportTranscriptAsSRT(fileName, segments); setIsExportMenuOpen(false); }}
+                        onClick={() => { exportTranscriptAsSRT(exportBaseName, segments); setIsExportMenuOpen(false); }}
                         className="w-full text-left px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 rounded-lg flex items-center gap-2"
                       >
                         <i className="fa-regular fa-file-video text-slate-400 w-4"></i>
                         SRT 字幕檔 (.srt)
                       </button>
                       <button 
-                        onClick={() => { exportTranscriptAsText(fileName, segments, true); setIsExportMenuOpen(false); }}
+                        onClick={() => { exportTranscriptAsText(exportBaseName, segments, true); setIsExportMenuOpen(false); }}
                         className="w-full text-left px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 rounded-lg flex items-center gap-2"
                       >
                          <i className="fa-regular fa-clock text-slate-400 w-4"></i>
@@ -186,7 +187,7 @@ const TranscriptView: React.FC<TranscriptViewProps> = ({ fileName, segments, pol
                       </button>
                       <div className="my-1 border-t border-slate-100"></div>
                       <button 
-                        onClick={() => { exportTranscriptAsText(fileName, segments, false); setIsExportMenuOpen(false); }}
+                        onClick={() => { exportTranscriptAsText(exportBaseName, segments, false); setIsExportMenuOpen(false); }}
                         className="w-full text-left px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 rounded-lg flex items-center gap-2"
                       >
                          <i className="fa-regular fa-file-lines text-slate-400 w-4"></i>
@@ -200,7 +201,7 @@ const TranscriptView: React.FC<TranscriptViewProps> = ({ fileName, segments, pol
                       </div>
                       <button 
                         disabled={!polishedContent}
-                        onClick={() => { if(polishedContent) exportPolishedContent(fileName, polishedContent); setIsExportMenuOpen(false); }}
+                        onClick={() => { if(polishedContent) exportPolishedContent(exportBaseName, polishedContent); setIsExportMenuOpen(false); }}
                         className="w-full text-left px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 rounded-lg flex items-center gap-2 disabled:opacity-50"
                       >
                         <i className="fa-brands fa-markdown text-slate-400 w-4"></i>

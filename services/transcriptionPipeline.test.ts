@@ -45,6 +45,7 @@ const fakeSlicer = (durationSeconds: number, readSlice?: AudioSlicer['readSlice'
 /** gemini.analyzeTranscript 的回傳形狀（segment_from／segment_to，不是秒數）。
  * segment_from/to 都指第 1 段：analyze() 呼叫前已經擋掉空逐字稿，至少有第 1 段可以指 */
 const analysisOutput: AnalysisModelOutput = {
+  title: '預算與時程',
   overview: '一句話主旨',
   topics: [{ title: '議題 A', content: '內容' }],
   decisions: [{ text: '決定 A', segment_from: 1, segment_to: 1, decided_by: null }],
@@ -950,5 +951,38 @@ describe('run：關聯接在 READY 之後（W4）', () => {
     // 也會讓 6.1 的關聯成功率指標被人為關閉污染
     expect(statuses).toEqual(['TRANSCRIBING', 'ANALYZING', 'READY']);
     expect(store.getMeeting('m-1')?.error).toBeNull();
+  });
+});
+
+describe('run：建議標題', () => {
+  const runWith = async (title: string, existingTitle: string | null = null) => {
+    store.createMeeting({ meeting_id: 'm-1', created_at: T0, source_file_name: 'a.m4a', source_file_size: 10, title: existingTitle });
+    const pipeline = pipelineWith({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(THREE_SLICE_DURATION),
+      gemini: fakeGemini({ analyzeTranscript: async () => ({ ...analysisOutput, title }) }),
+      now: () => T0 + 1,
+    });
+    await pipeline.run('m-1');
+  };
+
+  it('分析完成後把模型的建議標題（trim 過）寫進 meeting.title', async () => {
+    await runWith('  預算與時程  ');
+    expect(store.getMeeting('m-1')?.title).toBe('預算與時程');
+  });
+
+  it('已經有標題的會不覆蓋：人改過的名字不能被下一次分析洗掉', async () => {
+    await runWith('模型的建議', '我自己取的');
+    expect(store.getMeeting('m-1')?.title).toBe('我自己取的');
+  });
+
+  it('建議標題不合規則時標題留 null 並 warn，這場會照樣 READY', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await runWith('   ');
+    expect(store.getMeeting('m-1')?.title).toBeNull();
+    expect(store.getMeeting('m-1')?.status).toBe('READY');
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('建議標題不可用'));
+    warn.mockRestore();
   });
 });

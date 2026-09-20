@@ -17,10 +17,10 @@ import { checkBasicAuth, createRateLimiter, describeBodyParserError, ListenConfi
 import { LlmLogger } from './llmTelemetry';
 import { MeetingStore } from './meetingStore';
 import { MigrationRecord, isRejected, toMigrationRecord } from './jobMigration';
-import { GeminiServerClient, formatTranscriptWithTimeForAI, getAI } from './geminiServerClient';
+import { GeminiServerClient } from './geminiServerClient';
 import { AudioFileStore } from './audioFileStore';
 import { TranscriptionQueue } from './transcriptionQueue';
-import { deleteMeetingRequest, patchAnalysisRequest, patchTranscriptRequest } from './meetingEdits';
+import { deleteMeetingRequest, patchAnalysisRequest, patchTitleRequest, patchTranscriptRequest } from './meetingEdits';
 import { TopicLinker } from './topicLinker';
 import { runProjection, VaultProjector } from './vaultProjector';
 
@@ -492,11 +492,21 @@ export function createApp(deps: AppDeps): express.Express {
     }
   });
 
-  // 前端仍在用的一條 Gemini 路由。轉錄與分析的路由在 W2 T2 之後零呼叫端（那兩條事的發起點
-  // 改成 server 端的 transcriptionPipeline），已經移除；geminiServerClient 的
-  // transcribeSlice、analyzeTranscript 留著，pipeline 內部呼叫，沒有對外路由。
+  // 改標題。不重投影：vault 檔的 heading 與檔名取自 analysis.overview（SDD 1.3.1），跟這個欄位無關
+  app.patch('/api/meetings/:id/title', (req, res) => {
+    try {
+      const outcome = patchTitleRequest({ store: meetingStore }, req.params.id, req.body, Date.now());
+      res.status(outcome.status).json(outcome.body);
+    } catch (err) {
+      handleStoreError(err, res);
+    }
+  });
 
-  // 1. Polish Transcript（components/TranscriptView.tsx）
+  // 前端仍在用的唯一一條 Gemini 路由。轉錄與分析的路由在 W2 T2 之後零呼叫端（那兩件事的發起點
+  // 改成 server 端的 transcriptionPipeline），已經移除；問答串流路由在 2026-09-20 連同前端一起拿掉。
+  // geminiServerClient 的 transcribeSlice 與 analyzeTranscript 都是 pipeline 內部呼叫，沒有對外路由。
+
+  // Polish Transcript（components/TranscriptView.tsx）
   app.post('/api/gemini/polish', async (req, res) => {
     try {
       const { transcript } = req.body;
@@ -508,138 +518,6 @@ export function createApp(deps: AppDeps): express.Express {
       res.json({ content });
     } catch (err: any) {
       handleApiError(err, res);
-    }
-  });
-
-  // 2. Chat Q&A Streaming (SSE)（components/ChatView.tsx）
-  app.post('/api/gemini/chat-stream', async (req, res) => {
-    try {
-      const { transcript = [], history = [], question } = req.body;
-      if (!question) {
-        return res.status(400).json({ error: 'Question is required' });
-      }
-
-      const ai = getAI();
-      const docContext = formatTranscriptWithTimeForAI(transcript);
-      const recentHistory = history.slice(-6).map((h: any) => ({
-        role: h.role,
-        parts: [{ text: h.text }],
-      }));
-
-      const chatHistory = [
-        {
-          role: 'user',
-          parts: [{ text: `這是本次會議的完整逐字稿內容 (含時間戳記)：\n\n${docContext}\n\n請閱讀並記住上述內容，準備回答問題。` }],
-        },
-        {
-          role: 'model',
-          parts: [{ text: '好的，我已經閱讀並理解了會議逐字稿。請問有什麼關於這次會議的問題需要我協助解答？我將會基於上述文件內容進行精準回覆並附上時間引用。' }],
-        },
-        ...recentHistory,
-      ];
-
-      const chatConfig = {
-        systemInstruction: '你是一位專業的會議助理。任務是回答用戶關於「會議逐字稿」的具體問題。準則：嚴格基於事實，引用時間戳記 [MM:SS]，繁體中文回答。',
-      };
-
-      const models = ['gemini-3.8-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest'];
-      let responseStream: any = null;
-      let lastErr: any;
-      // 這條路徑不走 generateContentWithFallback，紀錄要自己埋，而且跨「建立」與「消費」兩段：
-      // 成功建立的那個 model 與起算時間要傳到下面
-      let streamModel = '';
-      let streamModelIndex = -1;
-      let streamStartedAt = 0;
-
-      for (let modelIndex = 0; modelIndex < models.length; modelIndex++) {
-        const model = models[modelIndex];
-        const startedAt = Date.now();
-        try {
-          const chat = ai.chats.create({
-            model,
-            history: chatHistory,
-            config: chatConfig,
-          });
-          responseStream = await chat.sendMessageStream({ message: question });
-          streamModel = model;
-          streamModelIndex = modelIndex;
-          streamStartedAt = startedAt;
-          break;
-        } catch (err: any) {
-          lastErr = err;
-          const msg = (err?.message || '').toLowerCase();
-          const isTransient = msg.includes('503') || msg.includes('unavailable') || msg.includes('high demand') || msg.includes('429');
-          llmLogger.log({
-            kind: 'chat-stream',
-            model,
-            modelIndex,
-            attempt: 1,
-            streamed: true,
-            latencyMs: Date.now() - startedAt,
-            outcome: isTransient ? 'transient' : 'fatal',
-            error: err,
-          });
-          if (!isTransient) throw err;
-        }
-      }
-
-      if (!responseStream) throw (lastErr || new Error('無法建立對話串流'));
-
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
-
-      let firstChunkAt: number | null = null;
-      // Gemini 在串流尾端才給完整的 usageMetadata，留住最後一個帶它的 chunk
-      let usageChunk: unknown = null;
-
-      // 消費串流的錯誤在這裡就記，不留給外層 catch：外層也接得到上面建立階段的錯，
-      // 在那裡記會把已經記過的那一筆再記第二次
-      try {
-        for await (const chunk of responseStream) {
-          if (firstChunkAt === null) firstChunkAt = Date.now();
-          if (chunk.usageMetadata) usageChunk = chunk;
-          if (chunk.text) {
-            res.write(`data: ${JSON.stringify({ text: chunk.text })}\n\n`);
-          }
-        }
-      } catch (err) {
-        llmLogger.log({
-          kind: 'chat-stream',
-          model: streamModel,
-          modelIndex: streamModelIndex,
-          attempt: 1,
-          streamed: true,
-          latencyMs: Date.now() - streamStartedAt,
-          ttfbMs: firstChunkAt === null ? null : firstChunkAt - streamStartedAt,
-          // 斷在中途不算可重試：部分內容已經送出去了
-          outcome: 'fatal',
-          error: err,
-        });
-        throw err;
-      }
-
-      llmLogger.log({
-        kind: 'chat-stream',
-        model: streamModel,
-        modelIndex: streamModelIndex,
-        attempt: 1,
-        streamed: true,
-        latencyMs: Date.now() - streamStartedAt,
-        ttfbMs: firstChunkAt === null ? null : firstChunkAt - streamStartedAt,
-        outcome: 'ok',
-        response: usageChunk,
-      });
-
-      res.write(`data: [DONE]\n\n`);
-      res.end();
-    } catch (err: any) {
-      if (!res.headersSent) {
-        handleApiError(err, res);
-      } else {
-        res.write(`data: ${JSON.stringify({ error: err?.message || '串流錯誤' })}\n\n`);
-        res.end();
-      }
     }
   });
 

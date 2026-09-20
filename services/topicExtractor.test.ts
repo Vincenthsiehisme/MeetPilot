@@ -15,7 +15,7 @@ let store: MeetingStore;
 const fakeGemini = (extract: () => Promise<ExtractedTopicTag[]>): GeminiServerClient => ({
   transcribeSlice: async () => [],
   polishTranscript: async () => '',
-  analyzeTranscript: async () => ({ overview: 'x', topics: [], decisions: [], action_items: [], open_questions: [] }),
+  analyzeTranscript: async () => ({ title: 't', overview: 'x', topics: [], decisions: [], action_items: [], open_questions: [] }),
   extractTopicTags: extract,
   embeddingModel: 'fake-embedding',
   // W4 的兩支。這一層不算關聯，形狀要在，缺了型別就對不上

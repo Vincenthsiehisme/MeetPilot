@@ -142,6 +142,21 @@ export interface PatchAnalysisResponse {
 }
 
 /**
+ * `PATCH /api/meetings/:id/title`
+ *
+ * 標題的規則在 `services/meetingTitle.ts`（trim 後非空、最多 100 字、不含控制字元），server 與前端共用
+ * 同一支檢查。分析中（`BUSY_STATUSES`）回 **409**：pipeline 在分析結尾才判「標題還是 null 就填建議」，
+ * 分析中放行寫入會讓剛存的標題被那個判斷蓋掉。下載檔名與畫面上的名字都用這個欄位。
+ */
+export interface PatchTitleRequest {
+  title: string;
+}
+
+export interface PatchTitleResponse {
+  title: string;
+}
+
+/**
  * `DELETE /api/meetings/:id`
  *
  * 正在跑的（`TRANSCRIBING` / `ANALYZING` / `LINKING`）回 409 而不是排隊刪除：

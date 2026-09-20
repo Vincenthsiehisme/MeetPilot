@@ -592,3 +592,10 @@ describe('upgradeLocalJobAnalysis：本機 IndexedDB 舊 Job 的 v1 分析升到
     expect(upgraded.fileName).toBe(job.fileName);
   });
 });
+
+describe('meetingToJob 的標題', () => {
+  it('server 的 title 帶進 Job.title，null 變 undefined（畫面退回 fileName 的判斷靠 undefined）', () => {
+    expect(meetingToJob(makeMeeting({ title: '週會' })).title).toBe('週會');
+    expect(meetingToJob(makeMeeting({ title: null })).title).toBeUndefined();
+  });
+});

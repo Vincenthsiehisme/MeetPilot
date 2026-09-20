@@ -12,6 +12,7 @@ import {
   importLegacyJobs,
   listMeetings,
   patchAnalysis,
+  patchTitle,
   patchTranscript,
   retryMeeting,
   submitAudio
@@ -476,6 +477,9 @@ const App: React.FC = () => {
         // SummaryView 編輯的就是這份物件，直接送出即可，不用像 v1 字串那樣猜哪一筆是哪一筆
         await patchAnalysis(meetingId, updates.analysis);
       }
+      if (updates.title !== undefined) {
+        await patchTitle(meetingId, updates.title);
+      }
       await refreshActiveDetail(meetingId);
       await refreshMeetings();
     } catch (err: any) {
@@ -544,7 +548,7 @@ const App: React.FC = () => {
     // 跟 handleDragEnter 同一套判準：拖曳頁面上的文字選取也會觸發 drop 事件，
     // 但 dataTransfer.types 不含 'Files'，不該當成「拖錯檔案」跳錯誤視窗
     if (!e.dataTransfer.types.includes('Files')) return;
-    const pick = pickDroppedAudioFile(e.dataTransfer.files);
+    const pick = pickDroppedAudioFile(e.dataTransfer.files, Array.from(e.dataTransfer.types));
     // 明寫 `=== false` 而不是 `!pick.ok`：tsconfig 沒開 strict，`!pick.ok` 這種寫法在這個 repo
     // 收斂不到 { ok: false; reason } 那一側（同樣的坑見 meetingAdapter.ts／meetingEdits.ts）
     if (pick.ok === false) {
@@ -579,12 +583,16 @@ const App: React.FC = () => {
              <i className={`fa-solid ${isSidebarOpen ? 'fa-chevron-left' : 'fa-bars'} text-sm`}></i>
           </button>
           
-          <div className="flex items-center gap-2 select-none">
+          <button
+            onClick={() => selectRecord(null)}
+            className="flex items-center gap-2 select-none rounded-lg px-1.5 py-1 -mx-1.5 hover:bg-slate-100 transition-colors"
+            title="回首頁"
+          >
             <div className="bg-indigo-600 text-white w-8 h-8 rounded-lg flex items-center justify-center shadow-md shadow-indigo-100">
               <i className="fa-solid fa-microphone-lines text-sm"></i>
             </div>
             <span className="text-sm font-bold text-slate-900 hidden sm:inline">WhisperX & Gemini Hub</span>
-          </div>
+          </button>
         </div>
         
         <div className="flex items-center gap-3">
@@ -760,9 +768,11 @@ const App: React.FC = () => {
                   <p className="text-slate-500 max-w-sm mb-8 leading-relaxed text-sm">
                     上傳音檔後由伺服器轉錄與分析，這個分頁可以關掉，處理不會中斷。
                   </p>
-                  <div className="flex gap-4 items-center">
-                    <FileUpload onFileSelect={addMeeting} onRejected={(reason) => showAlert('無法建立任務', reason)} />
-                  </div>
+                  <FileUpload
+                    onFileSelect={addMeeting}
+                    onRejected={(reason) => showAlert('無法建立任務', reason)}
+                    variant="zone"
+                  />
                 </div>
               )}
             </div>

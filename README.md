@@ -1,6 +1,6 @@
 # MeetPilot（語音蒟蒻）
 
-會議錄音 → 切片轉錄 → 結構化中文摘要 → 即時策略與問答。前端 React 19 + Vite，後端 Express 5 代理 Gemini API。
+會議錄音 → 切片轉錄 → 依規範產出的會議記錄（帶逐字稿出處）→ 投影到 Obsidian vault。前端 React 19 + Vite，後端 Express 5 代理 Gemini API。
 
 ## 跑起來
 
@@ -49,6 +49,7 @@ POST   /api/meetings/:id/link     重算跨會議關聯（READY / LINKED / LINK_
 DELETE /api/meetings/:id          刪掉；正在跑的回 409，等它結束或失敗再刪
 PATCH  /api/meetings/:id/transcript   改逐字稿或存潤稿
 PATCH  /api/meetings/:id/analysis     改會議記錄
+PATCH  /api/meetings/:id/title        改標題；畫面上的名字與下載檔名用它，分析完成時模型先填一個建議（只填還沒有標題的會）
 ```
 
 回 meeting 的三條路（`POST`、`PUT`、`GET`）送出來的不是資料庫裡的 `Meeting`，而是 `MeetingView`：多一個

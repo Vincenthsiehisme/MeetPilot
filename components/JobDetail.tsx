@@ -3,8 +3,8 @@ import React, { useState } from 'react';
 import { Job, JobStatus, StepStatus } from '../types';
 import TranscriptView from './TranscriptView';
 import SummaryView from './SummaryView';
-import ChatView from './ChatView';
 import { exportJobAsJSON, exportErrorAsJSON } from '../services/exportUtils';
+import { MEETING_TITLE_MAX_LENGTH, checkMeetingTitle, jobDisplayName, jobDownloadBaseName } from '../services/meetingTitle';
 
 interface JobDetailProps {
   job: Job;
@@ -14,7 +14,20 @@ interface JobDetailProps {
 }
 
 const JobDetail: React.FC<JobDetailProps> = ({ job, onUpdateJob, onAlert, onRetry }) => {
-  const [activeTab, setActiveTab] = useState<'status' | 'transcript' | 'summary' | 'chat'>('status');
+  const [activeTab, setActiveTab] = useState<'status' | 'transcript' | 'summary'>('status');
+  // null 是「沒在編輯標題」；編輯中是輸入框裡的草稿
+  const [titleDraft, setTitleDraft] = useState<string | null>(null);
+
+  const saveTitle = () => {
+    const check = checkMeetingTitle(titleDraft);
+    // 明寫 === false：tsconfig 沒開 strict，!check.ok 收斂不到 reason 那一側（AGENTS.md〈gate 守不到哪裡〉）
+    if (check.ok === false) {
+      onAlert('標題不能用', check.reason);
+      return;
+    }
+    setTitleDraft(null);
+    if (check.title !== job.title) onUpdateJob({ title: check.title });
+  };
 
   const getStepIcon = (status: StepStatus) => {
     switch (status) {
@@ -32,13 +45,6 @@ const JobDetail: React.FC<JobDetailProps> = ({ job, onUpdateJob, onAlert, onRetr
           <TabButton active={activeTab === 'status'} onClick={() => setActiveTab('status')} label="任務進度" />
           <TabButton active={activeTab === 'transcript'} onClick={() => setActiveTab('transcript')} label="完整逐字稿" count={job.transcript?.length} disabled={!job.transcript} />
           <TabButton active={activeTab === 'summary'} onClick={() => setActiveTab('summary')} label="AI 會議記錄" disabled={!job.analysis} />
-          <TabButton 
-            active={activeTab === 'chat'} 
-            onClick={() => setActiveTab('chat')} 
-            label="AI 智慧問答" 
-            disabled={!job.transcript}
-            icon="fa-wand-magic-sparkles"
-          />
         </div>
 
         <div className="flex items-center gap-3 py-2">
@@ -63,12 +69,48 @@ const JobDetail: React.FC<JobDetailProps> = ({ job, onUpdateJob, onAlert, onRetr
         </div>
       </div>
 
-      <div className={`flex-1 relative ${activeTab === 'chat' ? 'overflow-hidden' : 'overflow-y-auto bg-slate-50/30'}`}>
+      <div className="flex-1 relative overflow-y-auto bg-slate-50/30">
         {activeTab === 'status' && (
           <div className="max-w-xl mx-auto space-y-8 py-12 px-6 pb-24">
             <div className="text-center mb-8">
-               <h2 className="text-lg font-bold text-slate-800 break-words">{job.fileName}</h2>
-               <p className="text-xs text-slate-400 mt-1">建立於 {new Date(job.createdAt).toLocaleString()}</p>
+              {titleDraft === null ? (
+                <div className="flex items-center justify-center gap-2">
+                  <h2 className="text-lg font-bold text-slate-800 break-words">{jobDisplayName(job)}</h2>
+                  <button
+                    type="button"
+                    onClick={() => setTitleDraft(job.title ?? '')}
+                    className="text-slate-300 hover:text-indigo-600 transition-colors p-1"
+                    title="改標題"
+                  >
+                    <i className="fa-solid fa-pen text-xs"></i>
+                  </button>
+                </div>
+              ) : (
+                <form
+                  className="flex items-center justify-center gap-2"
+                  onSubmit={(e) => { e.preventDefault(); saveTitle(); }}
+                >
+                  <input
+                    autoFocus
+                    value={titleDraft}
+                    maxLength={MEETING_TITLE_MAX_LENGTH}
+                    onChange={(e) => setTitleDraft(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Escape') setTitleDraft(null); }}
+                    placeholder="這場會叫什麼"
+                    className="flex-1 max-w-sm border border-indigo-300 rounded-lg px-3 py-1.5 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-200"
+                  />
+                  <button type="submit" className="bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold px-3 py-1.5 rounded-lg">
+                    儲存
+                  </button>
+                  <button type="button" onClick={() => setTitleDraft(null)} className="text-slate-500 hover:text-slate-700 text-xs font-bold px-2 py-1.5">
+                    取消
+                  </button>
+                </form>
+              )}
+              {job.title !== undefined && (
+                <p className="text-xs text-slate-400 mt-1">來源檔案：{job.fileName}</p>
+              )}
+              <p className="text-xs text-slate-400 mt-1">建立於 {new Date(job.createdAt).toLocaleString()}</p>
             </div>
 
             {job.status === JobStatus.FAILED && (
@@ -160,7 +202,7 @@ const JobDetail: React.FC<JobDetailProps> = ({ job, onUpdateJob, onAlert, onRetr
 
         {activeTab === 'transcript' && job.transcript && (
           <TranscriptView 
-            fileName={job.fileName}
+            exportBaseName={jobDownloadBaseName(job)}
             segments={job.transcript}
             polishedContent={job.polishedContent}
             onUpdate={(segments) => onUpdateJob({ transcript: segments })}
@@ -175,10 +217,6 @@ const JobDetail: React.FC<JobDetailProps> = ({ job, onUpdateJob, onAlert, onRetr
             jobMetadata={job} 
             onUpdate={(analysis) => onUpdateJob({ analysis })}
           />
-        )}
-
-        {activeTab === 'chat' && job.transcript && (
-          <ChatView fileName={job.fileName} transcript={job.transcript} />
         )}
       </div>
       

@@ -138,7 +138,7 @@ const SummaryView: React.FC<SummaryViewProps> = ({ analysis, jobMetadata, onUpda
         <div className="px-8 sm:px-12 pt-12 pb-8 border-b border-slate-100">
            <div className="flex justify-between items-start">
              <div>
-               <h1 className="text-2xl sm:text-3xl font-serif font-bold text-slate-900 mb-2">會議記錄</h1>
+               <h1 className="text-2xl sm:text-3xl font-serif font-bold text-slate-900 mb-2">{jobMetadata.title ?? '會議記錄'}</h1>
                <div className="text-xs text-slate-500 font-medium flex gap-4">
                  <span><i className="fa-regular fa-file-audio mr-1.5"></i>{jobMetadata.fileName}</span>
                  <span><i className="fa-regular fa-calendar mr-1.5"></i>{new Date(jobMetadata.createdAt).toLocaleDateString()}</span>
@@ -150,7 +150,7 @@ const SummaryView: React.FC<SummaryViewProps> = ({ analysis, jobMetadata, onUpda
                {/* Context Aware Export Buttons */}
                <div className="flex bg-slate-100 rounded-lg p-0.5" role="group">
                   <button
-                    onClick={() => exportSummaryAsMarkdown(jobMetadata.fileName, analysis)}
+                    onClick={() => exportSummaryAsMarkdown(jobMetadata, analysis)}
                     className="p-1.5 text-slate-500 hover:text-indigo-600 hover:bg-white rounded transition-all"
                     title="匯出 Markdown"
                   >
@@ -158,7 +158,7 @@ const SummaryView: React.FC<SummaryViewProps> = ({ analysis, jobMetadata, onUpda
                   </button>
                   <div className="w-px bg-slate-200 my-1"></div>
                   <button
-                    onClick={() => exportSummaryAsText(jobMetadata.fileName, analysis)}
+                    onClick={() => exportSummaryAsText(jobMetadata, analysis)}
                     className="p-1.5 text-slate-500 hover:text-indigo-600 hover:bg-white rounded transition-all"
                     title="匯出純文字"
                   >

@@ -748,3 +748,18 @@ describe('W4：向量、關聯與排除紀錄', () => {
     expect(db.prepare('SELECT COUNT(*) AS n FROM link_runs').get()).toEqual({ n: 0 });
   });
 });
+
+describe('setTitle', () => {
+  it('寫入標題與 updated_at，其餘欄位不動', () => {
+    newMeeting();
+    const updated = store.setTitle('m-1', '週會', T0 + 5);
+    expect(updated.title).toBe('週會');
+    expect(updated.updated_at).toBe(T0 + 5);
+    expect(updated.status).toBe('CREATED');
+    expect(store.getMeeting('m-1')?.title).toBe('週會');
+  });
+
+  it('找不到 Meeting 時拋錯，不靜默建一筆', () => {
+    expect(() => store.setTitle('nope', '週會', T0)).toThrow('找不到 Meeting nope');
+  });
+});

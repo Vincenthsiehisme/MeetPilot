@@ -36,10 +36,19 @@ export type DroppedFilePick =
  * 例如一段選取的文字或一張圖片連結）、超過 1 個（這裡沒有批次上傳的 UI，選第一個會讓
  * 使用者以為其餘的檔案也送出去了）、型別不對（使用者拖錯檔案，需要知道拖對的話該是什麼格式）。
  */
-export const pickDroppedAudioFile = (files: FileList | readonly File[]): DroppedFilePick => {
+export const pickDroppedAudioFile = (
+  files: FileList | readonly File[],
+  types: readonly string[] = [],
+): DroppedFilePick => {
   const list = Array.from(files);
   if (list.length === 0) {
-    return { ok: false, reason: '沒有偵測到檔案。請直接把錄音檔拖到這個視窗裡。' };
+    // 拖進來的東西沒有變成 File：可能是文字、連結，或來源 App 用瀏覽器接不到的方式交檔
+    //（macOS 有些 App 拖出的是 promised file）。把 dataTransfer.types 列出來，使用者才回報得出是哪一種
+    const detected = types.length > 0 ? types.join('、') : '無';
+    return {
+      ok: false,
+      reason: `沒有偵測到檔案（拖曳內容的型別：${detected}）。請從 Finder 把錄音檔拖到這個視窗裡，或點「建立新任務」選檔。`,
+    };
   }
   if (list.length > 1) {
     return { ok: false, reason: `一次只能拖曳一個檔案（偵測到 ${list.length} 個），請重新拖曳其中一個。` };

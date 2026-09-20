@@ -189,6 +189,10 @@ const SEGMENT_REF_SCHEMA_PROPERTIES = {
 const ANALYSIS_RESPONSE_SCHEMA = {
   type: Type.OBJECT,
   properties: {
+    title: {
+      type: Type.STRING,
+      description: '這場會的標題：15 字內的名詞短語，只用逐字稿出現過的題目與名稱，不加日期、不加「會議」字樣',
+    },
     overview: { type: Type.STRING },
     topics: {
       type: Type.ARRAY,
@@ -232,7 +236,7 @@ const ANALYSIS_RESPONSE_SCHEMA = {
       },
     },
   },
-  required: ['overview', 'topics', 'decisions', 'action_items', 'open_questions'],
+  required: ['title', 'overview', 'topics', 'decisions', 'action_items', 'open_questions'],
 };
 
 /** 模型回的一條題目標籤。落地前還要算比對鍵，見 services/topicExtractor.ts */

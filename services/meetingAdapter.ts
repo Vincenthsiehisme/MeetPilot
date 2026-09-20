@@ -142,6 +142,7 @@ export const meetingToJob = (meeting: Meeting): Job => {
     id: meeting.meeting_id,
     // 三個都可能是 null，最後退回 meeting_id：畫面上至少要有一個認得出是哪一場的字串
     fileName: meeting.source_file_name ?? meeting.title ?? meeting.meeting_id,
+    title: meeting.title ?? undefined,
     fileSize: meeting.source_file_size ?? 0,
     createdAt: meeting.created_at,
     updatedAt: meeting.updated_at,

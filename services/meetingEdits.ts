@@ -14,6 +14,7 @@ import { AudioFileStore } from './audioFileStore';
 import { BUSY_STATUSES } from './meetingApi';
 import { MeetingStatus } from './meetingState';
 import { MeetingStore, TranscriptPatch } from './meetingStore';
+import { checkMeetingTitle } from './meetingTitle';
 
 export interface EditOutcome {
   status: number;
@@ -223,4 +224,26 @@ export function patchAnalysisRequest(
 
   deps.store.replaceAnalysis(meetingId, analysis, updatedAt);
   return { status: 200, body: { analysis } };
+}
+
+/**
+ * 改標題。規則在 meetingTitle.ts，跟 pipeline 填建議標題用同一支檢查。
+ * 分析中回 409 的理由跟另外兩條 PATCH 不同：pipeline 在分析結尾才判「標題還是 null 就填建議」，
+ * 這時放行寫入，剛存的標題會被那個過期的判斷蓋掉，而回應是 200。
+ */
+export function patchTitleRequest(
+  deps: { store: MeetingStore },
+  meetingId: string,
+  body: unknown,
+  updatedAt: number,
+): EditOutcome {
+  const check = checkMeetingTitle(isObject(body) ? body.title : undefined);
+  if (check.ok === false) return fail(400, check.reason);
+
+  const meeting = deps.store.getMeeting(meetingId);
+  if (!meeting) return fail(404, `找不到 Meeting ${meetingId}`);
+  if (isBusy(meeting.status)) return busyError(meetingId, meeting.status, '等它跑完再改標題');
+
+  deps.store.setTitle(meetingId, check.title, updatedAt);
+  return { status: 200, body: { title: check.title } };
 }
