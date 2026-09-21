@@ -21,10 +21,16 @@ const FileUpload: React.FC<FileUploadProps> = ({ onFileSelect, onRejected, varia
   };
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    // 清空 input 以便連續上傳同名檔案（先讀 e.target.files 再清空，事件物件之後不能再用）
+    // `e.target.files` 是 Chrome 內部同一個 FileList 物件、不是快照：先存進變數再清空
+    // `e.target.value` 沒有用，清空的當下這個變數指到的同一份 FileList 也會一起被清空
+    // （2026-09-22 實測確認：`sameObject === true`，清空後 `length` 變 0）。用 `Array.from`
+    // 立刻轉成獨立陣列才是真的「讀到」，不受後面清空 input 影響。這個 bug 讓按鈕選檔全面
+    // 無聲失敗：不噴錯誤、不開選人視窗、不送 request，只有走拖曳的 dataTransfer.files（本來
+    // 就是獨立物件）不受影響，因此使用者只有按鈕選檔會卡住，拖曳一直是好的。
+    const fileList = e.target.files;
+    const files: File[] = fileList ? Array.from(fileList) : [];
     e.target.value = '';
-    if (!files || files.length === 0) return;
+    if (files.length === 0) return;
     // 跟拖曳入口走同一套判準（droppedFiles.ts），兩個入口不該有兩套把關強度
     const pick = pickDroppedAudioFile(files);
     if (pick.ok === false) {
