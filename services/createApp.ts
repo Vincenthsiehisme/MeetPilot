@@ -12,15 +12,17 @@
 import express from 'express';
 import { randomUUID } from 'node:crypto';
 import { Meeting } from '../types';
-import { MeetingView, audioUploadInFlightError, audioUploadQueuedError } from './meetingApi';
+import { MeetingView, NameMentionView, audioUploadInFlightError, audioUploadQueuedError } from './meetingApi';
 import { checkBasicAuth, createRateLimiter, describeBodyParserError, ListenConfig } from './httpGuards';
 import { LlmLogger } from './llmTelemetry';
 import { MeetingStore } from './meetingStore';
+import { PeopleStore } from './peopleStore';
+import { NameResolver } from './nameResolver';
 import { MigrationRecord, isRejected, toMigrationRecord } from './jobMigration';
 import { GeminiServerClient } from './geminiServerClient';
 import { AudioFileStore } from './audioFileStore';
 import { TranscriptionQueue } from './transcriptionQueue';
-import { deleteMeetingRequest, patchAnalysisRequest, patchTitleRequest, patchTranscriptRequest } from './meetingEdits';
+import { deleteMeetingRequest, isBusy, patchAnalysisRequest, patchTitleRequest, patchTranscriptRequest } from './meetingEdits';
 import { checkMeetingTitle } from './meetingTitle';
 import { TopicLinker } from './topicLinker';
 import { runProjection, VaultProjector } from './vaultProjector';
@@ -28,6 +30,10 @@ import { runProjection, VaultProjector } from './vaultProjector';
 export interface AppDeps {
   listenConfig: ListenConfig;
   meetingStore: MeetingStore;
+  /** 人員名單（人名校正 N2）。`F-CREATE` 驗證與會者員編要靠它，一期沒有「不需要名單」這個情境，必填 */
+  peopleStore: PeopleStore;
+  /** 人名比對（人名校正 N4／N5）。跟 peopleStore 同一個理由必填：`needs_review` 確認路由沒有它不成立 */
+  nameResolver: NameResolver;
   audioStore: AudioFileStore;
   transcriptionQueue: TranscriptionQueue;
   geminiClient: GeminiServerClient;
@@ -39,7 +45,7 @@ export interface AppDeps {
 }
 
 export function createApp(deps: AppDeps): express.Express {
-  const { listenConfig, meetingStore, audioStore, transcriptionQueue, geminiClient, llmLogger } = deps;
+  const { listenConfig, meetingStore, peopleStore, nameResolver, audioStore, transcriptionQueue, geminiClient, llmLogger } = deps;
   const topicLinker = deps.topicLinker ?? null;
   const vaultProjector = deps.vaultProjector ?? null;
 
@@ -71,6 +77,25 @@ export function createApp(deps: AppDeps): express.Express {
       hasAudio = false;
     }
     return { ...meeting, has_audio: hasAudio };
+  };
+
+  const listNameMentionViews = (meetingId: string): NameMentionView[] => {
+    const transcript = meetingStore.getTranscript(meetingId);
+    return nameResolver.listNeedsReview(meetingId).map((mention) => {
+      const segmentText = transcript?.segments[mention.segment_index]?.text;
+      if (typeof segmentText !== 'string') {
+        throw new Error(
+          `Meeting ${meetingId} 的 name_mentions 指向不存在的逐字稿段落 ${mention.segment_index}`,
+        );
+      }
+      return {
+        segment_index: mention.segment_index,
+        segment_text: segmentText,
+        original_text: mention.original_text,
+        employee_id: mention.employee_id,
+        method: mention.method as 'short_alias_review' | 'conflict_review',
+      };
+    });
   };
 
   /**
@@ -311,11 +336,29 @@ export function createApp(deps: AppDeps): express.Express {
     }
   });
 
+  // 給上傳畫面的與會者選取器用。只回在職的人：離職的人不該再被選成新會議的與會者，
+  // 即使他過去參與過的舊會議仍然看得到他（那筆資料在 meeting_participants，不受這裡影響）
+  app.get('/api/people', (req, res) => {
+    try {
+      const people = peopleStore.listPeople().filter((p) => p.active);
+      res.json({
+        people: people.map((p) => ({
+          employeeId: p.employee_id,
+          displayName: p.display_name,
+          title: p.title,
+          department: p.department,
+        })),
+      });
+    } catch (err) {
+      handleStoreError(err, res);
+    }
+  });
+
   // 建立一場會。音檔另外用 PUT /api/meetings/:id/audio 送，分兩步是因為上傳要走原始位元組、
   // 不經 body parser，而這些欄位是 JSON；混在一起就得自己解 multipart
   app.post('/api/meetings', (req, res) => {
     try {
-      const { fileName, fileSize, title, meetingContext, tags = [] } = req.body ?? {};
+      const { fileName, fileSize, title, meetingContext, tags = [], participantIds } = req.body ?? {};
       if (typeof fileName !== 'string' || fileName.trim() === '') {
         return res.status(400).json({ error: 'fileName 必須是非空字串' });
       }
@@ -337,6 +380,19 @@ export function createApp(deps: AppDeps): express.Express {
       if (meetingContext !== undefined && typeof meetingContext !== 'string') {
         return res.status(400).json({ error: 'meetingContext 必須是字串' });
       }
+      // D-016：至少一位與會者是 F-CREATE 的前置條件，不是選填的方便欄位。
+      // 空清單靜默放行的話，這場會轉錄與分析呼叫都拿不到人名提示（人名校正三層設計的第 1 層），
+      // 而那個缺口不會有任何錯誤訊息，事後也查不出這場會為什麼沒對到提示
+      if (!Array.isArray(participantIds) || participantIds.length === 0
+        || !participantIds.every((id: unknown) => typeof id === 'string' && id.trim() !== '')) {
+        return res.status(400).json({ error: 'participantIds 必須是至少一個員編字串的陣列' });
+      }
+      // 不信任前端送來的員編：對照名單擋掉打錯字或名單裡沒有的人，錯誤裡列出哪幾個查無此人，
+      // 不讓它一路寫進 meeting_participants 之後才在別處（提示、NameResolver）查無此人時再爆炸
+      const unknownIds = participantIds.filter((id: string) => !peopleStore.getPerson(id));
+      if (unknownIds.length > 0) {
+        return res.status(400).json({ error: `找不到員編：${unknownIds.join('、')}` });
+      }
 
       // randomUUID 不含路徑字元，可以直接當音檔檔名（見 audioFileStore 的 SAFE_MEETING_ID）
       const meetingId = randomUUID();
@@ -347,6 +403,7 @@ export function createApp(deps: AppDeps): express.Express {
         source_file_name: fileName,
         source_file_size: fileSize,
         meeting_context: meetingContext ?? null,
+        participant_ids: participantIds,
       });
       if (tags.length > 0) meetingStore.setTags(meetingId, tags);
 
@@ -381,6 +438,64 @@ export function createApp(deps: AppDeps): express.Express {
         // 關聯與它的覆蓋率（W4）。空陣列要配 status 一起讀，理由在契約檔
         links: meetingStore.getLinks(req.params.id),
         linkRun: meetingStore.getLinkRun(req.params.id),
+        // 與會者（人名校正 N2）跟待確認的人名（N4／N5）：前者是後者的選人來源
+        participantIds: meetingStore.getParticipants(req.params.id),
+        nameMentions: listNameMentionViews(req.params.id),
+      });
+    } catch (err) {
+      handleStoreError(err, res);
+    }
+  });
+
+  /**
+   * 人一鍵確認 needs_review 的人名（人名校正 N5，SDD 1.3.2 第 3 層）。
+   *
+   * 只認這場會的與會者：`needs_review` 本來就是「只在與會者別名集合裡比對」找不出答案的結果，
+   * 確認的對象也只該是與會者，不是全公司名單。確認結果寫進 `person_aliases`（`source = manual`）
+   * 並直接覆寫這場會的 `name_mentions`（`nameResolver.confirmMention`，理由見那支函式的檔頭：
+   * `conflict_review` 沒辦法只靠別名表升級解決）；有分析結果的話同一次也重算
+   * `decided_by_employee_id`／`assignee_employee_id`（FN-14 現在查得到人了）。都是本機查表，
+   * 不花任何 Gemini 額度。
+   */
+  app.post('/api/meetings/:id/name-mentions/confirm', (req, res) => {
+    try {
+      const meetingId = req.params.id;
+      const meeting = meetingStore.getMeeting(meetingId);
+      if (!meeting) return res.status(404).json({ error: `找不到 Meeting ${meetingId}` });
+      if (isBusy(meeting.status)) {
+        return res.status(409).json({
+          error: `Meeting ${meetingId} 目前是 ${meeting.status}，這場正在處理，等它跑完再確認人名`,
+        });
+      }
+
+      const { segment_index: segmentIndex, original_text: originalText, employee_id: employeeId } = req.body ?? {};
+      if (!Number.isInteger(segmentIndex) || segmentIndex < 0) {
+        return res.status(400).json({ error: 'segment_index 必須是非負整數' });
+      }
+      if (typeof originalText !== 'string' || originalText.trim() === '') {
+        return res.status(400).json({ error: 'original_text 必須是非空字串' });
+      }
+      if (typeof employeeId !== 'string' || employeeId.trim() === '') {
+        return res.status(400).json({ error: 'employee_id 必須是非空字串' });
+      }
+      const participantIds = meetingStore.getParticipants(meetingId);
+      if (!participantIds.includes(employeeId)) {
+        return res.status(400).json({ error: `員編 ${employeeId} 不是這場會的與會者，只能確認成與會者名單裡的人` });
+      }
+
+      // 直接覆寫這場會的 name_mentions，不是重跑 resolveTranscript：conflict_review 沒辦法
+      // 只靠別名表升級解決（另一個候選人還在別名集合裡），重跑比對只會再判一次 conflict_review，
+      // 使用者確認就等於沒做（見 nameResolver.ts 的 confirmMention 檔頭說明）
+      nameResolver.confirmMention(meetingId, segmentIndex, originalText, employeeId, Date.now());
+
+      const analysis = meetingStore.getAnalysis(meetingId);
+      if (analysis) {
+        const overrides = nameResolver.listResolvedByText(meetingId);
+        meetingStore.saveAnalysis(meetingId, nameResolver.resolveAnalysisEmployeeIds(analysis, meetingId, overrides), Date.now());
+      }
+
+      res.json({
+        nameMentions: listNameMentionViews(meetingId),
       });
     } catch (err) {
       handleStoreError(err, res);

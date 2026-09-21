@@ -92,6 +92,15 @@ export interface DecisionV3 {
   evidence: Evidence | null;
   /** 只用逐字稿裡講過的人名；沒明講就是 null，不從語氣或職稱推測 */
   decided_by: string | null;
+  /**
+   * `C-ANALYSIS` v3 → v4（SDD 1.3.2，`NameResolver` 反查，關閉 U-007）。選填（`?`）而不是
+   * 必填 `| null`：這個欄位加在既有的 v3 型別上，`contract_version` 不動，舊資料的 JSON blob
+   * 裡沒有這個 key，`upgradeAnalysisV2ToV3`／`buildAnalysisV3FromModelOutput` 也不用跟著改
+   * ——查不到員編或反查邏輯本身失敗時就是「這個 key 不存在」，跟寫成 `null` 是同一件事，
+   * 不需要特殊的 lazy 升級分支（SDD 1.3.2〈第 3 層〉）。由 `nameResolver.ts` 的
+   * `resolveAnalysisEmployeeIds` 在分析完成後另外補上
+   */
+  decided_by_employee_id?: string | null;
 }
 
 export interface ActionItemV3 {
@@ -105,6 +114,8 @@ export interface ActionItemV3 {
   /** 逐字稿講的原話（例如「下週三」），不換算成日期；沒講就是 null */
   due: string | null;
   evidence: Evidence | null;
+  /** 同 `DecisionV3.decided_by_employee_id`，由 `nameResolver.ts` 反查 `assignee` 補上 */
+  assignee_employee_id?: string | null;
 }
 
 export interface OpenQuestionV3 {

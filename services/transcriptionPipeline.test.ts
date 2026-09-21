@@ -9,12 +9,15 @@ import { openMeetingDb } from './meetingDb';
 import { MeetingStore, createMeetingStore } from './meetingStore';
 import { SLICE_OVERLAP_SECONDS } from './transcriptMerge';
 import { createTopicExtractor } from './topicExtractor';
+import { PeopleStore, createPeopleStore } from './peopleStore';
+import { NameResolver, createNameResolver } from './nameResolver';
 import {
   SLICE_DURATION_SECONDS,
   TranscriptionPipelineDeps,
   buildPreviousContext,
   createTranscriptionPipeline,
   requeueInterruptedMeetings,
+  resolveParticipantNames,
 } from './transcriptionPipeline';
 
 const T0 = 1_700_000_000_000;
@@ -216,6 +219,262 @@ describe('run：整場跑完', () => {
     expect(contexts[0]).toBe('');
     expect(contexts[1]).toBe('S: 片段 0');
     expect(contexts[2]).toBe('S: 片段 0\nS: 片段 600');
+  });
+});
+
+describe('resolveParticipantNames（人名校正 N3）', () => {
+  let peopleStore: PeopleStore;
+
+  beforeEach(() => {
+    peopleStore = createPeopleStore(db);
+  });
+
+  it('沒有 peopleStore（null）時回空陣列，不影響既有沒有這個依賴的呼叫端', () => {
+    newMeeting();
+    expect(resolveParticipantNames('m-1', store, null)).toEqual([]);
+  });
+
+  it('這場會沒有與會者時回空陣列，即使 peopleStore 有資料', () => {
+    newMeeting();
+    peopleStore.importRoster(
+      [{ employeeId: 'p-1', displayName: '陳國煌', title: null, email: 'p1@liontravel.com', department: null, aliases: ['Philchen'] }],
+      T0,
+    );
+    expect(resolveParticipantNames('m-1', store, peopleStore)).toEqual([]);
+  });
+
+  it('回傳正名與別名的聯集，去重', () => {
+    peopleStore.importRoster(
+      [{ employeeId: 'p-1', displayName: '陳國煌', title: null, email: 'p1@liontravel.com', department: null, aliases: ['Philchen', 'philchen'] }],
+      T0,
+    );
+    store.createMeeting({ meeting_id: 'm-1', created_at: T0, participant_ids: ['p-1'] });
+
+    expect(resolveParticipantNames('m-1', store, peopleStore).sort()).toEqual(['Philchen', 'philchen', '陳國煌'].sort());
+  });
+
+  it('多個與會者的名字合併成一份清單', () => {
+    peopleStore.importRoster(
+      [
+        { employeeId: 'p-1', displayName: '陳國煌', title: null, email: 'p1@liontravel.com', department: null, aliases: [] },
+        { employeeId: 'p-2', displayName: '陳雅婷', title: null, email: 'p2@liontravel.com', department: null, aliases: ['Tina'] },
+      ],
+      T0,
+    );
+    store.createMeeting({ meeting_id: 'm-1', created_at: T0, participant_ids: ['p-1', 'p-2'] });
+
+    expect(resolveParticipantNames('m-1', store, peopleStore).sort()).toEqual(['Tina', '陳國煌', '陳雅婷'].sort());
+  });
+});
+
+describe('與會者提示接進轉錄與分析呼叫（人名校正 N3）', () => {
+  let peopleStore: PeopleStore;
+
+  beforeEach(() => {
+    peopleStore = createPeopleStore(db);
+    peopleStore.importRoster(
+      [{ employeeId: 'p-1', displayName: '陳國煌', title: null, email: 'p1@liontravel.com', department: null, aliases: ['Philchen'] }],
+      T0,
+    );
+  });
+
+  it('轉錄的每一片與分析呼叫都收到 participantNames', async () => {
+    store.createMeeting({
+      meeting_id: 'm-1', created_at: T0, source_file_name: 'a.m4a', source_file_size: 10, participant_ids: ['p-1'],
+    });
+    const transcribeCalls: (string[] | undefined)[] = [];
+    const analyzeCalls: (string[] | undefined)[] = [];
+    const pipeline = pipelineWith({
+      store,
+      peopleStore,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(THREE_SLICE_DURATION),
+      gemini: fakeGemini({
+        transcribeSlice: async ({ offsetSeconds = 0, participantNames }) => {
+          transcribeCalls.push(participantNames);
+          return [{ start: offsetSeconds, end: offsetSeconds + 30, text: `片段 ${offsetSeconds}`, speaker: 'S' }];
+        },
+        analyzeTranscript: async ({ participantNames }) => {
+          analyzeCalls.push(participantNames);
+          return analysisOutput;
+        },
+      }),
+      now: () => T0 + 1,
+    });
+
+    await pipeline.run('m-1');
+
+    expect(transcribeCalls).toHaveLength(3); // 三片
+    for (const names of transcribeCalls) expect(names?.sort()).toEqual(['Philchen', '陳國煌'].sort());
+    expect(analyzeCalls).toHaveLength(1);
+    expect(analyzeCalls[0]?.sort()).toEqual(['Philchen', '陳國煌'].sort());
+  });
+
+  it('沒帶 peopleStore 時 participantNames 是空陣列，既有不關心人名校正的測試不受影響', async () => {
+    newMeeting(); // 這場會沒有 participant_ids
+    const seen: (string[] | undefined)[] = [];
+    const pipeline = pipelineWith({
+      store,
+      // 刻意不傳 peopleStore：驗證它是真的 optional，不是「忘了給會壞」
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(THREE_SLICE_DURATION),
+      gemini: fakeGemini({
+        transcribeSlice: async ({ offsetSeconds = 0, participantNames }) => {
+          seen.push(participantNames);
+          return [{ start: offsetSeconds, end: offsetSeconds + 30, text: `片段 ${offsetSeconds}`, speaker: 'S' }];
+        },
+      }),
+      now: () => T0 + 1,
+    });
+
+    await pipeline.run('m-1');
+
+    expect(seen.every(names => names?.length === 0)).toBe(true);
+  });
+});
+
+describe('NameResolver 接進 analyze（人名校正 N4）', () => {
+  let peopleStore: PeopleStore;
+  let nameResolver: NameResolver;
+
+  beforeEach(() => {
+    peopleStore = createPeopleStore(db);
+    nameResolver = createNameResolver(db, peopleStore, store);
+    peopleStore.importRoster(
+      [{ employeeId: 'p-1', displayName: '陳國煌', title: null, email: 'p1@liontravel.com', department: null, aliases: ['Philchen'] }],
+      T0,
+    );
+  });
+
+  it('analyzeTranscript 收到的是已解析視圖，不是原始逐字稿', async () => {
+    store.createMeeting({
+      meeting_id: 'm-1', created_at: T0, source_file_name: 'a.m4a', source_file_size: 10, participant_ids: ['p-1'],
+    });
+    let seenTranscript: TranscriptSegment[] = [];
+    const pipeline = pipelineWith({
+      store,
+      peopleStore,
+      nameResolver,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(30),
+      gemini: fakeGemini({
+        transcribeSlice: async () => [{ start: 0, end: 30, text: 'Philchen 報告進度', speaker: 'S' }],
+        analyzeTranscript: async ({ transcript }) => {
+          seenTranscript = transcript;
+          return analysisOutput;
+        },
+      }),
+      now: () => T0 + 1,
+    });
+
+    await pipeline.run('m-1');
+
+    expect(seenTranscript[0].text).toBe('陳國煌 報告進度');
+    // raw 逐字稿不受影響，畫面上看到的仍是原始聽寫
+    expect(store.getTranscript('m-1')!.segments[0].text).toBe('Philchen 報告進度');
+  });
+
+  it('decided_by／assignee 逐字對得上與會者時，存下來的分析帶對應員編', async () => {
+    store.createMeeting({
+      meeting_id: 'm-1', created_at: T0, source_file_name: 'a.m4a', source_file_size: 10, participant_ids: ['p-1'],
+    });
+    const pipeline = pipelineWith({
+      store,
+      peopleStore,
+      nameResolver,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(30),
+      gemini: fakeGemini({
+        transcribeSlice: async () => [{ start: 0, end: 30, text: '討論預算分配', speaker: 'S' }],
+        analyzeTranscript: async () => ({
+          ...analysisOutput,
+          decisions: [{ text: '採用方案 A', segment_from: 1, segment_to: 1, decided_by: '陳國煌' }],
+        }),
+      }),
+      now: () => T0 + 1,
+    });
+
+    await pipeline.run('m-1');
+
+    const analysis = store.getAnalysis('m-1')!;
+    expect(analysis.decisions[0].decided_by_employee_id).toBe('p-1');
+  });
+
+  it('分析完成時把這場會已確認的人名覆寫表帶進 FN-14', async () => {
+    newMeeting();
+    const overrides = new Map([['Tina', 'p-1']]);
+    const resolveAnalysisEmployeeIds = vi.fn((analysis: any, _meetingId: string, received: ReadonlyMap<string, string>) => {
+      expect(received).toBe(overrides);
+      return analysis;
+    });
+    const nameResolver: NameResolver = {
+      resolveTranscript: (_meetingId, segments) => ({ mentions: [], resolvedSegments: [...segments] }),
+      listNeedsReview: () => [],
+      resolveAnalysisEmployeeIds,
+      confirmMention: () => {},
+      listResolvedByText: () => overrides,
+    };
+    const pipeline = pipelineWith({
+      store,
+      nameResolver,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(30),
+      gemini: fakeGemini(),
+      now: () => T0 + 1,
+    });
+
+    await pipeline.run('m-1');
+
+    expect(resolveAnalysisEmployeeIds).toHaveBeenCalledWith(expect.any(Object), 'm-1', overrides);
+  });
+
+  it('NameResolver 比對失敗時不阻塞這場會，改用原始逐字稿分析並照樣進 READY', async () => {
+    store.createMeeting({
+      meeting_id: 'm-1', created_at: T0, source_file_name: 'a.m4a', source_file_size: 10, participant_ids: ['p-1'],
+    });
+    const brokenResolver: NameResolver = {
+      resolveTranscript: () => { throw new Error('比對邏輯壞了'); },
+      listNeedsReview: () => [],
+      resolveAnalysisEmployeeIds: () => { throw new Error('反查邏輯壞了'); },
+      confirmMention: () => { throw new Error('確認邏輯壞了'); },
+      listResolvedByText: () => new Map(),
+    };
+    let seenTranscript: TranscriptSegment[] = [];
+    const pipeline = pipelineWith({
+      store,
+      peopleStore,
+      nameResolver: brokenResolver,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(30),
+      gemini: fakeGemini({
+        transcribeSlice: async () => [{ start: 0, end: 30, text: 'Philchen 報告進度', speaker: 'S' }],
+        analyzeTranscript: async ({ transcript }) => {
+          seenTranscript = transcript;
+          return analysisOutput;
+        },
+      }),
+      now: () => T0 + 1,
+    });
+
+    await pipeline.run('m-1');
+
+    expect(seenTranscript[0].text).toBe('Philchen 報告進度'); // 退回原始逐字稿
+    expect(store.getMeeting('m-1')!.status).toBe('READY');
+  });
+
+  it('沒帶 nameResolver 時既有行為不受影響（既有測試靠這條，optional 是真的 optional）', async () => {
+    newMeeting();
+    const pipeline = pipelineWith({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(30),
+      gemini: fakeGemini(),
+      now: () => T0 + 1,
+    });
+
+    await pipeline.run('m-1');
+
+    expect(store.getMeeting('m-1')!.status).toBe('READY');
   });
 });
 

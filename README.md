@@ -14,6 +14,17 @@ npm install
 npm run dev             # http://127.0.0.1:3000
 ```
 
+### 匯入與會者名單
+
+全新安裝或升級到含與會者功能的版本後，先匯入 roster：
+
+```bash
+npx tsx scripts/importRoster.ts <csv-path>
+```
+
+匯入完成後，`GET /api/people` 才會回傳人員，建立會議時的 `ParticipantPicker` 才能列出與會者。
+名單沒匯入時，至少一位與會者的建立規則會擋下所有新會議。
+
 ## 驗證
 
 ```bash

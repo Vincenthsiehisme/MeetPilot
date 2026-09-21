@@ -39,7 +39,7 @@ const isObject = (v: unknown): v is Record<string, unknown> =>
  *
  * 明寫轉型是因為 tsconfig 沒開 strict，唯讀字面值元組跟 MeetingStatus 收斂不到一起。
  */
-const isBusy = (status: MeetingStatus): boolean =>
+export const isBusy = (status: MeetingStatus): boolean =>
   (BUSY_STATUSES as readonly string[]).includes(status);
 
 const busyError = (meetingId: string, status: MeetingStatus, advice: string): EditOutcome =>
@@ -146,11 +146,18 @@ const isEvidence = (v: unknown): boolean =>
     && v.start <= v.end
   );
 
+// decided_by_employee_id／assignee_employee_id（人名校正 N4，C-ANALYSIS v3→v4）是選填欄位，
+// 不驗的話任意型別（數字、物件）都能原樣存進 JSON blob，下游把它當員編用時才會炸
+// （Codex review 2026-09-21 抓到）。這裡只驗型別，不驗員編存不存在或跟 decided_by／assignee
+// 是否一致——那需要 peopleStore 才能查，是 N5 人工確認流程的責任，不在這支路由的範圍
+const isEmployeeIdField = (v: unknown): boolean => v === undefined || v === null || typeof v === 'string';
+
 const isDecisionV3 = (v: unknown): boolean =>
   isObject(v)
   && typeof v.text === 'string'
   && isEvidence(v.evidence)
-  && (v.decided_by === null || typeof v.decided_by === 'string');
+  && (v.decided_by === null || typeof v.decided_by === 'string')
+  && isEmployeeIdField(v.decided_by_employee_id);
 
 /**
  * action_items 的每一筆都要完整驗。
@@ -169,7 +176,8 @@ const isActionItemV3 = (v: unknown): boolean =>
   && (v.status === 'unknown' || v.status === 'open' || v.status === 'done')
   && (v.assignee === null || typeof v.assignee === 'string')
   && (v.due === null || typeof v.due === 'string')
-  && isEvidence(v.evidence);
+  && isEvidence(v.evidence)
+  && isEmployeeIdField(v.assignee_employee_id);
 
 const isOpenQuestionV3 = (v: unknown): boolean =>
   isObject(v)

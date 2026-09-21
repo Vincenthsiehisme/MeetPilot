@@ -31,6 +31,20 @@ export interface CreateMeetingRequest {
   title?: string;
   meetingContext?: string;
   tags?: string[];
+  /** 這場會的與會者員編，至少一個（人名校正 N2，SDD D-016）。server 沒收到會拒絕建立 */
+  participantIds: string[];
+}
+
+/** `GET /api/people` 的一列，只給前端選取用，不含 email／active（人名校正 N2） */
+export interface PersonSummary {
+  employeeId: string;
+  displayName: string;
+  title: string | null;
+  department: string | null;
+}
+
+export interface PeopleListResponse {
+  people: PersonSummary[];
 }
 
 /**
@@ -60,11 +74,44 @@ export interface MeetingListResponse {
   meetings: MeetingView[];
 }
 
+/**
+ * 一場會裡待確認的人名比對結果（人名校正 N4／N5，SDD 1.3.2 第 2、3 層）。
+ *
+ * 這是 `services/nameResolver.ts` 的 `NameMention` 的前端安全版本，故意不 import 那個檔案：
+ * 它有 `node:sqlite` 依賴，跟 `meetingStore.ts` 同一個理由不能進前端 bundle（見檔頭）。
+ * 只回 `needs_review` 的兩種（`short_alias_review`／`conflict_review`），確認粒度是段落＋字串。
+ */
+export interface NameMentionView {
+  segment_index: number;
+  /** 該筆提及所在的完整逐字稿段落，讓使用者能分辨同名者 */
+  segment_text: string;
+  original_text: string;
+  /** `short_alias_review` 時是那個唯一候選；`conflict_review` 時是 null，不猜 */
+  employee_id: string | null;
+  method: 'short_alias_review' | 'conflict_review';
+}
+
+/** `POST /api/meetings/:id/name-mentions/confirm`。人一鍵確認 needs_review 的人名（N5） */
+export interface ConfirmNameMentionRequest {
+  segment_index: number;
+  original_text: string;
+  employee_id: string;
+}
+
+export interface ConfirmNameMentionResponse {
+  /** 確認後這場會剩下的 needs_review 名單（已排除剛確認的那一筆） */
+  nameMentions: NameMentionView[];
+}
+
 /** `GET /api/meetings/:id`。transcript 與 analysis 還沒產出時是 null，不是空物件 */
 export interface MeetingDetailResponse {
   meeting: MeetingView;
   transcript: { segments: TranscriptSegment[]; polished_content: string | null } | null;
   analysis: AnalysisV3 | null;
+  /** 這場會的與會者員編（人名校正 N2 必填，N5 的人名確認只能從這裡面選人） */
+  participantIds: string[];
+  /** 還沒確認的人名比對結果（人名校正 N4／N5）。沒有 nameResolver 或還沒轉錄完成時是空陣列 */
+  nameMentions: NameMentionView[];
   /** 使用者建立會議時自己打的會議標籤（`meeting_tags`），只當 prompt 背景 */
   tags: string[];
   /**

@@ -10,6 +10,8 @@ import { GeminiServerClient } from './geminiServerClient';
 import { ListenConfig } from './httpGuards';
 import { openMeetingDb } from './meetingDb';
 import { MeetingStore, createMeetingStore } from './meetingStore';
+import { PeopleStore, createPeopleStore } from './peopleStore';
+import { NameResolver, createNameResolver } from './nameResolver';
 import { MATCH_KEY_VERSION } from './topicTag';
 import { TranscriptionQueue } from './transcriptionQueue';
 import { TopicLinker } from './topicLinker';
@@ -22,9 +24,12 @@ import { createVaultProjector, VaultProjector } from './vaultProjector';
  */
 
 const T0 = 1_700_000_000_000;
+const TEST_EMPLOYEE_ID = 'p-1';
 
 let db: DatabaseSync;
 let store: MeetingStore;
+let peopleStore: PeopleStore;
+let nameResolver: NameResolver;
 let audioDir: string;
 let audioStore: AudioFileStore;
 let server: Server;
@@ -71,6 +76,8 @@ const startWith = async (options: {
       ...options.listenConfig,
     },
     meetingStore: store,
+    peopleStore,
+    nameResolver,
     audioStore: options.audioStore ?? audioStore,
     // 預設佇列照 pipeline.run 的第一步做：只有 CREATED 才推進 TRANSCRIBING（已經在轉的不重設）
     transcriptionQueue: options.queue ?? fakeQueue(id => {
@@ -96,7 +103,9 @@ const start = (options: {
 } = {}) =>
   startWith(options);
 
-const createMeeting = async (body: Record<string, unknown> = { fileName: 'a.m4a', fileSize: 10 }) => {
+const createMeeting = async (
+  body: Record<string, unknown> = { fileName: 'a.m4a', fileSize: 10, participantIds: [TEST_EMPLOYEE_ID] },
+) => {
   const res = await fetch(`${url}/api/meetings`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -115,6 +124,14 @@ const putAudio = (meetingId: string, payload: Buffer, headers: Record<string, st
 beforeEach(() => {
   db = openMeetingDb(':memory:');
   store = createMeetingStore(db);
+  peopleStore = createPeopleStore(db);
+  nameResolver = createNameResolver(db, peopleStore, store);
+  // 既有測試多半不關心與會者，統一先種一個人（TEST_EMPLOYEE_ID），
+  // createMeeting() helper 的預設 body 用它，個別測試要測「查無此人」再自己蓋掉
+  peopleStore.importRoster(
+    [{ employeeId: TEST_EMPLOYEE_ID, displayName: '測試員工', title: null, email: 'test@liontravel.com', department: null, aliases: [] }],
+    T0,
+  );
   audioDir = mkdtempSync(join(tmpdir(), 'meetpilot-app-'));
   audioStore = createAudioFileStore(audioDir);
   enqueued = [];
@@ -125,6 +142,66 @@ afterEach(async () => {
   if (server) await new Promise<void>(resolve => server.close(() => resolve()));
   db.close();
   rmSync(audioDir, { recursive: true, force: true });
+});
+
+describe('POST /api/meetings：與會者必填（D-016）', () => {
+  it('沒有 participantIds 回 400，不靜默放行', async () => {
+    await start();
+    const { status, body } = await createMeeting({ fileName: 'a.m4a', fileSize: 10 });
+    expect(status).toBe(400);
+    expect(body.error).toContain('participantIds');
+  });
+
+  it('participantIds 是空陣列回 400', async () => {
+    await start();
+    const { status } = await createMeeting({ fileName: 'a.m4a', fileSize: 10, participantIds: [] });
+    expect(status).toBe(400);
+  });
+
+  it('participantIds 含查無此人的員編回 400，錯誤訊息列出哪個員編', async () => {
+    await start();
+    const { status, body } = await createMeeting({
+      fileName: 'a.m4a', fileSize: 10, participantIds: [TEST_EMPLOYEE_ID, 'no-such-id'],
+    });
+    expect(status).toBe(400);
+    expect(body.error).toContain('no-such-id');
+  });
+
+  it('合法的 participantIds 寫進 meeting_participants', async () => {
+    await start();
+    peopleStore.importRoster(
+      [{ employeeId: 'p-2', displayName: '第二個人', title: null, email: 'p2@liontravel.com', department: null, aliases: [] }],
+      T0,
+    );
+    const { status, body } = await createMeeting({
+      fileName: 'a.m4a', fileSize: 10, participantIds: [TEST_EMPLOYEE_ID, 'p-2'],
+    });
+    expect(status).toBe(201);
+    expect(store.getParticipants(body.meeting.meeting_id).sort()).toEqual([TEST_EMPLOYEE_ID, 'p-2'].sort());
+  });
+});
+
+describe('GET /api/people', () => {
+  it('只回在職的人，欄位形狀不含 email 與 active', async () => {
+    peopleStore.importRoster(
+      [{ employeeId: 'p-2', displayName: '第二個人', title: '經理', email: 'p2@liontravel.com', department: '某部門', aliases: [] }],
+      T0,
+    );
+    db.prepare('UPDATE people SET active = 0 WHERE employee_id = ?').run('p-2');
+    await start();
+
+    const res = await fetch(`${url}/api/people`);
+    const body = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(body.people).toHaveLength(1); // p-2 離職，不出現
+    expect(body.people[0]).toEqual({
+      employeeId: TEST_EMPLOYEE_ID,
+      displayName: '測試員工',
+      title: null,
+      department: null,
+    });
+  });
 });
 
 describe('PUT /api/meetings/:id/audio', () => {
@@ -402,6 +479,186 @@ describe('GET /api/meetings/:id 的題目標籤（W3）', () => {
     expect(detail.topicTags).toEqual([]);
     expect(detail.meeting.topic_extraction_status).toBeNull();
   });
+});
+
+describe('GET /api/meetings/:id 的 participantIds／nameMentions（人名校正 N4／N5）', () => {
+  it('回這場會的與會者員編，跟建立時送的一致', async () => {
+    await start({ queue: fakeQueue() });
+    const created = await createMeeting({ fileName: 'a.m4a', fileSize: 10, participantIds: [TEST_EMPLOYEE_ID] });
+
+    const detail = await (await fetch(`${url}/api/meetings/${created.body.meeting.meeting_id}`)).json() as any;
+
+    expect(detail.participantIds).toEqual([TEST_EMPLOYEE_ID]);
+  });
+
+  it('needs_review 的人名比對結果會出現在 nameMentions，確認後從清單移除', async () => {
+    await start({ queue: fakeQueue() });
+    // 種第二個人，兩人共用一個兩字短別名，製造 needs_review
+    peopleStore.importRoster(
+      [{ employeeId: 'p-2', displayName: '陳小明', title: null, email: 'p2@liontravel.com', department: null, aliases: ['小明'] }],
+      T0,
+    );
+    const created = await createMeeting({ fileName: 'a.m4a', fileSize: 10, participantIds: [TEST_EMPLOYEE_ID, 'p-2'] });
+    const meetingId = created.body.meeting.meeting_id;
+    store.setStatus(meetingId, 'TRANSCRIBING', T0);
+    store.saveTranscript(meetingId, { segments: [{ start: 0, end: 5, text: '小明報告進度' }], polished_content: null }, T0);
+    nameResolver.resolveTranscript(meetingId, [{ start: 0, end: 5, text: '小明報告進度' }], T0);
+    store.setStatus(meetingId, 'ANALYZING', T0);
+    store.setStatus(meetingId, 'READY', T0);
+
+    const before = await (await fetch(`${url}/api/meetings/${meetingId}`)).json() as any;
+    expect(before.nameMentions).toEqual([{
+      segment_index: 0,
+      segment_text: '小明報告進度',
+      original_text: '小明',
+      employee_id: 'p-2',
+      method: 'short_alias_review',
+    }]);
+
+    const confirmRes = await fetch(`${url}/api/meetings/${meetingId}/name-mentions/confirm`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ segment_index: 0, original_text: '小明', employee_id: 'p-2' }),
+    });
+    expect(confirmRes.status).toBe(200);
+    expect((await confirmRes.json() as any).nameMentions).toEqual([]);
+
+    const after = await (await fetch(`${url}/api/meetings/${meetingId}`)).json() as any;
+    expect(after.nameMentions).toEqual([]);
+  });
+
+  it('conflict_review（撞到兩個員編）確認後也會從清單移除，不會因為另一位候選人還在而重判', async () => {
+    await start({ queue: fakeQueue() });
+    peopleStore.importRoster(
+      [{ employeeId: 'p-2', displayName: '林雅婷', title: null, email: 'p2@liontravel.com', department: null, aliases: ['Tina'] }],
+      T0,
+    );
+    peopleStore.addManualAlias(TEST_EMPLOYEE_ID, 'Tina', T0); // 讓 TEST_EMPLOYEE_ID 也用 Tina，製造衝突
+    const created = await createMeeting({ fileName: 'a.m4a', fileSize: 10, participantIds: [TEST_EMPLOYEE_ID, 'p-2'] });
+    const meetingId = created.body.meeting.meeting_id;
+    store.setStatus(meetingId, 'TRANSCRIBING', T0);
+    store.saveTranscript(meetingId, { segments: [{ start: 0, end: 5, text: 'Tina 說明狀況' }], polished_content: null }, T0);
+    nameResolver.resolveTranscript(meetingId, [{ start: 0, end: 5, text: 'Tina 說明狀況' }], T0);
+    store.setStatus(meetingId, 'ANALYZING', T0);
+    store.setStatus(meetingId, 'READY', T0);
+
+    const before = await (await fetch(`${url}/api/meetings/${meetingId}`)).json() as any;
+    expect(before.nameMentions).toEqual([{
+      segment_index: 0,
+      segment_text: 'Tina 說明狀況',
+      original_text: 'Tina',
+      employee_id: null,
+      method: 'conflict_review',
+    }]);
+
+    const confirmRes = await fetch(`${url}/api/meetings/${meetingId}/name-mentions/confirm`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ segment_index: 0, original_text: 'Tina', employee_id: TEST_EMPLOYEE_ID }),
+    });
+    expect(confirmRes.status).toBe(200);
+    expect((await confirmRes.json() as any).nameMentions).toEqual([]);
+  });
+
+  it('確認後重算 decided_by_employee_id：原本反查不到的決議現在能對上員編', async () => {
+    await start({ queue: fakeQueue() });
+    const created = await createMeeting({ fileName: 'a.m4a', fileSize: 10, participantIds: [TEST_EMPLOYEE_ID] });
+    const meetingId = created.body.meeting.meeting_id;
+    store.setStatus(meetingId, 'TRANSCRIBING', T0);
+    store.saveTranscript(meetingId, { segments: [{ start: 0, end: 5, text: '討論預算' }], polished_content: null }, T0);
+    store.setStatus(meetingId, 'ANALYZING', T0);
+    store.saveAnalysis(meetingId, {
+      contract_version: 3, overview: '摘要', topics: [], open_questions: [],
+      decisions: [{ text: '採用方案 A', evidence: null, decided_by: '小美' }],
+      action_items: [],
+    }, T0);
+    store.setStatus(meetingId, 'READY', T0);
+
+    await fetch(`${url}/api/meetings/${meetingId}/name-mentions/confirm`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ segment_index: 0, original_text: '小美', employee_id: TEST_EMPLOYEE_ID }),
+    });
+
+    const detail = await (await fetch(`${url}/api/meetings/${meetingId}`)).json() as any;
+    expect(detail.analysis.decisions[0].decided_by_employee_id).toBe(TEST_EMPLOYEE_ID);
+  });
+
+  it.each([
+    ['缺 segment_index', { original_text: '小美', employee_id: TEST_EMPLOYEE_ID }, 400, 'segment_index'],
+    ['segment_index 是負數', { segment_index: -1, original_text: '小美', employee_id: TEST_EMPLOYEE_ID }, 400, 'segment_index'],
+    ['缺 original_text', { segment_index: 0 }, 400, 'original_text'],
+    ['original_text 是空字串', { segment_index: 0, original_text: '  ', employee_id: TEST_EMPLOYEE_ID }, 400, 'original_text'],
+    ['缺 employee_id', { segment_index: 0, original_text: '小美' }, 400, 'employee_id'],
+  ])('%s 時回 400', async (_label, body, expectedStatus, expectedFragment) => {
+    await start({ queue: fakeQueue() });
+    const created = await createMeeting();
+    const meetingId = created.body.meeting.meeting_id;
+
+    const res = await fetch(`${url}/api/meetings/${meetingId}/name-mentions/confirm`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    expect(res.status).toBe(expectedStatus);
+    expect((await res.json() as any).error).toContain(expectedFragment);
+  });
+
+  it('employee_id 不是這場會的與會者時回 400，不寫進 person_aliases', async () => {
+    await start({ queue: fakeQueue() });
+    peopleStore.importRoster(
+      [{ employeeId: 'p-outsider', displayName: '局外人', title: null, email: 'x@liontravel.com', department: null, aliases: [] }],
+      T0,
+    );
+    const created = await createMeeting({ fileName: 'a.m4a', fileSize: 10, participantIds: [TEST_EMPLOYEE_ID] });
+    const meetingId = created.body.meeting.meeting_id;
+
+    const res = await fetch(`${url}/api/meetings/${meetingId}/name-mentions/confirm`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ segment_index: 0, original_text: '小美', employee_id: 'p-outsider' }),
+    });
+
+    expect(res.status).toBe(400);
+    expect((await res.json() as any).error).toContain('不是這場會的與會者');
+    expect(peopleStore.listAliasesForEmployees(['p-outsider'])).toEqual([]);
+  });
+
+  it('Meeting 不存在時回 404', async () => {
+    await start({ queue: fakeQueue() });
+    const res = await fetch(`${url}/api/meetings/nope/name-mentions/confirm`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ segment_index: 0, original_text: '小美', employee_id: TEST_EMPLOYEE_ID }),
+    });
+    expect(res.status).toBe(404);
+  });
+
+  it.each(['TRANSCRIBING', 'ANALYZING', 'LINKING'] as const)(
+    'Meeting 是 %s 時確認人名回 409，不寫入 manual alias',
+    async (status) => {
+      await start({ queue: fakeQueue() });
+      const created = await createMeeting();
+      const meetingId = created.body.meeting.meeting_id;
+      store.setStatus(meetingId, 'TRANSCRIBING', T0);
+      if (status === 'ANALYZING' || status === 'LINKING') store.setStatus(meetingId, 'ANALYZING', T0);
+      if (status === 'LINKING') {
+        store.setStatus(meetingId, 'READY', T0);
+        store.setStatus(meetingId, 'LINKING', T0);
+      }
+
+      const res = await fetch(`${url}/api/meetings/${meetingId}/name-mentions/confirm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ segment_index: 0, original_text: '小美', employee_id: TEST_EMPLOYEE_ID }),
+      });
+
+      expect(res.status).toBe(409);
+      expect((await res.json() as any).error).toContain('等它跑完再確認人名');
+      expect(peopleStore.listAliasesForEmployees([TEST_EMPLOYEE_ID]).some((a) => a.alias === '小美')).toBe(false);
+    },
+  );
 });
 
 describe('has_audio', () => {
@@ -713,7 +970,7 @@ describe('POST /api/meetings 帶 title', () => {
   // （2026-09-20 Codex review 抓到）
   it('合法標題 trim 後存下來', async () => {
     await start();
-    const { status, body } = await createMeeting({ fileName: 'a.m4a', fileSize: 10, title: '  週會  ' });
+    const { status, body } = await createMeeting({ fileName: 'a.m4a', fileSize: 10, title: '  週會  ', participantIds: [TEST_EMPLOYEE_ID] });
     expect(status).toBe(201);
     expect(body.meeting.title).toBe('週會');
   });
@@ -721,7 +978,7 @@ describe('POST /api/meetings 帶 title', () => {
   it('空白、超過 100 字、含控制字元的標題回 400，不建立會議', async () => {
     await start();
     for (const title of ['   ', 'x'.repeat(101), '週會\n第二週']) {
-      const { status, body } = await createMeeting({ fileName: 'a.m4a', fileSize: 10, title });
+      const { status, body } = await createMeeting({ fileName: 'a.m4a', fileSize: 10, title, participantIds: [TEST_EMPLOYEE_ID] });
       expect(status).toBe(400);
       expect(body.error).toBeTruthy();
     }
@@ -730,7 +987,7 @@ describe('POST /api/meetings 帶 title', () => {
 
   it('沒給 title 時是 null，不是空字串', async () => {
     await start();
-    const { body } = await createMeeting({ fileName: 'a.m4a', fileSize: 10 });
+    const { body } = await createMeeting({ fileName: 'a.m4a', fileSize: 10, participantIds: [TEST_EMPLOYEE_ID] });
     expect(body.meeting.title).toBeNull();
   });
 });

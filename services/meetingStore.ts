@@ -123,6 +123,14 @@ export interface CreateMeetingInput {
   source_file_name?: string | null;
   source_file_size?: number | null;
   meeting_context?: string | null;
+  /**
+   * 這場會的與會者員編（人名校正 N2，SDD D-016）。**選填在 store 這一層**：
+   * 「至少一位」是 `F-CREATE` 的前置條件（`services/createApp.ts` 的路由驗證），不是
+   * `Meeting` 這個實體本身的資料完整性規則——沒有這條區分，這個既有函式簽章一改成必填，
+   * 全 repo 九個呼叫端（多半是不關心與會者的既有測試）都要跟著補假資料，
+   * 那些測試測的是別的事，不該被這個新規則波及
+   */
+  participant_ids?: readonly string[];
 }
 
 export interface ImportReport {
@@ -259,6 +267,12 @@ export const createMeetingStore = (db: DatabaseSync) => {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertTag = db.prepare('INSERT OR IGNORE INTO meeting_tags (meeting_id, tag) VALUES (?, ?)');
+  const insertParticipant = db.prepare(
+    'INSERT OR IGNORE INTO meeting_participants (meeting_id, employee_id) VALUES (?, ?)',
+  );
+  const selectParticipants = db.prepare(
+    'SELECT employee_id FROM meeting_participants WHERE meeting_id = ? ORDER BY employee_id',
+  );
   const insertTopicTag = db.prepare(`
     INSERT INTO topic_tags (tag_id, meeting_id, title, content, source, corrected_at,
                             match_key, match_key_version, created_at)
@@ -346,24 +360,54 @@ export const createMeetingStore = (db: DatabaseSync) => {
 
     createMeeting: (input: CreateMeetingInput): Meeting => {
       if (getMeeting(input.meeting_id)) throw new Error(`Meeting ${input.meeting_id} 已經存在`);
-      insertMeeting.run(
-        input.meeting_id,
-        input.title ?? null,
-        'CREATED',
-        input.created_at,
-        input.created_at,
-        input.source_file_name ?? null,
-        input.source_file_size ?? null,
-        'native',
-        null,
-        null,
-        null,
-        input.meeting_context ?? null,
-        // 新建的會還沒抽過標籤。這裡寫死 null 而不是省略欄位：省略的話新增欄位時
-        // 會安靜地吃到資料庫預設值，而那不一定是這裡想要的
-        null,
-        null,
-      );
+      const participantIds = input.participant_ids ?? [];
+      // 有帶與會者才開交易：多數既有呼叫端不帶這個欄位，維持原本的單一 INSERT，
+      // 不為了一個大家通常用不到的欄位讓每次建立都多一層交易開銷
+      if (participantIds.length === 0) {
+        insertMeeting.run(
+          input.meeting_id,
+          input.title ?? null,
+          'CREATED',
+          input.created_at,
+          input.created_at,
+          input.source_file_name ?? null,
+          input.source_file_size ?? null,
+          'native',
+          null,
+          null,
+          null,
+          input.meeting_context ?? null,
+          // 新建的會還沒抽過標籤。這裡寫死 null 而不是省略欄位：省略的話新增欄位時
+          // 會安靜地吃到資料庫預設值，而那不一定是這裡想要的
+          null,
+          null,
+        );
+      } else {
+        db.exec('BEGIN');
+        try {
+          insertMeeting.run(
+            input.meeting_id,
+            input.title ?? null,
+            'CREATED',
+            input.created_at,
+            input.created_at,
+            input.source_file_name ?? null,
+            input.source_file_size ?? null,
+            'native',
+            null,
+            null,
+            null,
+            input.meeting_context ?? null,
+            null,
+            null,
+          );
+          for (const employeeId of participantIds) insertParticipant.run(input.meeting_id, employeeId);
+          db.exec('COMMIT');
+        } catch (err) {
+          db.exec('ROLLBACK');
+          throw err;
+        }
+      }
       return requireMeeting(input.meeting_id);
     },
 
@@ -452,8 +496,8 @@ export const createMeetingStore = (db: DatabaseSync) => {
     },
 
     /**
-     * 刪掉整場會。transcripts、analyses、meeting_tags 靠外鍵 cascade 一起走
-     * （meetingDb 開了 `PRAGMA foreign_keys = ON`）；手動逐張刪的話，之後新增的表
+     * 刪掉整場會。transcripts、analyses、meeting_tags、meeting_participants 靠外鍵 cascade
+     * 一起走（meetingDb 開了 `PRAGMA foreign_keys = ON`）；手動逐張刪的話，之後新增的表
      * 只要忘了補一行就會留下對不到 Meeting 的孤兒列。
      *
      * 找不到 Meeting 時拋錯，不靜默當作已經刪掉：呼叫端要分得開「本來就沒有」與「剛剛刪掉」。
@@ -480,6 +524,7 @@ export const createMeetingStore = (db: DatabaseSync) => {
         // 「這份分析跟你剛上傳的檔沒有關係」。中途失敗更糟：留下「新的部分逐字稿 ＋ 上一輪的
         // 會議記錄」這種對不起來的組合。
         db.prepare('DELETE FROM analyses WHERE meeting_id = ?').run(id);
+        db.prepare('DELETE FROM name_mentions WHERE meeting_id = ?').run(id);
         db.prepare(
           'UPDATE meetings SET processed_slices = NULL, total_slices = NULL, updated_at = ? WHERE meeting_id = ?',
         ).run(updatedAt, id);
@@ -515,6 +560,7 @@ export const createMeetingStore = (db: DatabaseSync) => {
       db.exec('BEGIN');
       try {
         writeTranscript(id, next, updatedAt);
+        db.prepare('DELETE FROM name_mentions WHERE meeting_id = ?').run(id);
         db.prepare('UPDATE meetings SET updated_at = ? WHERE meeting_id = ?').run(updatedAt, id);
         db.exec('COMMIT');
       } catch (err) {
@@ -617,6 +663,10 @@ export const createMeetingStore = (db: DatabaseSync) => {
     getTags: (id: string): string[] =>
       (db.prepare('SELECT tag FROM meeting_tags WHERE meeting_id = ? ORDER BY tag').all(id) as { tag: string }[])
         .map(r => r.tag),
+
+    /** 這場會的與會者員編（N3 轉錄／分析提示、N4 NameResolver 比對都靠這份清單縮小範圍） */
+    getParticipants: (id: string): string[] =>
+      (selectParticipants.all(id) as { employee_id: string }[]).map((r) => r.employee_id),
 
     /** 一場會的題目標籤，auto 與 manual 都在裡面（W3）。跟 getTags 是兩件事，見 topicTag.ts 檔頭 */
     getTopicTags: (id: string): TopicTag[] =>

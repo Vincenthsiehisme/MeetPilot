@@ -4,13 +4,16 @@ import JobDashboard from './components/JobDashboard';
 import JobDetail from './components/JobDetail';
 import FileUpload from './components/FileUpload';
 import ConfirmModal from './components/ConfirmModal';
+import ParticipantPicker from './components/ParticipantPicker';
 import { HttpError } from './services/httpError';
-import { MEETING_POLL_INTERVAL_MS, MeetingDetailResponse, MeetingView } from './services/meetingApi';
+import { MEETING_POLL_INTERVAL_MS, MeetingDetailResponse, MeetingView, PersonSummary } from './services/meetingApi';
 import {
+  confirmNameMention,
   deleteMeeting,
   getMeetingDetail,
   importLegacyJobs,
   listMeetings,
+  listPeopleWithSingleRetry,
   patchAnalysis,
   patchTitle,
   patchTranscript,
@@ -103,6 +106,11 @@ const App: React.FC = () => {
   // dragleave 再觸發它自己的 dragenter，布林版本會在兩者之間閃一下 false
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const dragCounter = useRef(0);
+  // 建立新會議前的與會者名單（人名校正 N2）。null 是「還沒讀回來」，picker 用它跟 people 分開判斷
+  const [people, setPeople] = useState<PersonSummary[] | null>(null);
+  const [peopleLoadError, setPeopleLoadError] = useState<string | null>(null);
+  // 選好檔案、等使用者在 picker 裡選完與會者才真的送出（D-016：至少一位是前置條件）
+  const [pendingUploadFile, setPendingUploadFile] = useState<File | null>(null);
   const [confirmConfig, setConfirmConfig] = useState<{
     isOpen: boolean;
     title: string;
@@ -201,6 +209,22 @@ const App: React.FC = () => {
       });
   }, [refreshMeetings, showAlert]);
 
+  const loadPeople = useCallback(async (): Promise<void> => {
+    setPeople(null);
+    setPeopleLoadError(null);
+    try {
+      setPeople(await listPeopleWithSingleRetry());
+    } catch (err: any) {
+      console.error('讀取人員名單失敗', err);
+      setPeopleLoadError(errorText(err));
+    }
+  }, []);
+
+  // 與會者名單只在真的要建立新會議時才需要，但先在開場讀好：picker 打開時使用者不該乾等一次 API 呼叫。
+  useEffect(() => {
+    loadPeople();
+  }, [loadPeople]);
+
   // 選到 server 的會議才去拉內容。本機紀錄的內容本來就在手上，不用再讀一次
   useEffect(() => {
     if (selection === null || selection.source !== 'server') {
@@ -234,8 +258,11 @@ const App: React.FC = () => {
    *
    * 補送這條路絕對不能再 POST 一次：上傳失敗留下的 CREATED 會議要能被救回來，
    * 每失敗一次多一筆殭屍會議的話，那幾筆永遠不會有人去補音檔。
+   *
+   * `participantIds` 只在新建時用得到（D-016），補送既有會議時忽略——那場會的與會者
+   * 已經在建立當下定了，不能事後改。
    */
-  const submitAudioFile = async (file: File, targetMeetingId: string | null) => {
+  const submitAudioFile = async (file: File, targetMeetingId: string | null, participantIds: string[] | null = null) => {
     setBusyMessage(`正在上傳「${file.name}」…`);
     // server 上到底有沒有那場會。補送本來就有；新建這條要等 onCreated 才算數 ——
     // createMeeting 自己失敗時那場會根本不存在，這個旗標決定失敗訊息該講哪一句
@@ -244,6 +271,7 @@ const App: React.FC = () => {
       await submitAudio(
         file,
         targetMeetingId === null ? null : { meetingId: targetMeetingId },
+        participantIds,
         created => {
           meetingExists = true;
           // 上傳是整條裡最久的一段。建立完就先把那場會放進畫面，
@@ -266,7 +294,16 @@ const App: React.FC = () => {
     }
   };
 
-  const addMeeting = (file: File) => submitAudioFile(file, null);
+  // 新建這條先開 picker 選與會者（D-016 必填），選完才真的送出；補送既有會議走 submitAudioFile 原路
+  const addMeeting = (file: File) => setPendingUploadFile(file);
+
+  const handleConfirmParticipants = (participantIds: string[]) => {
+    const file = pendingUploadFile;
+    setPendingUploadFile(null);
+    if (file) submitAudioFile(file, null, participantIds);
+  };
+
+  const handleCancelParticipants = () => setPendingUploadFile(null);
 
   const handleRetryMeeting = async (meetingId: string) => {
     try {
@@ -487,6 +524,23 @@ const App: React.FC = () => {
       showAlert('儲存失敗', translateError(errorText(err)));
     } finally {
       setBusyMessage(null);
+    }
+  };
+
+  /**
+   * 一鍵確認 needs_review 的人名（人名校正 N5）。跟 handleUpdateActiveMeeting 同一個理由，
+   * 寫完重新拉一次 detail：確認會連動改到 analysis 的 decided_by_employee_id／
+   * assignee_employee_id，不只是 nameMentions 清單變短，畫面要反映 server 真的存下來的樣子。
+   */
+  const handleConfirmNameMention = async (segmentIndex: number, originalText: string, employeeId: string) => {
+    if (selection === null || selection.source !== 'server') return;
+    const meetingId = selection.id;
+    try {
+      await confirmNameMention(meetingId, segmentIndex, originalText, employeeId);
+      await refreshActiveDetail(meetingId);
+    } catch (err: any) {
+      console.error('確認人名失敗', err);
+      showAlert('確認失敗', translateError(errorText(err)));
     }
   };
 
@@ -750,13 +804,20 @@ const App: React.FC = () => {
               )}
               {activeJob ? (
                 <div className="flex-1 overflow-y-auto">
-                  <JobDetail 
-                    job={activeJob} 
+                  <JobDetail
+                    job={activeJob}
                     onUpdateJob={handleUpdateActiveMeeting}
                     onAlert={showAlert}
                     onRetry={selection !== null && selection.source === 'server'
                       ? handleRetryMeeting
                       : showLocalRetryNotice}
+                    participants={selection !== null && selection.source === 'server' && activeDetail !== null
+                      ? (people ?? []).filter((p) => activeDetail.participantIds.includes(p.employeeId))
+                      : []}
+                    nameMentions={selection !== null && selection.source === 'server' && activeDetail !== null
+                      ? activeDetail.nameMentions
+                      : []}
+                    onConfirmNameMention={handleConfirmNameMention}
                   />
                 </div>
               ) : (
@@ -788,6 +849,15 @@ const App: React.FC = () => {
         isDestructive={confirmConfig.isDestructive}
         hideCancel={confirmConfig.hideCancel}
         onCancel={closeConfirm}
+      />
+
+      <ParticipantPicker
+        isOpen={pendingUploadFile !== null}
+        people={people}
+        loadError={peopleLoadError}
+        onRetry={loadPeople}
+        onConfirm={handleConfirmParticipants}
+        onCancel={handleCancelParticipants}
       />
     </div>
   );

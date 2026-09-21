@@ -11,6 +11,7 @@ import { AnalysisV3 } from './analysisContract';
 import { errorFromResponse } from './httpResponse';
 import {
   AUDIO_CONTENT_TYPE,
+  ConfirmNameMentionResponse,
   CreateMeetingRequest,
   DeleteMeetingResponse,
   ImportRequest,
@@ -19,10 +20,13 @@ import {
   MeetingListResponse,
   MeetingResponse,
   MeetingView,
+  NameMentionView,
   PatchAnalysisResponse,
   PatchTitleResponse,
   PatchTranscriptRequest,
   PatchTranscriptResponse,
+  PeopleListResponse,
+  PersonSummary,
 } from './meetingApi';
 
 async function requestJson<T>(endpoint: string, init: RequestInit): Promise<T> {
@@ -77,6 +81,21 @@ export const listMeetings = async (): Promise<MeetingView[]> => {
   return data.meetings;
 };
 
+/** 建立會議前的與會者選取用（人名校正 N2）。只回在職的人 */
+export const listPeople = async (): Promise<PersonSummary[]> => {
+  const data = await requestJson<PeopleListResponse>('/api/people', { method: 'GET' });
+  return data.people;
+};
+
+/** 開場載入名單失敗時自動再試一次；兩次都失敗才交給畫面顯示錯誤。 */
+export const listPeopleWithSingleRetry = async (): Promise<PersonSummary[]> => {
+  try {
+    return await listPeople();
+  } catch {
+    return listPeople();
+  }
+};
+
 export const getMeetingDetail = (meetingId: string): Promise<MeetingDetailResponse> =>
   requestJson<MeetingDetailResponse>(meetingPath(meetingId), { method: 'GET' });
 
@@ -125,6 +144,24 @@ export const patchAnalysis = async (meetingId: string, analysis: AnalysisV3): Pr
   return data.analysis;
 };
 
+/**
+ * 一鍵確認 needs_review 的人名（人名校正 N5）。employeeId 不是這場會的與會者時 server 回 400。
+ * 回傳這場會確認後剩下的 needs_review 清單，呼叫端可以直接拿它更新畫面，不用重打一次會議詳情。
+ */
+export const confirmNameMention = async (
+  meetingId: string,
+  segmentIndex: number,
+  originalText: string,
+  employeeId: string,
+): Promise<NameMentionView[]> => {
+  const data = await requestJson<ConfirmNameMentionResponse>(meetingPath(meetingId, '/name-mentions/confirm'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ segment_index: segmentIndex, original_text: originalText, employee_id: employeeId }),
+  });
+  return data.nameMentions;
+};
+
 /** 改標題。空字串、超過 100 字或含控制字元時 server 回 400；分析中回 409，訊息原樣顯示 */
 export const patchTitle = async (meetingId: string, title: string): Promise<string> => {
   const data = await requestJson<PatchTitleResponse>(meetingPath(meetingId, '/title'), {
@@ -148,15 +185,23 @@ export const patchTitle = async (meetingId: string, title: string): Promise<stri
  *
  * onCreated 在「建立成功、還沒開始上傳」時呼叫：上傳是整條裡最久的一段，呼叫端要在這個時間點
  * 就把那場會放進畫面，失敗時使用者才找得到它去補音檔。
+ *
+ * `participantIds` 只在新建（`target === null`）時有意義：既有會議在建立當下已經定過與會者
+ * （D-016 不允許事後改），補送音檔這條路不重新宣告一次。
  */
 export const submitAudio = async (
   file: File,
   target: { meetingId: string } | null,
+  participantIds: string[] | null,
   onCreated?: (meeting: MeetingView) => void
 ): Promise<MeetingView> => {
   if (target !== null) return uploadAudio(target.meetingId, file);
 
-  const created = await createMeeting({ fileName: file.name, fileSize: file.size });
+  const created = await createMeeting({
+    fileName: file.name,
+    fileSize: file.size,
+    participantIds: participantIds ?? [],
+  });
   if (onCreated) onCreated(created);
   return uploadAudio(created.meeting_id, file);
 };

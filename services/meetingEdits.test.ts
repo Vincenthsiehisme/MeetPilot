@@ -288,6 +288,11 @@ describe('PATCH /api/meetings/:id/analysis', () => {
       '形狀不是 C-ANALYSIS v3',
     ],
     [
+      'decisions 的 decided_by_employee_id 不是字串或 null',
+      { analysis: { ...edited, decisions: [{ text: 'x', evidence: null, decided_by: null, decided_by_employee_id: 42 }] } },
+      '形狀不是 C-ANALYSIS v3',
+    ],
+    [
       'open_questions 不是陣列',
       { analysis: { ...edited, open_questions: '不是陣列' } },
       '形狀不是 C-ANALYSIS v3',
@@ -338,6 +343,9 @@ describe('PATCH /api/meetings/:id/analysis', () => {
     ['assignee 不是字串或 null', { text: 't', source_meeting_id: 'm-1', created_at: T0, status: 'open', assignee: 42, due: null, evidence: null }],
     ['due 不是字串或 null', { text: 't', source_meeting_id: 'm-1', created_at: T0, status: 'open', assignee: null, due: 42, evidence: null }],
     ['evidence 不是 null 或 {start,end}', { text: 't', source_meeting_id: 'm-1', created_at: T0, status: 'open', assignee: null, due: null, evidence: '不對' }],
+    // 人名校正 N4：assignee_employee_id 是選填欄位，不驗型別的話任意值都能原樣存進 JSON blob
+    // （Codex review 2026-09-21 抓到）
+    ['assignee_employee_id 不是字串或 null', { text: 't', source_meeting_id: 'm-1', created_at: T0, status: 'open', assignee: null, due: null, evidence: null, assignee_employee_id: 42 }],
   ])('action_items 的 %s 時回 400，不讓壞形狀原樣落地', (_label, item) => {
     readyMeeting();
 
@@ -365,6 +373,24 @@ describe('PATCH /api/meetings/:id/analysis', () => {
 
     expect(outcome.status).toBe(200);
     expect(store.getAnalysis('m-1')?.action_items[0].status).toBe('done');
+  });
+
+  it('decided_by_employee_id／assignee_employee_id 是字串或 undefined 時正常收下（人名校正 N4）', () => {
+    readyMeeting();
+
+    const outcome = patchAnalysisRequest({ store }, 'm-1', {
+      analysis: {
+        ...edited,
+        decisions: [{ text: 'x', evidence: null, decided_by: '陳國煌', decided_by_employee_id: 'p-1' }],
+        action_items: [{
+          text: 't', source_meeting_id: 'm-1', created_at: T0, status: 'done',
+          assignee: null, due: null, evidence: null, assignee_employee_id: undefined,
+        }],
+      },
+    }, T1);
+
+    expect(outcome.status).toBe(200);
+    expect(store.getAnalysis('m-1')?.decisions[0].decided_by_employee_id).toBe('p-1');
   });
 
   it('Meeting 不存在時回 404', () => {

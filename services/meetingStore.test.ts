@@ -125,6 +125,41 @@ describe('createMeeting', () => {
   });
 });
 
+describe('createMeeting 的 participant_ids（人名校正 N2，D-016）', () => {
+  const seedPerson = (employeeId: string) => {
+    db.prepare(
+      'INSERT INTO people (employee_id, display_name, email, active, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)',
+    ).run(employeeId, `測試-${employeeId}`, `${employeeId}@liontravel.com`, T0, T0);
+  };
+
+  it('不帶 participant_ids 時行為不變（既有呼叫端不受影響）', () => {
+    const m = store.createMeeting({ meeting_id: 'm-1', created_at: T0 });
+    expect(m.status).toBe('CREATED');
+    expect(store.getParticipants('m-1')).toEqual([]);
+  });
+
+  it('帶 participant_ids 時一併寫入 meeting_participants', () => {
+    seedPerson('p-1');
+    seedPerson('p-2');
+    store.createMeeting({ meeting_id: 'm-1', created_at: T0, participant_ids: ['p-1', 'p-2'] });
+    expect(store.getParticipants('m-1').sort()).toEqual(['p-1', 'p-2']);
+  });
+
+  it('participant_ids 指到不存在的員編時整筆連 Meeting 都不建立（同一個交易，FK 擋下）', () => {
+    expect(() => store.createMeeting({ meeting_id: 'm-1', created_at: T0, participant_ids: ['no-such-id'] }))
+      .toThrow();
+    expect(store.getMeeting('m-1')).toBeNull();
+  });
+
+  it('刪除 Meeting 時 meeting_participants 隨外鍵 cascade 一起清掉', () => {
+    seedPerson('p-1');
+    store.createMeeting({ meeting_id: 'm-1', created_at: T0, participant_ids: ['p-1'] });
+    store.deleteMeeting('m-1');
+    expect(db.prepare('SELECT COUNT(*) c FROM meeting_participants WHERE meeting_id = ?').get('m-1'))
+      .toMatchObject({ c: 0 });
+  });
+});
+
 describe('setStatus', () => {
   it('合法轉移寫得進去', () => {
     newMeeting();
@@ -368,6 +403,20 @@ describe('resetTranscriptionProgress', () => {
     expect(store.getAnalysis('m-1')).toBeNull();
   });
 
+  it('重新上傳音檔時清掉舊逐字稿的人名提及', () => {
+    newMeeting();
+    db.prepare(
+      'INSERT INTO name_mentions '
+      + '(mention_id, meeting_id, segment_index, original_text, employee_id, method, confidence, created_at) '
+      + 'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    ).run('mention-1', 'm-1', 0, 'Tina', null, 'conflict_review', 0, T0);
+
+    store.resetTranscriptionProgress('m-1', T0 + 1);
+
+    expect((db.prepare('SELECT COUNT(*) AS count FROM name_mentions WHERE meeting_id = ?')
+      .get('m-1') as { count: number }).count).toBe(0);
+  });
+
   it('本來就沒有逐字稿時照樣跑得完，不拋錯', () => {
     newMeeting();
     expect(() => store.resetTranscriptionProgress('m-1', T0 + 1)).not.toThrow();
@@ -375,6 +424,27 @@ describe('resetTranscriptionProgress', () => {
 
   it('Meeting 不存在時拋錯', () => {
     expect(() => store.resetTranscriptionProgress('nope', T0)).toThrow(/找不到 Meeting nope/);
+  });
+});
+
+describe('updateTranscript', () => {
+  it('人工修改逐字稿時清掉已失效的人名提及', () => {
+    newMeeting();
+    store.saveTranscript('m-1', { segments: [{ start: 0, end: 1, text: 'Tina 發言' }], polished_content: null }, T0);
+    db.prepare(
+      'INSERT INTO name_mentions '
+      + '(mention_id, meeting_id, segment_index, original_text, employee_id, method, confidence, created_at) '
+      + 'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    ).run('mention-1', 'm-1', 0, 'Tina', null, 'conflict_review', 0, T0);
+
+    store.updateTranscript(
+      'm-1',
+      { segments: [{ start: 0, end: 1, text: '已移除舊人名' }] },
+      T0 + 1,
+    );
+
+    expect((db.prepare('SELECT COUNT(*) AS count FROM name_mentions WHERE meeting_id = ?')
+      .get('m-1') as { count: number }).count).toBe(0);
   });
 });
 

@@ -1,10 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
+  confirmNameMention,
   createMeeting,
   deleteMeeting,
   getMeetingDetail,
   importLegacyJobs,
   listMeetings,
+  listPeopleWithSingleRetry,
   patchAnalysis,
   patchTitle,
   patchTranscript,
@@ -69,14 +71,14 @@ describe('meetingClient', () => {
 
     const file = new File([new Uint8Array([1, 2, 3])], 'a.m4a', { type: 'audio/mp4' });
 
-    const createdBack = await createMeeting({ fileName: file.name, fileSize: file.size });
+    const createdBack = await createMeeting({ fileName: file.name, fileSize: file.size, participantIds: ['p-1'] });
     expect(createdBack).toEqual(created);
 
     const [createUrl, createInit] = fetchMock.mock.calls[0];
     expect(createUrl).toBe('/api/meetings');
     expect(createInit.method).toBe('POST');
     expect(createInit.headers['Content-Type']).toBe('application/json');
-    expect(JSON.parse(createInit.body)).toEqual({ fileName: 'a.m4a', fileSize: 3 });
+    expect(JSON.parse(createInit.body)).toEqual({ fileName: 'a.m4a', fileSize: 3, participantIds: ['p-1'] });
 
     const uploaded = await uploadAudio(createdBack.meeting_id, file);
     expect(uploaded).toEqual(transcribing);
@@ -114,6 +116,17 @@ describe('meetingClient', () => {
     expect((await retryMeeting('m_1')).status).toBe('TRANSCRIBING');
     expect(fetchMock.mock.calls[2][0]).toBe('/api/meetings/m_1/retry');
     expect(fetchMock.mock.calls[2][1].method).toBe('POST');
+  });
+
+  it('人員名單第一次載入失敗時自動重試一次', async () => {
+    fetchMock
+      .mockRejectedValueOnce(new Error('network down'))
+      .mockResolvedValueOnce(respond(200, JSON.stringify({
+        people: [{ employeeId: 'p-1', displayName: '陳國煌', title: null, department: null }],
+      })));
+
+    await expect(listPeopleWithSingleRetry()).resolves.toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it('搬遷把 jobs 與 blobIds 一起送到 import 端點', async () => {
@@ -221,7 +234,7 @@ describe('meetingClient', () => {
     fetchMock.mockResolvedValueOnce(respond(202, JSON.stringify({ meeting: meeting({ status: 'TRANSCRIBING' }) })));
     const onCreated = vi.fn();
 
-    const back = await submitAudio(new File(['x'], 'b.wav'), { meetingId: 'm_existing' }, onCreated);
+    const back = await submitAudio(new File(['x'], 'b.wav'), { meetingId: 'm_existing' }, null, onCreated);
 
     expect(back.status).toBe('TRANSCRIBING');
     expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -239,7 +252,7 @@ describe('meetingClient', () => {
       .mockResolvedValueOnce(respond(202, JSON.stringify({ meeting: meeting({ status: 'TRANSCRIBING' }) })));
     const onCreated = vi.fn();
 
-    await submitAudio(new File(['x'], 'a.m4a'), null, onCreated);
+    await submitAudio(new File(['x'], 'a.m4a'), null, ['p-1'], onCreated);
 
     expect(fetchMock.mock.calls.map(([url, init]: any[]) => `${init.method} ${url}`)).toEqual([
       'POST /api/meetings',
@@ -254,7 +267,7 @@ describe('meetingClient', () => {
       .mockResolvedValueOnce(respond(500, JSON.stringify({ error: '寫入音檔失敗' })));
     const onCreated = vi.fn();
 
-    await expect(submitAudio(new File(['x'], 'a.m4a'), null, onCreated)).rejects.toThrow('寫入音檔失敗');
+    await expect(submitAudio(new File(['x'], 'a.m4a'), null, ['p-1'], onCreated)).rejects.toThrow('寫入音檔失敗');
     expect(onCreated).toHaveBeenCalledWith(meeting());
   });
 
@@ -295,5 +308,23 @@ describe('meetingClient', () => {
     expect(url).toBe('/api/meetings/m_1/title');
     expect(init.method).toBe('PATCH');
     expect(JSON.parse(init.body)).toEqual({ title: ' 週會 ' });
+  });
+
+  it('確認人名打 POST /name-mentions/confirm，body 帶 segment_index／original_text／employee_id', async () => {
+    fetchMock.mockResolvedValueOnce(respond(200, JSON.stringify({ nameMentions: [] })));
+
+    await expect(confirmNameMention('m_1', 3, '小明', 'p-1')).resolves.toEqual([]);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe('/api/meetings/m_1/name-mentions/confirm');
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(init.body)).toEqual({ segment_index: 3, original_text: '小明', employee_id: 'p-1' });
+  });
+
+  it('確認的人不是這場會的與會者時回 400，訊息帶出來', async () => {
+    fetchMock.mockResolvedValueOnce(respond(400, JSON.stringify({ error: '員編 p-2 不是這場會的與會者' })));
+
+    const err = await confirmNameMention('m_1', 0, '小明', 'p-2').catch((e: unknown) => e);
+    expect((err as HttpError).status).toBe(400);
+    expect((err as HttpError).message).toBe('員編 p-2 不是這場會的與會者');
   });
 });

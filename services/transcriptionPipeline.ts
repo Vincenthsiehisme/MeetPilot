@@ -17,6 +17,8 @@ import { AudioSlicer, planSlices } from './audioSlicer';
 import { GeminiServerClient } from './geminiServerClient';
 import { MeetingStore } from './meetingStore';
 import { checkMeetingTitle } from './meetingTitle';
+import { NameResolver } from './nameResolver';
+import { PeopleStore } from './peopleStore';
 import { SeamReportEntry } from './meetingApi';
 import { DEFAULT_SEAM_REPAIR, RepairResult, SeamRepairConfig, repairSeamGap } from './seamRepair';
 import { TopicExtractor } from './topicExtractor';
@@ -30,6 +32,21 @@ export const SLICE_DURATION_SECONDS = 10 * 60;
 
 export interface TranscriptionPipelineDeps {
   store: MeetingStore;
+  /**
+   * 人員名單（人名校正 N3）。轉錄與分析呼叫靠它把與會者姓名塞進提示，見 resolveParticipantNames。
+   * **型別上是 optional／nullable，但跟 `vaultProjector` 同一個理由**：不是使用者可關的功能開關，
+   * `server.ts` 一律建一個真的；optional 只是為了讓不驗證人名提示的既有測試不用注入一個真的
+   */
+  peopleStore?: PeopleStore | null;
+  /**
+   * 人名校正第 2 層（N4，SDD 1.3.2）。轉錄完成、分析之前的確定性比對，插在 `analyze()`
+   * 讀到逐字稿之後、送進 `analyzeTranscript` 之前。**型別上是 optional／nullable，跟
+   * `peopleStore` 同一個理由**：`server.ts` 一律建一個真的，optional 只是為了讓不驗證
+   * 人名比對的既有測試不用注入一個真的。比對邏輯本身失敗時這裡接住，讓整場會照舊用
+   * 原始逐字稿分析、`decided_by_employee_id`／`assignee_employee_id` 留空，不阻塞這場會
+   * 進 READY（同 `topicLinker` 失敗不阻塞可見性的精神）
+   */
+  nameResolver?: NameResolver | null;
   audioStore: AudioFileStore;
   slicer: AudioSlicer;
   gemini: GeminiServerClient;
@@ -72,8 +89,39 @@ export function buildPreviousContext(transcript: readonly TranscriptSegment[]): 
     .slice(-1000);
 }
 
+/**
+ * 這場會與會者的正名與已知別名，塞進轉錄／分析呼叫的提示（人名校正 N3，SDD 1.3.2 第 1 層）。
+ * 沒有與會者（尚未做人名校正的舊資料、或這場會建立時還沒有這個規則）就回空陣列，
+ * `geminiServerClient.ts` 收到空陣列時不會改變既有 prompt。
+ *
+ * 名字集合是「員編本身的正名」聯集「person_aliases 裡的所有別名」：後者在匯入當下
+ * 已經含正名的一種寫法（見 rosterImport.ts 的 buildAliasCandidates），這裡仍然兩者都查，
+ * 不假設匯入資料一定完整——manual 建立的 Person 可能沒有任何別名。
+ */
+export function resolveParticipantNames(
+  meetingId: string,
+  store: Pick<MeetingStore, 'getParticipants'>,
+  peopleStore: Pick<PeopleStore, 'getPerson' | 'listAliasesForEmployees'> | null,
+): string[] {
+  if (!peopleStore) return [];
+  const employeeIds = store.getParticipants(meetingId);
+  if (employeeIds.length === 0) return [];
+
+  const names = new Set<string>();
+  for (const employeeId of employeeIds) {
+    const person = peopleStore.getPerson(employeeId);
+    if (person) names.add(person.display_name);
+  }
+  for (const alias of peopleStore.listAliasesForEmployees(employeeIds)) {
+    names.add(alias.alias);
+  }
+  return Array.from(names);
+}
+
 export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
   const { store, audioStore, slicer, gemini, topicExtractor } = deps;
+  const peopleStore = deps.peopleStore ?? null;
+  const nameResolver = deps.nameResolver ?? null;
   const topicLinker = deps.topicLinker ?? null;
   const vaultProjector = deps.vaultProjector ?? null;
   const now = deps.now ?? (() => Date.now());
@@ -98,6 +146,8 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
     const seamReport: SeamReportEntry[] = store.getSeamReport(meetingId) ?? [];
     // 額度跨接縫共用。續傳時重新給滿：這一輪是新的一次執行，沿用上一輪的殘額沒有意義
     let repairBudgetLeft = repairConfig.budget;
+    // 整場會算一次就好：與會者名單在轉錄過程中不會變，不用每片重查
+    const participantNames = resolveParticipantNames(meetingId, store, peopleStore);
 
     store.setSliceProgress(meetingId, processedSlices, plan.length, now());
 
@@ -111,6 +161,7 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
         previousContext: buildPreviousContext(transcript),
         mimeType: 'audio/wav',
         sliceDurationSeconds: slice.durationSeconds,
+        participantNames,
         meetingId,
       });
 
@@ -134,6 +185,7 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
                 previousContext: buildPreviousContext(transcript),
                 mimeType: 'audio/wav',
                 sliceDurationSeconds: durationSeconds,
+                participantNames,
                 meetingId,
               });
             },
@@ -205,17 +257,52 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
       throw new Error(`Meeting ${meetingId} 的每一片都沒有轉出內容，不進分析`);
     }
 
+    // 人名校正第 2 層（N4）：轉錄完成、分析之前的確定性比對。raw transcript.segments 不動，
+    // analyzeTranscript 讀的是已解析視圖；段落索引不變，所以下面算出處時仍用 raw segments。
+    // 比對邏輯本身失敗不阻塞這場會，退回用原始逐字稿分析（同 topicLinker 失敗不阻塞可見性）
+    let resolvedSegments = transcript.segments;
+    if (nameResolver) {
+      try {
+        resolvedSegments = nameResolver.resolveTranscript(meetingId, transcript.segments, now()).resolvedSegments;
+      } catch (err) {
+        console.error(`[Transcription] Meeting ${meetingId} 人名比對失敗，這場會的分析改用原始逐字稿：`, err);
+      }
+    }
+
+    // 跟上面 resolveTranscript 同一顆風險：peopleStore 的查詢若持續性失敗（例如資料庫壞了），
+    // 沒包這層的話上面才剛 catch 住、宣稱「已退回原始逐字稿」，這裡又用同一組查詢再拋一次，
+    // 讓整場會還是變 FAILED，「人名相關失敗不阻塞分析」的承諾就沒做到（Codex review 2026-09-21 抓到）
+    let participantNames: string[] = [];
+    try {
+      participantNames = resolveParticipantNames(meetingId, store, peopleStore);
+    } catch (err) {
+      console.error(`[Transcription] Meeting ${meetingId} 讀與會者名單失敗，分析呼叫不帶人名提示：`, err);
+    }
+
     const output = await gemini.analyzeTranscript({
-      transcript: transcript.segments,
+      transcript: resolvedSegments,
       meetingTags: store.getTags(meetingId),
       meetingContext: meeting.meeting_context ?? '',
       meetingId,
+      participantNames,
     });
-    store.saveAnalysis(
-      meetingId,
-      buildAnalysisV3FromModelOutput(output, transcript.segments, meetingId, now()),
-      now(),
-    );
+    let analysis = buildAnalysisV3FromModelOutput(output, transcript.segments, meetingId, now());
+
+    // FN-14：反查 decided_by／assignee 對應的員編（關閉 U-007）。失敗不阻塞分析落地，
+    // 兩個欄位就停在 buildAnalysisV3FromModelOutput 給的值（undefined，效果同 null）
+    if (nameResolver) {
+      try {
+        analysis = nameResolver.resolveAnalysisEmployeeIds(
+          analysis,
+          meetingId,
+          nameResolver.listResolvedByText(meetingId),
+        );
+      } catch (err) {
+        console.error(`[Transcription] Meeting ${meetingId} 反查決議／待辦的員編失敗：`, err);
+      }
+    }
+
+    store.saveAnalysis(meetingId, analysis, now());
 
     // 建議標題只在還沒有的時候填：使用者改過的名字不能被下一次分析洗掉。
     // 模型給的標題不合規則（空、超長、控制字元）時標題留 null 並記 log，不讓這場會 FAILED——
