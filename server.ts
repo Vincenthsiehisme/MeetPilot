@@ -6,6 +6,7 @@ import { createLlmLogger, resolveLlmLogPath } from './services/llmTelemetry';
 import { openMeetingDb, resolveDbPath } from './services/meetingDb';
 import { createMeetingStore } from './services/meetingStore';
 import { createPeopleStore } from './services/peopleStore';
+import { importRosterFromFile, resolveRosterCsvPath } from './services/rosterImportRunner';
 import { createNameResolver } from './services/nameResolver';
 import { createGeminiServerClient } from './services/geminiServerClient';
 import { createAudioFileStore, resolveAudioDir } from './services/audioFileStore';
@@ -32,8 +33,27 @@ const llmLogger = createLlmLogger(resolveLlmLogPath(process.env));
 const meetingDb = openMeetingDb(resolveDbPath(process.env));
 const meetingStore = createMeetingStore(meetingDb);
 // 人員名單（人名校正 N1／N2）。同一個 DB 檔案，跟 meetingStore 共用交易與備份邊界，
-// 名單怎麼進來是 scripts/importRoster.ts 的事，這裡只負責讀
+// 手動匯入仍是 scripts/importRoster.ts 的事（CLI 而非 API，2026-09-21 決策不變）。
+// 這裡只是啟動時的方便：people 表還是空的、且設了 MEETPILOT_ROSTER_CSV 時自動補一次
+// 同一套匯入邏輯，省得每次重建資料庫都要記得手動下指令（2026-09-22 決策）。
+// CSV 格式錯誤要在這裡爆，不要吞掉讓 server 帶著沒匯入名單的假象繼續跑。
 const peopleStore = createPeopleStore(meetingDb);
+const rosterCsvPath = resolveRosterCsvPath(process.env);
+if (peopleStore.listPeople().length === 0) {
+  if (rosterCsvPath) {
+    const outcome = importRosterFromFile(rosterCsvPath, peopleStore, Date.now());
+    console.log(
+      `[MeetPilot] 啟動時自動匯入人員名單（${rosterCsvPath}）：`
+      + `people ${outcome.peopleWritten} 筆，person_aliases 新增 ${outcome.aliasesAdded} 筆`,
+    );
+  } else {
+    console.warn(
+      '[MeetPilot] 人員名單是空的：建立會議需要至少一位與會者，上傳會卡在選人畫面。'
+      + '設定 MEETPILOT_ROSTER_CSV 讓 server 啟動時自動匯入，或手動執行'
+      + ' `npx tsx scripts/importRoster.ts <csv-path>`。',
+    );
+  }
+}
 // 人名校正第 2 層（人名校正 N4）。同一個 DB 檔案，`name_mentions` 表跟其他資料共用
 // 交易與備份邊界，理由同 peopleStore
 const nameResolver = createNameResolver(meetingDb, peopleStore, meetingStore);

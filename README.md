@@ -25,6 +25,10 @@ npx tsx scripts/importRoster.ts <csv-path>
 匯入完成後，`GET /api/people` 才會回傳人員，建立會議時的 `ParticipantPicker` 才能列出與會者。
 名單沒匯入時，至少一位與會者的建立規則會擋下所有新會議。
 
+設了 `MEETPILOT_ROSTER_CSV`（見 `.env.example`）的話，server 啟動時若 people 表還是空的會自動
+跑一次上面同一套匯入邏輯，不用每次重建資料庫都手動下指令；不設就維持原本行為，仍要手動執行
+CLI。這仍然是 CLI 邏輯的重用，不是新增的 API 端點或前端介面。
+
 ## 驗證
 
 ```bash
