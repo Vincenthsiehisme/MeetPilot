@@ -17,6 +17,7 @@ import { checkBasicAuth, createRateLimiter, describeBodyParserError, ListenConfi
 import { LlmLogger } from './llmTelemetry';
 import { MeetingStore } from './meetingStore';
 import { PeopleStore } from './peopleStore';
+import { NameResolver } from './nameResolver';
 import { MigrationRecord, isRejected, toMigrationRecord } from './jobMigration';
 import { GeminiServerClient } from './geminiServerClient';
 import { AudioFileStore } from './audioFileStore';
@@ -31,6 +32,8 @@ export interface AppDeps {
   meetingStore: MeetingStore;
   /** 人員名單（人名校正 N2）。`F-CREATE` 驗證與會者員編要靠它，一期沒有「不需要名單」這個情境，必填 */
   peopleStore: PeopleStore;
+  /** 人名比對（人名校正 N4／N5）。跟 peopleStore 同一個理由必填：`needs_review` 確認路由沒有它不成立 */
+  nameResolver: NameResolver;
   audioStore: AudioFileStore;
   transcriptionQueue: TranscriptionQueue;
   geminiClient: GeminiServerClient;
@@ -42,7 +45,7 @@ export interface AppDeps {
 }
 
 export function createApp(deps: AppDeps): express.Express {
-  const { listenConfig, meetingStore, peopleStore, audioStore, transcriptionQueue, geminiClient, llmLogger } = deps;
+  const { listenConfig, meetingStore, peopleStore, nameResolver, audioStore, transcriptionQueue, geminiClient, llmLogger } = deps;
   const topicLinker = deps.topicLinker ?? null;
   const vaultProjector = deps.vaultProjector ?? null;
 
@@ -416,6 +419,64 @@ export function createApp(deps: AppDeps): express.Express {
         // 關聯與它的覆蓋率（W4）。空陣列要配 status 一起讀，理由在契約檔
         links: meetingStore.getLinks(req.params.id),
         linkRun: meetingStore.getLinkRun(req.params.id),
+        // 與會者（人名校正 N2）跟待確認的人名（N4／N5）：前者是後者的選人來源
+        participantIds: meetingStore.getParticipants(req.params.id),
+        nameMentions: nameResolver.listNeedsReview(req.params.id).map((m) => ({
+          original_text: m.original_text,
+          employee_id: m.employee_id,
+          method: m.method as 'short_alias_review' | 'conflict_review',
+        })),
+      });
+    } catch (err) {
+      handleStoreError(err, res);
+    }
+  });
+
+  /**
+   * 人一鍵確認 needs_review 的人名（人名校正 N5，SDD 1.3.2 第 3 層）。
+   *
+   * 只認這場會的與會者：`needs_review` 本來就是「只在與會者別名集合裡比對」找不出答案的結果，
+   * 確認的對象也只該是與會者，不是全公司名單。確認結果寫進 `person_aliases`（`source = manual`）
+   * 並直接覆寫這場會的 `name_mentions`（`nameResolver.confirmMention`，理由見那支函式的檔頭：
+   * `conflict_review` 沒辦法只靠別名表升級解決）；有分析結果的話同一次也重算
+   * `decided_by_employee_id`／`assignee_employee_id`（FN-14 現在查得到人了）。都是本機查表，
+   * 不花任何 Gemini 額度。
+   */
+  app.post('/api/meetings/:id/name-mentions/confirm', (req, res) => {
+    try {
+      const meetingId = req.params.id;
+      const meeting = meetingStore.getMeeting(meetingId);
+      if (!meeting) return res.status(404).json({ error: `找不到 Meeting ${meetingId}` });
+
+      const { original_text: originalText, employee_id: employeeId } = req.body ?? {};
+      if (typeof originalText !== 'string' || originalText.trim() === '') {
+        return res.status(400).json({ error: 'original_text 必須是非空字串' });
+      }
+      if (typeof employeeId !== 'string' || employeeId.trim() === '') {
+        return res.status(400).json({ error: 'employee_id 必須是非空字串' });
+      }
+      const participantIds = meetingStore.getParticipants(meetingId);
+      if (!participantIds.includes(employeeId)) {
+        return res.status(400).json({ error: `員編 ${employeeId} 不是這場會的與會者，只能確認成與會者名單裡的人` });
+      }
+
+      // 直接覆寫這場會的 name_mentions，不是重跑 resolveTranscript：conflict_review 沒辦法
+      // 只靠別名表升級解決（另一個候選人還在別名集合裡），重跑比對只會再判一次 conflict_review，
+      // 使用者確認就等於沒做（見 nameResolver.ts 的 confirmMention 檔頭說明）
+      nameResolver.confirmMention(meetingId, originalText, employeeId, Date.now());
+
+      const analysis = meetingStore.getAnalysis(meetingId);
+      if (analysis) {
+        const overrides = nameResolver.listResolvedByText(meetingId);
+        meetingStore.saveAnalysis(meetingId, nameResolver.resolveAnalysisEmployeeIds(analysis, meetingId, overrides), Date.now());
+      }
+
+      res.json({
+        nameMentions: nameResolver.listNeedsReview(meetingId).map((m) => ({
+          original_text: m.original_text,
+          employee_id: m.employee_id,
+          method: m.method as 'short_alias_review' | 'conflict_review',
+        })),
       });
     } catch (err) {
       handleStoreError(err, res);

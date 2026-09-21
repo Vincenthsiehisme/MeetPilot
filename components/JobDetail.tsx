@@ -3,17 +3,26 @@ import React, { useEffect, useState } from 'react';
 import { Job, JobStatus, StepStatus } from '../types';
 import TranscriptView from './TranscriptView';
 import SummaryView from './SummaryView';
+import NameReviewPanel from './NameReviewPanel';
 import { exportJobAsJSON, exportErrorAsJSON } from '../services/exportUtils';
 import { MEETING_TITLE_MAX_LENGTH, checkMeetingTitle, jobDisplayName, jobDownloadBaseName } from '../services/meetingTitle';
+import { NameMentionView, PersonSummary } from '../services/meetingApi';
 
 interface JobDetailProps {
   job: Job;
   onUpdateJob: (updates: Partial<Job>) => void;
   onAlert: (title: string, message: string) => void;
   onRetry?: (id: string) => void;
+  /** 這場會的與會者（人名校正 N2）。本機舊紀錄沒有這個概念，傳空陣列 */
+  participants?: PersonSummary[];
+  /** 還沒確認的人名（人名校正 N4／N5）。本機舊紀錄沒有這個概念，傳空陣列 */
+  nameMentions?: NameMentionView[];
+  onConfirmNameMention?: (originalText: string, employeeId: string) => void | Promise<void>;
 }
 
-const JobDetail: React.FC<JobDetailProps> = ({ job, onUpdateJob, onAlert, onRetry }) => {
+const JobDetail: React.FC<JobDetailProps> = ({
+  job, onUpdateJob, onAlert, onRetry, participants = [], nameMentions = [], onConfirmNameMention,
+}) => {
   const [activeTab, setActiveTab] = useState<'status' | 'transcript' | 'summary'>('status');
   // null 是「沒在編輯標題」；編輯中是輸入框裡的草稿
   const [titleDraft, setTitleDraft] = useState<string | null>(null);
@@ -186,6 +195,14 @@ const JobDetail: React.FC<JobDetailProps> = ({ job, onUpdateJob, onAlert, onRetr
                 ))}
               </div>
             </div>
+
+            {nameMentions.length > 0 && onConfirmNameMention && (
+              <NameReviewPanel
+                participants={participants}
+                nameMentions={nameMentions}
+                onConfirm={onConfirmNameMention}
+              />
+            )}
 
             {/* Data Management Section */}
             {(job.status === JobStatus.COMPLETED || job.status === JobStatus.FAILED) && (

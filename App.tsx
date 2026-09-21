@@ -8,6 +8,7 @@ import ParticipantPicker from './components/ParticipantPicker';
 import { HttpError } from './services/httpError';
 import { MEETING_POLL_INTERVAL_MS, MeetingDetailResponse, MeetingView, PersonSummary } from './services/meetingApi';
 import {
+  confirmNameMention,
   deleteMeeting,
   getMeetingDetail,
   importLegacyJobs,
@@ -518,6 +519,23 @@ const App: React.FC = () => {
     }
   };
 
+  /**
+   * 一鍵確認 needs_review 的人名（人名校正 N5）。跟 handleUpdateActiveMeeting 同一個理由，
+   * 寫完重新拉一次 detail：確認會連動改到 analysis 的 decided_by_employee_id／
+   * assignee_employee_id，不只是 nameMentions 清單變短，畫面要反映 server 真的存下來的樣子。
+   */
+  const handleConfirmNameMention = async (originalText: string, employeeId: string) => {
+    if (selection === null || selection.source !== 'server') return;
+    const meetingId = selection.id;
+    try {
+      await confirmNameMention(meetingId, originalText, employeeId);
+      await refreshActiveDetail(meetingId);
+    } catch (err: any) {
+      console.error('確認人名失敗', err);
+      showAlert('確認失敗', translateError(errorText(err)));
+    }
+  };
+
   const downloadLocalAudio = async (target: AudioBackupTarget) => {
     try {
       const blob = await getFileBlob(target.meetingId);
@@ -778,13 +796,20 @@ const App: React.FC = () => {
               )}
               {activeJob ? (
                 <div className="flex-1 overflow-y-auto">
-                  <JobDetail 
-                    job={activeJob} 
+                  <JobDetail
+                    job={activeJob}
                     onUpdateJob={handleUpdateActiveMeeting}
                     onAlert={showAlert}
                     onRetry={selection !== null && selection.source === 'server'
                       ? handleRetryMeeting
                       : showLocalRetryNotice}
+                    participants={selection !== null && selection.source === 'server' && activeDetail !== null
+                      ? (people ?? []).filter((p) => activeDetail.participantIds.includes(p.employeeId))
+                      : []}
+                    nameMentions={selection !== null && selection.source === 'server' && activeDetail !== null
+                      ? activeDetail.nameMentions
+                      : []}
+                    onConfirmNameMention={handleConfirmNameMention}
                   />
                 </div>
               ) : (

@@ -11,6 +11,7 @@ import { AnalysisV3 } from './analysisContract';
 import { errorFromResponse } from './httpResponse';
 import {
   AUDIO_CONTENT_TYPE,
+  ConfirmNameMentionResponse,
   CreateMeetingRequest,
   DeleteMeetingResponse,
   ImportRequest,
@@ -19,6 +20,7 @@ import {
   MeetingListResponse,
   MeetingResponse,
   MeetingView,
+  NameMentionView,
   PatchAnalysisResponse,
   PatchTitleResponse,
   PatchTranscriptRequest,
@@ -131,6 +133,23 @@ export const patchAnalysis = async (meetingId: string, analysis: AnalysisV3): Pr
     body: JSON.stringify({ analysis }),
   });
   return data.analysis;
+};
+
+/**
+ * 一鍵確認 needs_review 的人名（人名校正 N5）。employeeId 不是這場會的與會者時 server 回 400。
+ * 回傳這場會確認後剩下的 needs_review 清單，呼叫端可以直接拿它更新畫面，不用重打一次會議詳情。
+ */
+export const confirmNameMention = async (
+  meetingId: string,
+  originalText: string,
+  employeeId: string,
+): Promise<NameMentionView[]> => {
+  const data = await requestJson<ConfirmNameMentionResponse>(meetingPath(meetingId, '/name-mentions/confirm'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ original_text: originalText, employee_id: employeeId }),
+  });
+  return data.nameMentions;
 };
 
 /** 改標題。空字串、超過 100 字或含控制字元時 server 回 400；分析中回 409，訊息原樣顯示 */

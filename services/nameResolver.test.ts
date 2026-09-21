@@ -100,6 +100,22 @@ describe('resolveTranscript：短別名一律 needs_review', () => {
       { meeting_id: 'm-1', segment_index: 0, original_text: '小明', employee_id: 'p-1', method: 'short_alias_review', confidence: 0 },
     ]);
   });
+
+  // 人名校正 N5：人一鍵確認過的短別名不該下次還是 needs_review，不然「確認」沒有任何效果
+  it('人工確認過的短別名（source=manual）視為 exact，不再是 needs_review', () => {
+    peopleStore.importRoster(
+      [{ employeeId: 'p-1', displayName: '陳小明', title: null, email: 'p1@liontravel.com', department: null, aliases: ['小明'] }],
+      T0,
+    );
+    newMeeting(['p-1']);
+    peopleStore.addManualAlias('p-1', '小明', T0 + 1000);
+
+    const result = resolver.resolveTranscript('m-1', [seg('小明報告進度')], T0);
+    expect(result.mentions).toEqual([
+      { meeting_id: 'm-1', segment_index: 0, original_text: '小明', employee_id: 'p-1', method: 'exact', confidence: 1 },
+    ]);
+    expect(result.resolvedSegments[0].text).toBe('陳小明報告進度');
+  });
 });
 
 describe('resolveTranscript：同一字串撞兩個員編不猜', () => {
@@ -118,6 +134,70 @@ describe('resolveTranscript：同一字串撞兩個員編不猜', () => {
     expect(result.mentions).toEqual([
       { meeting_id: 'm-1', segment_index: 0, original_text: 'Tina', employee_id: null, method: 'conflict_review', confidence: 0 },
     ]);
+  });
+});
+
+describe('confirmMention（人名校正 N5）', () => {
+  it('確認 conflict_review 之後這場會的清單真的清掉，不會因為另一個候選人還在而重判', () => {
+    peopleStore.importRoster(
+      [
+        { employeeId: 'p-1', displayName: '陳雅婷', title: null, email: 'p1@liontravel.com', department: null, aliases: ['Tina'] },
+        { employeeId: 'p-2', displayName: '林雅婷', title: null, email: 'p2@liontravel.com', department: null, aliases: ['Tina'] },
+      ],
+      T0,
+    );
+    newMeeting(['p-1', 'p-2']);
+    resolver.resolveTranscript('m-1', [seg('Tina 說明採購狀況')], T0);
+    expect(resolver.listNeedsReview('m-1')).toHaveLength(1);
+
+    resolver.confirmMention('m-1', 'Tina', 'p-1', T0 + 1000);
+
+    expect(resolver.listNeedsReview('m-1')).toEqual([]);
+    // 別名表仍然是 p-1、p-2 各自有 Tina：確認不會讓另一個候選人從別名集合消失，
+    // 這場會自己的判斷只在這場會生效（見 confirmMention 檔頭）
+    expect(peopleStore.listAliasesForEmployees(['p-1', 'p-2']).filter((a) => a.alias === 'Tina')).toHaveLength(2);
+  });
+
+  it('確認不會讓「另一場會」同樣撞到兩個候選人的情況跟著解掉', () => {
+    peopleStore.importRoster(
+      [
+        { employeeId: 'p-1', displayName: '陳雅婷', title: null, email: 'p1@liontravel.com', department: null, aliases: ['Tina'] },
+        { employeeId: 'p-2', displayName: '林雅婷', title: null, email: 'p2@liontravel.com', department: null, aliases: ['Tina'] },
+      ],
+      T0,
+    );
+    newMeeting(['p-1', 'p-2']);
+    resolver.resolveTranscript('m-1', [seg('Tina 說明採購狀況')], T0);
+    resolver.confirmMention('m-1', 'Tina', 'p-1', T0 + 1000);
+
+    store.createMeeting({ meeting_id: 'm-2', created_at: T0, source_file_name: 'b.m4a', source_file_size: 10, participant_ids: ['p-1', 'p-2'] });
+    const result = resolver.resolveTranscript('m-2', [seg('Tina 也在這場會發言')], T0 + 2000);
+    expect(result.mentions[0].method).toBe('conflict_review');
+  });
+
+  it('確認短別名之後，同一個字串在另一場只有這位候選人的會議直接判 exact', () => {
+    peopleStore.importRoster(
+      [{ employeeId: 'p-1', displayName: '陳小明', title: null, email: 'p1@liontravel.com', department: null, aliases: ['小明'] }],
+      T0,
+    );
+    newMeeting(['p-1']);
+    resolver.resolveTranscript('m-1', [seg('小明報告進度')], T0);
+    resolver.confirmMention('m-1', '小明', 'p-1', T0 + 1000);
+
+    store.createMeeting({ meeting_id: 'm-2', created_at: T0, source_file_name: 'b.m4a', source_file_size: 10, participant_ids: ['p-1'] });
+    const result = resolver.resolveTranscript('m-2', [seg('小明報告進度')], T0 + 2000);
+    expect(result.mentions[0].method).toBe('exact');
+  });
+
+  it('listResolvedByText 只回有員編的字串，needs_review 的不算', () => {
+    peopleStore.importRoster(
+      [{ employeeId: 'p-1', displayName: '陳國煌', title: null, email: 'p1@liontravel.com', department: null, aliases: [] }],
+      T0,
+    );
+    newMeeting(['p-1']);
+    resolver.resolveTranscript('m-1', [seg('陳國煌報告進度')], T0);
+
+    expect(resolver.listResolvedByText('m-1')).toEqual(new Map([['陳國煌', 'p-1']]));
   });
 });
 

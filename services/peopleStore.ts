@@ -80,9 +80,17 @@ export const createPeopleStore = (db: DatabaseSync) => {
     VALUES (?, ?, ?, 'import', NULL, ?)
   `);
 
+  // 跟 insertAliasIfAbsent 不是同一條規則：人工確認（N5）很常見的情境是「這個別名匯入時
+  // 就已經存在，人只是確認它對」（例如自動比對出的兩字短別名，人一鍵確認）。如果也用
+  // INSERT OR IGNORE，既有的 import 列會擋掉這次寫入、source 永遠停在 import，
+  // 人工確認等於沒發生——`NameResolver` 判斷「這個別名是不是已經人工確認過」時只看
+  // source 是不是 manual，短別名規則因此永遠解不掉。這裡改用 UPSERT，把既有列的
+  // source 升級成 manual；反過來（import 蓋掉 manual）永遠不會發生，因為只有這個函式
+  // 寫 source = 'manual'，insertAliasIfAbsent 從來不覆寫任何既有列
   const insertManualAlias = db.prepare(`
-    INSERT OR IGNORE INTO person_aliases (alias_id, employee_id, alias, source, corrected_at, created_at)
+    INSERT INTO person_aliases (alias_id, employee_id, alias, source, corrected_at, created_at)
     VALUES (?, ?, ?, 'manual', ?, ?)
+    ON CONFLICT(employee_id, alias) DO UPDATE SET source = 'manual', corrected_at = excluded.corrected_at
   `);
 
   return {

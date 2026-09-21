@@ -81,6 +81,7 @@ const app = createApp({
   listenConfig,
   meetingStore,
   peopleStore,
+  nameResolver,
   audioStore,
   transcriptionQueue,
   geminiClient,

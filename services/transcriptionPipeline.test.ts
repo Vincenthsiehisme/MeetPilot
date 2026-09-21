@@ -406,7 +406,10 @@ describe('NameResolver 接進 analyze（人名校正 N4）', () => {
     });
     const brokenResolver: NameResolver = {
       resolveTranscript: () => { throw new Error('比對邏輯壞了'); },
+      listNeedsReview: () => [],
       resolveAnalysisEmployeeIds: () => { throw new Error('反查邏輯壞了'); },
+      confirmMention: () => { throw new Error('確認邏輯壞了'); },
+      listResolvedByText: () => new Map(),
     };
     let seenTranscript: TranscriptSegment[] = [];
     const pipeline = pipelineWith({

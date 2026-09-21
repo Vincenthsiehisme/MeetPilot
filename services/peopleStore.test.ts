@@ -121,6 +121,31 @@ describe('addManualAlias', () => {
   it('對不存在的員編加別名要明確報錯，不靜默略過', () => {
     expect(() => store.addManualAlias('no-such-id', '某某', T0)).toThrow(/找不到員編/);
   });
+
+  // 人名校正 N5：needs_review 常見的情境是「這個別名匯入時就已經存在」（例如自動比對出的
+  // 兩字短別名），人只是確認它對。之前用 INSERT OR IGNORE 的話這裡完全沒有效果，
+  // source 永遠停在 import，NameResolver 判斷「有沒有被人工確認過」就永遠是 false
+  it('人工確認一個匯入時已存在的別名，source 從 import 升級成 manual', () => {
+    store.importRoster([person({ aliases: ['小煌'] })], T0);
+    expect(store.listAliasesForEmployees(['4323']).find((a) => a.alias === '小煌')?.source).toBe('import');
+
+    store.addManualAlias('4323', '小煌', T0 + 1000);
+
+    const upgraded = store.listAliasesForEmployees(['4323']).find((a) => a.alias === '小煌');
+    expect(upgraded).toMatchObject({ alias: '小煌', source: 'manual', corrected_at: T0 + 1000 });
+    // 只有這一筆，不是額外多一筆重複的別名列
+    expect(store.listAliasesForEmployees(['4323']).filter((a) => a.alias === '小煌')).toHaveLength(1);
+  });
+
+  it('重複確認同一個別名是冪等的，corrected_at 更新成最新一次', () => {
+    store.importRoster([person({ aliases: [] })], T0);
+    store.addManualAlias('4323', '阿煌', T0 + 1000);
+    store.addManualAlias('4323', '阿煌', T0 + 2000);
+
+    const aliases = store.listAliasesForEmployees(['4323']).filter((a) => a.alias === '阿煌');
+    expect(aliases).toHaveLength(1);
+    expect(aliases[0].corrected_at).toBe(T0 + 2000);
+  });
 });
 
 describe('listAliasesForEmployees', () => {

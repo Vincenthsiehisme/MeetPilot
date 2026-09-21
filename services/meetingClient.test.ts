@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
+  confirmNameMention,
   createMeeting,
   deleteMeeting,
   getMeetingDetail,
@@ -295,5 +296,23 @@ describe('meetingClient', () => {
     expect(url).toBe('/api/meetings/m_1/title');
     expect(init.method).toBe('PATCH');
     expect(JSON.parse(init.body)).toEqual({ title: ' 週會 ' });
+  });
+
+  it('確認人名打 POST /name-mentions/confirm，body 是 original_text／employee_id，回傳剩下的 needs_review 清單', async () => {
+    fetchMock.mockResolvedValueOnce(respond(200, JSON.stringify({ nameMentions: [] })));
+
+    await expect(confirmNameMention('m_1', '小明', 'p-1')).resolves.toEqual([]);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe('/api/meetings/m_1/name-mentions/confirm');
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(init.body)).toEqual({ original_text: '小明', employee_id: 'p-1' });
+  });
+
+  it('確認的人不是這場會的與會者時回 400，訊息帶出來', async () => {
+    fetchMock.mockResolvedValueOnce(respond(400, JSON.stringify({ error: '員編 p-2 不是這場會的與會者' })));
+
+    const err = await confirmNameMention('m_1', '小明', 'p-2').catch((e: unknown) => e);
+    expect((err as HttpError).status).toBe(400);
+    expect((err as HttpError).message).toBe('員編 p-2 不是這場會的與會者');
   });
 });
