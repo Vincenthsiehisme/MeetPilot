@@ -403,6 +403,20 @@ describe('resetTranscriptionProgress', () => {
     expect(store.getAnalysis('m-1')).toBeNull();
   });
 
+  it('重新上傳音檔時清掉舊逐字稿的人名提及', () => {
+    newMeeting();
+    db.prepare(
+      'INSERT INTO name_mentions '
+      + '(mention_id, meeting_id, segment_index, original_text, employee_id, method, confidence, created_at) '
+      + 'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    ).run('mention-1', 'm-1', 0, 'Tina', null, 'conflict_review', 0, T0);
+
+    store.resetTranscriptionProgress('m-1', T0 + 1);
+
+    expect((db.prepare('SELECT COUNT(*) AS count FROM name_mentions WHERE meeting_id = ?')
+      .get('m-1') as { count: number }).count).toBe(0);
+  });
+
   it('本來就沒有逐字稿時照樣跑得完，不拋錯', () => {
     newMeeting();
     expect(() => store.resetTranscriptionProgress('m-1', T0 + 1)).not.toThrow();
@@ -410,6 +424,27 @@ describe('resetTranscriptionProgress', () => {
 
   it('Meeting 不存在時拋錯', () => {
     expect(() => store.resetTranscriptionProgress('nope', T0)).toThrow(/找不到 Meeting nope/);
+  });
+});
+
+describe('updateTranscript', () => {
+  it('人工修改逐字稿時清掉已失效的人名提及', () => {
+    newMeeting();
+    store.saveTranscript('m-1', { segments: [{ start: 0, end: 1, text: 'Tina 發言' }], polished_content: null }, T0);
+    db.prepare(
+      'INSERT INTO name_mentions '
+      + '(mention_id, meeting_id, segment_index, original_text, employee_id, method, confidence, created_at) '
+      + 'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    ).run('mention-1', 'm-1', 0, 'Tina', null, 'conflict_review', 0, T0);
+
+    store.updateTranscript(
+      'm-1',
+      { segments: [{ start: 0, end: 1, text: '已移除舊人名' }] },
+      T0 + 1,
+    );
+
+    expect((db.prepare('SELECT COUNT(*) AS count FROM name_mentions WHERE meeting_id = ?')
+      .get('m-1') as { count: number }).count).toBe(0);
   });
 });
 

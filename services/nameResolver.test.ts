@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
+import { readFileSync } from 'node:fs';
 import { openMeetingDb } from './meetingDb';
 import { createPeopleStore, PeopleStore } from './peopleStore';
 import { createMeetingStore, MeetingStore } from './meetingStore';
@@ -33,6 +34,14 @@ const newMeeting = (participantIds: string[]) => {
     participant_ids: participantIds,
   });
 };
+
+describe('nameResolver 原始碼格式', () => {
+  it('分隔鍵使用文字 escape sequence，檔案本身不含 NUL byte', () => {
+    const source = readFileSync(new URL('./nameResolver.ts', import.meta.url));
+    expect(source.includes(0)).toBe(false);
+    expect(source.toString('utf8')).toContain('\\u0000');
+  });
+});
 
 describe('resolveTranscript：沒有與會者', () => {
   it('沒有與會者時回空 mentions，segments 原樣不動', () => {
@@ -150,7 +159,7 @@ describe('confirmMention（人名校正 N5）', () => {
     resolver.resolveTranscript('m-1', [seg('Tina 說明採購狀況')], T0);
     expect(resolver.listNeedsReview('m-1')).toHaveLength(1);
 
-    resolver.confirmMention('m-1', 'Tina', 'p-1', T0 + 1000);
+    resolver.confirmMention('m-1', 0, 'Tina', 'p-1', T0 + 1000);
 
     expect(resolver.listNeedsReview('m-1')).toEqual([]);
     // 別名表仍然是 p-1、p-2 各自有 Tina：確認不會讓另一個候選人從別名集合消失，
@@ -168,7 +177,7 @@ describe('confirmMention（人名校正 N5）', () => {
     );
     newMeeting(['p-1', 'p-2']);
     resolver.resolveTranscript('m-1', [seg('Tina 說明採購狀況')], T0);
-    resolver.confirmMention('m-1', 'Tina', 'p-1', T0 + 1000);
+    resolver.confirmMention('m-1', 0, 'Tina', 'p-1', T0 + 1000);
 
     store.createMeeting({ meeting_id: 'm-2', created_at: T0, source_file_name: 'b.m4a', source_file_size: 10, participant_ids: ['p-1', 'p-2'] });
     const result = resolver.resolveTranscript('m-2', [seg('Tina 也在這場會發言')], T0 + 2000);
@@ -182,7 +191,7 @@ describe('confirmMention（人名校正 N5）', () => {
     );
     newMeeting(['p-1']);
     resolver.resolveTranscript('m-1', [seg('小明報告進度')], T0);
-    resolver.confirmMention('m-1', '小明', 'p-1', T0 + 1000);
+    resolver.confirmMention('m-1', 0, '小明', 'p-1', T0 + 1000);
 
     store.createMeeting({ meeting_id: 'm-2', created_at: T0, source_file_name: 'b.m4a', source_file_size: 10, participant_ids: ['p-1'] });
     const result = resolver.resolveTranscript('m-2', [seg('小明報告進度')], T0 + 2000);
@@ -198,6 +207,28 @@ describe('confirmMention（人名校正 N5）', () => {
     resolver.resolveTranscript('m-1', [seg('陳國煌報告進度')], T0);
 
     expect(resolver.listResolvedByText('m-1')).toEqual(new Map([['陳國煌', 'p-1']]));
+  });
+
+  it('同字串在不同段落逐筆確認，不會把另一段一起改成同一個人', () => {
+    peopleStore.importRoster(
+      [
+        { employeeId: 'p-1', displayName: '陳雅婷', title: null, email: 'p1@liontravel.com', department: null, aliases: ['Tina'] },
+        { employeeId: 'p-2', displayName: '林雅婷', title: null, email: 'p2@liontravel.com', department: null, aliases: ['Tina'] },
+      ],
+      T0,
+    );
+    newMeeting(['p-1', 'p-2']);
+    resolver.resolveTranscript('m-1', [seg('Tina 報告採購'), seg('Tina 報告行銷')], T0);
+
+    resolver.confirmMention('m-1', 0, 'Tina', 'p-1', T0 + 1000);
+    expect(resolver.listNeedsReview('m-1')).toEqual([
+      expect.objectContaining({ segment_index: 1, original_text: 'Tina', method: 'conflict_review' }),
+    ]);
+
+    resolver.confirmMention('m-1', 1, 'Tina', 'p-2', T0 + 2000);
+    expect(resolver.listNeedsReview('m-1')).toEqual([]);
+    // FN-14 沒有段落來源；兩段同字串指向不同人時不把其中一人誤套到整份分析。
+    expect(resolver.listResolvedByText('m-1').has('Tina')).toBe(false);
   });
 });
 

@@ -503,14 +503,22 @@ describe('GET /api/meetings/:id 的 participantIds／nameMentions（人名校正
     store.setStatus(meetingId, 'TRANSCRIBING', T0);
     store.saveTranscript(meetingId, { segments: [{ start: 0, end: 5, text: '小明報告進度' }], polished_content: null }, T0);
     nameResolver.resolveTranscript(meetingId, [{ start: 0, end: 5, text: '小明報告進度' }], T0);
+    store.setStatus(meetingId, 'ANALYZING', T0);
+    store.setStatus(meetingId, 'READY', T0);
 
     const before = await (await fetch(`${url}/api/meetings/${meetingId}`)).json() as any;
-    expect(before.nameMentions).toEqual([{ original_text: '小明', employee_id: 'p-2', method: 'short_alias_review' }]);
+    expect(before.nameMentions).toEqual([{
+      segment_index: 0,
+      segment_text: '小明報告進度',
+      original_text: '小明',
+      employee_id: 'p-2',
+      method: 'short_alias_review',
+    }]);
 
     const confirmRes = await fetch(`${url}/api/meetings/${meetingId}/name-mentions/confirm`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ original_text: '小明', employee_id: 'p-2' }),
+      body: JSON.stringify({ segment_index: 0, original_text: '小明', employee_id: 'p-2' }),
     });
     expect(confirmRes.status).toBe(200);
     expect((await confirmRes.json() as any).nameMentions).toEqual([]);
@@ -531,14 +539,22 @@ describe('GET /api/meetings/:id 的 participantIds／nameMentions（人名校正
     store.setStatus(meetingId, 'TRANSCRIBING', T0);
     store.saveTranscript(meetingId, { segments: [{ start: 0, end: 5, text: 'Tina 說明狀況' }], polished_content: null }, T0);
     nameResolver.resolveTranscript(meetingId, [{ start: 0, end: 5, text: 'Tina 說明狀況' }], T0);
+    store.setStatus(meetingId, 'ANALYZING', T0);
+    store.setStatus(meetingId, 'READY', T0);
 
     const before = await (await fetch(`${url}/api/meetings/${meetingId}`)).json() as any;
-    expect(before.nameMentions).toEqual([{ original_text: 'Tina', employee_id: null, method: 'conflict_review' }]);
+    expect(before.nameMentions).toEqual([{
+      segment_index: 0,
+      segment_text: 'Tina 說明狀況',
+      original_text: 'Tina',
+      employee_id: null,
+      method: 'conflict_review',
+    }]);
 
     const confirmRes = await fetch(`${url}/api/meetings/${meetingId}/name-mentions/confirm`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ original_text: 'Tina', employee_id: TEST_EMPLOYEE_ID }),
+      body: JSON.stringify({ segment_index: 0, original_text: 'Tina', employee_id: TEST_EMPLOYEE_ID }),
     });
     expect(confirmRes.status).toBe(200);
     expect((await confirmRes.json() as any).nameMentions).toEqual([]);
@@ -556,11 +572,12 @@ describe('GET /api/meetings/:id 的 participantIds／nameMentions（人名校正
       decisions: [{ text: '採用方案 A', evidence: null, decided_by: '小美' }],
       action_items: [],
     }, T0);
+    store.setStatus(meetingId, 'READY', T0);
 
     await fetch(`${url}/api/meetings/${meetingId}/name-mentions/confirm`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ original_text: '小美', employee_id: TEST_EMPLOYEE_ID }),
+      body: JSON.stringify({ segment_index: 0, original_text: '小美', employee_id: TEST_EMPLOYEE_ID }),
     });
 
     const detail = await (await fetch(`${url}/api/meetings/${meetingId}`)).json() as any;
@@ -568,9 +585,11 @@ describe('GET /api/meetings/:id 的 participantIds／nameMentions（人名校正
   });
 
   it.each([
-    ['缺 original_text', {}, 400, 'original_text'],
-    ['original_text 是空字串', { original_text: '  ', employee_id: TEST_EMPLOYEE_ID }, 400, 'original_text'],
-    ['缺 employee_id', { original_text: '小美' }, 400, 'employee_id'],
+    ['缺 segment_index', { original_text: '小美', employee_id: TEST_EMPLOYEE_ID }, 400, 'segment_index'],
+    ['segment_index 是負數', { segment_index: -1, original_text: '小美', employee_id: TEST_EMPLOYEE_ID }, 400, 'segment_index'],
+    ['缺 original_text', { segment_index: 0 }, 400, 'original_text'],
+    ['original_text 是空字串', { segment_index: 0, original_text: '  ', employee_id: TEST_EMPLOYEE_ID }, 400, 'original_text'],
+    ['缺 employee_id', { segment_index: 0, original_text: '小美' }, 400, 'employee_id'],
   ])('%s 時回 400', async (_label, body, expectedStatus, expectedFragment) => {
     await start({ queue: fakeQueue() });
     const created = await createMeeting();
@@ -598,7 +617,7 @@ describe('GET /api/meetings/:id 的 participantIds／nameMentions（人名校正
     const res = await fetch(`${url}/api/meetings/${meetingId}/name-mentions/confirm`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ original_text: '小美', employee_id: 'p-outsider' }),
+      body: JSON.stringify({ segment_index: 0, original_text: '小美', employee_id: 'p-outsider' }),
     });
 
     expect(res.status).toBe(400);
@@ -611,10 +630,35 @@ describe('GET /api/meetings/:id 的 participantIds／nameMentions（人名校正
     const res = await fetch(`${url}/api/meetings/nope/name-mentions/confirm`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ original_text: '小美', employee_id: TEST_EMPLOYEE_ID }),
+      body: JSON.stringify({ segment_index: 0, original_text: '小美', employee_id: TEST_EMPLOYEE_ID }),
     });
     expect(res.status).toBe(404);
   });
+
+  it.each(['TRANSCRIBING', 'ANALYZING', 'LINKING'] as const)(
+    'Meeting 是 %s 時確認人名回 409，不寫入 manual alias',
+    async (status) => {
+      await start({ queue: fakeQueue() });
+      const created = await createMeeting();
+      const meetingId = created.body.meeting.meeting_id;
+      store.setStatus(meetingId, 'TRANSCRIBING', T0);
+      if (status === 'ANALYZING' || status === 'LINKING') store.setStatus(meetingId, 'ANALYZING', T0);
+      if (status === 'LINKING') {
+        store.setStatus(meetingId, 'READY', T0);
+        store.setStatus(meetingId, 'LINKING', T0);
+      }
+
+      const res = await fetch(`${url}/api/meetings/${meetingId}/name-mentions/confirm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ segment_index: 0, original_text: '小美', employee_id: TEST_EMPLOYEE_ID }),
+      });
+
+      expect(res.status).toBe(409);
+      expect((await res.json() as any).error).toContain('等它跑完再確認人名');
+      expect(peopleStore.listAliasesForEmployees([TEST_EMPLOYEE_ID]).some((a) => a.alias === '小美')).toBe(false);
+    },
+  );
 });
 
 describe('has_audio', () => {

@@ -400,6 +400,34 @@ describe('NameResolver 接進 analyze（人名校正 N4）', () => {
     expect(analysis.decisions[0].decided_by_employee_id).toBe('p-1');
   });
 
+  it('分析完成時把這場會已確認的人名覆寫表帶進 FN-14', async () => {
+    newMeeting();
+    const overrides = new Map([['Tina', 'p-1']]);
+    const resolveAnalysisEmployeeIds = vi.fn((analysis: any, _meetingId: string, received: ReadonlyMap<string, string>) => {
+      expect(received).toBe(overrides);
+      return analysis;
+    });
+    const nameResolver: NameResolver = {
+      resolveTranscript: (_meetingId, segments) => ({ mentions: [], resolvedSegments: [...segments] }),
+      listNeedsReview: () => [],
+      resolveAnalysisEmployeeIds,
+      confirmMention: () => {},
+      listResolvedByText: () => overrides,
+    };
+    const pipeline = pipelineWith({
+      store,
+      nameResolver,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(30),
+      gemini: fakeGemini(),
+      now: () => T0 + 1,
+    });
+
+    await pipeline.run('m-1');
+
+    expect(resolveAnalysisEmployeeIds).toHaveBeenCalledWith(expect.any(Object), 'm-1', overrides);
+  });
+
   it('NameResolver 比對失敗時不阻塞這場會，改用原始逐字稿分析並照樣進 READY', async () => {
     store.createMeeting({
       meeting_id: 'm-1', created_at: T0, source_file_name: 'a.m4a', source_file_size: 10, participant_ids: ['p-1'],

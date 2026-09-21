@@ -292,7 +292,11 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
     // 兩個欄位就停在 buildAnalysisV3FromModelOutput 給的值（undefined，效果同 null）
     if (nameResolver) {
       try {
-        analysis = nameResolver.resolveAnalysisEmployeeIds(analysis, meetingId);
+        analysis = nameResolver.resolveAnalysisEmployeeIds(
+          analysis,
+          meetingId,
+          nameResolver.listResolvedByText(meetingId),
+        );
       } catch (err) {
         console.error(`[Transcription] Meeting ${meetingId} 反查決議／待辦的員編失敗：`, err);
       }

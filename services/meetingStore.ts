@@ -524,6 +524,7 @@ export const createMeetingStore = (db: DatabaseSync) => {
         // 「這份分析跟你剛上傳的檔沒有關係」。中途失敗更糟：留下「新的部分逐字稿 ＋ 上一輪的
         // 會議記錄」這種對不起來的組合。
         db.prepare('DELETE FROM analyses WHERE meeting_id = ?').run(id);
+        db.prepare('DELETE FROM name_mentions WHERE meeting_id = ?').run(id);
         db.prepare(
           'UPDATE meetings SET processed_slices = NULL, total_slices = NULL, updated_at = ? WHERE meeting_id = ?',
         ).run(updatedAt, id);
@@ -559,6 +560,7 @@ export const createMeetingStore = (db: DatabaseSync) => {
       db.exec('BEGIN');
       try {
         writeTranscript(id, next, updatedAt);
+        db.prepare('DELETE FROM name_mentions WHERE meeting_id = ?').run(id);
         db.prepare('UPDATE meetings SET updated_at = ? WHERE meeting_id = ?').run(updatedAt, id);
         db.exec('COMMIT');
       } catch (err) {

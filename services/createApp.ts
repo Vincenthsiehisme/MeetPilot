@@ -12,7 +12,7 @@
 import express from 'express';
 import { randomUUID } from 'node:crypto';
 import { Meeting } from '../types';
-import { MeetingView, audioUploadInFlightError, audioUploadQueuedError } from './meetingApi';
+import { MeetingView, NameMentionView, audioUploadInFlightError, audioUploadQueuedError } from './meetingApi';
 import { checkBasicAuth, createRateLimiter, describeBodyParserError, ListenConfig } from './httpGuards';
 import { LlmLogger } from './llmTelemetry';
 import { MeetingStore } from './meetingStore';
@@ -22,7 +22,7 @@ import { MigrationRecord, isRejected, toMigrationRecord } from './jobMigration';
 import { GeminiServerClient } from './geminiServerClient';
 import { AudioFileStore } from './audioFileStore';
 import { TranscriptionQueue } from './transcriptionQueue';
-import { deleteMeetingRequest, patchAnalysisRequest, patchTitleRequest, patchTranscriptRequest } from './meetingEdits';
+import { deleteMeetingRequest, isBusy, patchAnalysisRequest, patchTitleRequest, patchTranscriptRequest } from './meetingEdits';
 import { checkMeetingTitle } from './meetingTitle';
 import { TopicLinker } from './topicLinker';
 import { runProjection, VaultProjector } from './vaultProjector';
@@ -77,6 +77,25 @@ export function createApp(deps: AppDeps): express.Express {
       hasAudio = false;
     }
     return { ...meeting, has_audio: hasAudio };
+  };
+
+  const listNameMentionViews = (meetingId: string): NameMentionView[] => {
+    const transcript = meetingStore.getTranscript(meetingId);
+    return nameResolver.listNeedsReview(meetingId).map((mention) => {
+      const segmentText = transcript?.segments[mention.segment_index]?.text;
+      if (typeof segmentText !== 'string') {
+        throw new Error(
+          `Meeting ${meetingId} 的 name_mentions 指向不存在的逐字稿段落 ${mention.segment_index}`,
+        );
+      }
+      return {
+        segment_index: mention.segment_index,
+        segment_text: segmentText,
+        original_text: mention.original_text,
+        employee_id: mention.employee_id,
+        method: mention.method as 'short_alias_review' | 'conflict_review',
+      };
+    });
   };
 
   /**
@@ -421,11 +440,7 @@ export function createApp(deps: AppDeps): express.Express {
         linkRun: meetingStore.getLinkRun(req.params.id),
         // 與會者（人名校正 N2）跟待確認的人名（N4／N5）：前者是後者的選人來源
         participantIds: meetingStore.getParticipants(req.params.id),
-        nameMentions: nameResolver.listNeedsReview(req.params.id).map((m) => ({
-          original_text: m.original_text,
-          employee_id: m.employee_id,
-          method: m.method as 'short_alias_review' | 'conflict_review',
-        })),
+        nameMentions: listNameMentionViews(req.params.id),
       });
     } catch (err) {
       handleStoreError(err, res);
@@ -447,8 +462,16 @@ export function createApp(deps: AppDeps): express.Express {
       const meetingId = req.params.id;
       const meeting = meetingStore.getMeeting(meetingId);
       if (!meeting) return res.status(404).json({ error: `找不到 Meeting ${meetingId}` });
+      if (isBusy(meeting.status)) {
+        return res.status(409).json({
+          error: `Meeting ${meetingId} 目前是 ${meeting.status}，這場正在處理，等它跑完再確認人名`,
+        });
+      }
 
-      const { original_text: originalText, employee_id: employeeId } = req.body ?? {};
+      const { segment_index: segmentIndex, original_text: originalText, employee_id: employeeId } = req.body ?? {};
+      if (!Number.isInteger(segmentIndex) || segmentIndex < 0) {
+        return res.status(400).json({ error: 'segment_index 必須是非負整數' });
+      }
       if (typeof originalText !== 'string' || originalText.trim() === '') {
         return res.status(400).json({ error: 'original_text 必須是非空字串' });
       }
@@ -463,7 +486,7 @@ export function createApp(deps: AppDeps): express.Express {
       // 直接覆寫這場會的 name_mentions，不是重跑 resolveTranscript：conflict_review 沒辦法
       // 只靠別名表升級解決（另一個候選人還在別名集合裡），重跑比對只會再判一次 conflict_review，
       // 使用者確認就等於沒做（見 nameResolver.ts 的 confirmMention 檔頭說明）
-      nameResolver.confirmMention(meetingId, originalText, employeeId, Date.now());
+      nameResolver.confirmMention(meetingId, segmentIndex, originalText, employeeId, Date.now());
 
       const analysis = meetingStore.getAnalysis(meetingId);
       if (analysis) {
@@ -472,11 +495,7 @@ export function createApp(deps: AppDeps): express.Express {
       }
 
       res.json({
-        nameMentions: nameResolver.listNeedsReview(meetingId).map((m) => ({
-          original_text: m.original_text,
-          employee_id: m.employee_id,
-          method: m.method as 'short_alias_review' | 'conflict_review',
-        })),
+        nameMentions: listNameMentionViews(meetingId),
       });
     } catch (err) {
       handleStoreError(err, res);

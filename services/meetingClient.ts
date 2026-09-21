@@ -87,6 +87,15 @@ export const listPeople = async (): Promise<PersonSummary[]> => {
   return data.people;
 };
 
+/** 開場載入名單失敗時自動再試一次；兩次都失敗才交給畫面顯示錯誤。 */
+export const listPeopleWithSingleRetry = async (): Promise<PersonSummary[]> => {
+  try {
+    return await listPeople();
+  } catch {
+    return listPeople();
+  }
+};
+
 export const getMeetingDetail = (meetingId: string): Promise<MeetingDetailResponse> =>
   requestJson<MeetingDetailResponse>(meetingPath(meetingId), { method: 'GET' });
 
@@ -141,13 +150,14 @@ export const patchAnalysis = async (meetingId: string, analysis: AnalysisV3): Pr
  */
 export const confirmNameMention = async (
   meetingId: string,
+  segmentIndex: number,
   originalText: string,
   employeeId: string,
 ): Promise<NameMentionView[]> => {
   const data = await requestJson<ConfirmNameMentionResponse>(meetingPath(meetingId, '/name-mentions/confirm'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ original_text: originalText, employee_id: employeeId }),
+    body: JSON.stringify({ segment_index: segmentIndex, original_text: originalText, employee_id: employeeId }),
   });
   return data.nameMentions;
 };

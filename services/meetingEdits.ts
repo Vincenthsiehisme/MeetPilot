@@ -39,7 +39,7 @@ const isObject = (v: unknown): v is Record<string, unknown> =>
  *
  * 明寫轉型是因為 tsconfig 沒開 strict，唯讀字面值元組跟 MeetingStatus 收斂不到一起。
  */
-const isBusy = (status: MeetingStatus): boolean =>
+export const isBusy = (status: MeetingStatus): boolean =>
   (BUSY_STATUSES as readonly string[]).includes(status);
 
 const busyError = (meetingId: string, status: MeetingStatus, advice: string): EditOutcome =>

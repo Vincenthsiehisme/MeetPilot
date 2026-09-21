@@ -6,6 +6,7 @@ import {
   getMeetingDetail,
   importLegacyJobs,
   listMeetings,
+  listPeopleWithSingleRetry,
   patchAnalysis,
   patchTitle,
   patchTranscript,
@@ -115,6 +116,17 @@ describe('meetingClient', () => {
     expect((await retryMeeting('m_1')).status).toBe('TRANSCRIBING');
     expect(fetchMock.mock.calls[2][0]).toBe('/api/meetings/m_1/retry');
     expect(fetchMock.mock.calls[2][1].method).toBe('POST');
+  });
+
+  it('人員名單第一次載入失敗時自動重試一次', async () => {
+    fetchMock
+      .mockRejectedValueOnce(new Error('network down'))
+      .mockResolvedValueOnce(respond(200, JSON.stringify({
+        people: [{ employeeId: 'p-1', displayName: '陳國煌', title: null, department: null }],
+      })));
+
+    await expect(listPeopleWithSingleRetry()).resolves.toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it('搬遷把 jobs 與 blobIds 一起送到 import 端點', async () => {
@@ -298,20 +310,20 @@ describe('meetingClient', () => {
     expect(JSON.parse(init.body)).toEqual({ title: ' 週會 ' });
   });
 
-  it('確認人名打 POST /name-mentions/confirm，body 是 original_text／employee_id，回傳剩下的 needs_review 清單', async () => {
+  it('確認人名打 POST /name-mentions/confirm，body 帶 segment_index／original_text／employee_id', async () => {
     fetchMock.mockResolvedValueOnce(respond(200, JSON.stringify({ nameMentions: [] })));
 
-    await expect(confirmNameMention('m_1', '小明', 'p-1')).resolves.toEqual([]);
+    await expect(confirmNameMention('m_1', 3, '小明', 'p-1')).resolves.toEqual([]);
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe('/api/meetings/m_1/name-mentions/confirm');
     expect(init.method).toBe('POST');
-    expect(JSON.parse(init.body)).toEqual({ original_text: '小明', employee_id: 'p-1' });
+    expect(JSON.parse(init.body)).toEqual({ segment_index: 3, original_text: '小明', employee_id: 'p-1' });
   });
 
   it('確認的人不是這場會的與會者時回 400，訊息帶出來', async () => {
     fetchMock.mockResolvedValueOnce(respond(400, JSON.stringify({ error: '員編 p-2 不是這場會的與會者' })));
 
-    const err = await confirmNameMention('m_1', '小明', 'p-2').catch((e: unknown) => e);
+    const err = await confirmNameMention('m_1', 0, '小明', 'p-2').catch((e: unknown) => e);
     expect((err as HttpError).status).toBe(400);
     expect((err as HttpError).message).toBe('員編 p-2 不是這場會的與會者');
   });

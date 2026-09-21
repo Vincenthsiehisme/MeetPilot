@@ -79,10 +79,12 @@ export interface MeetingListResponse {
  *
  * 這是 `services/nameResolver.ts` 的 `NameMention` 的前端安全版本，故意不 import 那個檔案：
  * 它有 `node:sqlite` 依賴，跟 `meetingStore.ts` 同一個理由不能進前端 bundle（見檔頭）。
- * 只回 `needs_review` 的兩種（`short_alias_review`／`conflict_review`），同一場會裡同一個
- * `original_text` 只出現一次（已在 server 端去重），確認一筆會讓同一個字串在這場會全部解決。
+ * 只回 `needs_review` 的兩種（`short_alias_review`／`conflict_review`），確認粒度是段落＋字串。
  */
 export interface NameMentionView {
+  segment_index: number;
+  /** 該筆提及所在的完整逐字稿段落，讓使用者能分辨同名者 */
+  segment_text: string;
   original_text: string;
   /** `short_alias_review` 時是那個唯一候選；`conflict_review` 時是 null，不猜 */
   employee_id: string | null;
@@ -91,6 +93,7 @@ export interface NameMentionView {
 
 /** `POST /api/meetings/:id/name-mentions/confirm`。人一鍵確認 needs_review 的人名（N5） */
 export interface ConfirmNameMentionRequest {
+  segment_index: number;
   original_text: string;
   employee_id: string;
 }

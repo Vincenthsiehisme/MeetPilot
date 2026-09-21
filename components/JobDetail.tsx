@@ -17,7 +17,7 @@ interface JobDetailProps {
   participants?: PersonSummary[];
   /** 還沒確認的人名（人名校正 N4／N5）。本機舊紀錄沒有這個概念，傳空陣列 */
   nameMentions?: NameMentionView[];
-  onConfirmNameMention?: (originalText: string, employeeId: string) => void | Promise<void>;
+  onConfirmNameMention?: (segmentIndex: number, originalText: string, employeeId: string) => void | Promise<void>;
 }
 
 const JobDetail: React.FC<JobDetailProps> = ({

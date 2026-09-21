@@ -4,8 +4,10 @@ import { PersonSummary } from '../services/meetingApi';
 
 interface ParticipantPickerProps {
   isOpen: boolean;
-  /** null 代表名單還沒讀回來（GET /api/people 進行中或失敗），畫面顯示讀取中，不能誤當成「名單是空的」 */
+  /** null 代表名單還沒讀回來；是否失敗由 loadError 明確區分 */
   people: PersonSummary[] | null;
+  loadError: string | null;
+  onRetry: () => void;
   onConfirm: (participantIds: string[]) => void;
   onCancel: () => void;
 }
@@ -14,7 +16,9 @@ interface ParticipantPickerProps {
  * 建立新會議前的與會者選取（人名校正 N2，SDD D-016：至少一位與會者是 F-CREATE 的前置條件）。
  * 388 人的名單需要搜尋才選得動，純捲動清單不夠用。
  */
-const ParticipantPicker: React.FC<ParticipantPickerProps> = ({ isOpen, people, onConfirm, onCancel }) => {
+const ParticipantPicker: React.FC<ParticipantPickerProps> = ({
+  isOpen, people, loadError, onRetry, onConfirm, onCancel,
+}) => {
   const [query, setQuery] = useState('');
   const [selected, setSelected] = useState<Set<string>>(new Set());
 
@@ -87,7 +91,18 @@ const ParticipantPicker: React.FC<ParticipantPickerProps> = ({ isOpen, people, o
             </div>
 
             <div className="flex-1 overflow-y-auto px-4">
-              {people === null ? (
+              {people === null && loadError !== null ? (
+                <div className="py-8 text-center text-sm text-rose-600">
+                  <p>名單讀取失敗：{loadError}</p>
+                  <button
+                    type="button"
+                    onClick={onRetry}
+                    className="mt-3 px-3 py-1.5 rounded-lg bg-rose-50 hover:bg-rose-100 font-bold"
+                  >
+                    重新讀取
+                  </button>
+                </div>
+              ) : people === null ? (
                 <div className="py-8 text-center text-sm text-slate-400">讀取名單中…</div>
               ) : filtered.length === 0 ? (
                 <div className="py-8 text-center text-sm text-slate-400">沒有符合的人</div>

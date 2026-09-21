@@ -13,7 +13,7 @@ import {
   getMeetingDetail,
   importLegacyJobs,
   listMeetings,
-  listPeople,
+  listPeopleWithSingleRetry,
   patchAnalysis,
   patchTitle,
   patchTranscript,
@@ -108,6 +108,7 @@ const App: React.FC = () => {
   const dragCounter = useRef(0);
   // 建立新會議前的與會者名單（人名校正 N2）。null 是「還沒讀回來」，picker 用它跟 people 分開判斷
   const [people, setPeople] = useState<PersonSummary[] | null>(null);
+  const [peopleLoadError, setPeopleLoadError] = useState<string | null>(null);
   // 選好檔案、等使用者在 picker 裡選完與會者才真的送出（D-016：至少一位是前置條件）
   const [pendingUploadFile, setPendingUploadFile] = useState<File | null>(null);
   const [confirmConfig, setConfirmConfig] = useState<{
@@ -208,14 +209,21 @@ const App: React.FC = () => {
       });
   }, [refreshMeetings, showAlert]);
 
-  // 與會者名單只在真的要建立新會議時才需要，但先在開場讀好：picker 打開時使用者不該乾等一次 API 呼叫。
-  // 讀失敗不彈窗——它不影響既有會議的檢視，等使用者真的要建立新會議、picker 顯示「讀取中」卡住時
-  // 才需要處理，那時 pendingUploadFile 的 catch 分支會講清楚
-  useEffect(() => {
-    listPeople()
-      .then(setPeople)
-      .catch((err: any) => console.error('讀取人員名單失敗', err));
+  const loadPeople = useCallback(async (): Promise<void> => {
+    setPeople(null);
+    setPeopleLoadError(null);
+    try {
+      setPeople(await listPeopleWithSingleRetry());
+    } catch (err: any) {
+      console.error('讀取人員名單失敗', err);
+      setPeopleLoadError(errorText(err));
+    }
   }, []);
+
+  // 與會者名單只在真的要建立新會議時才需要，但先在開場讀好：picker 打開時使用者不該乾等一次 API 呼叫。
+  useEffect(() => {
+    loadPeople();
+  }, [loadPeople]);
 
   // 選到 server 的會議才去拉內容。本機紀錄的內容本來就在手上，不用再讀一次
   useEffect(() => {
@@ -524,11 +532,11 @@ const App: React.FC = () => {
    * 寫完重新拉一次 detail：確認會連動改到 analysis 的 decided_by_employee_id／
    * assignee_employee_id，不只是 nameMentions 清單變短，畫面要反映 server 真的存下來的樣子。
    */
-  const handleConfirmNameMention = async (originalText: string, employeeId: string) => {
+  const handleConfirmNameMention = async (segmentIndex: number, originalText: string, employeeId: string) => {
     if (selection === null || selection.source !== 'server') return;
     const meetingId = selection.id;
     try {
-      await confirmNameMention(meetingId, originalText, employeeId);
+      await confirmNameMention(meetingId, segmentIndex, originalText, employeeId);
       await refreshActiveDetail(meetingId);
     } catch (err: any) {
       console.error('確認人名失敗', err);
@@ -846,6 +854,8 @@ const App: React.FC = () => {
       <ParticipantPicker
         isOpen={pendingUploadFile !== null}
         people={people}
+        loadError={peopleLoadError}
+        onRetry={loadPeople}
         onConfirm={handleConfirmParticipants}
         onCancel={handleCancelParticipants}
       />

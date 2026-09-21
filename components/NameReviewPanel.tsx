@@ -6,7 +6,7 @@ interface NameReviewPanelProps {
   participants: PersonSummary[];
   /** 還沒確認的人名（人名校正 N4／N5）。確認後從清單移除，交給呼叫端更新 */
   nameMentions: NameMentionView[];
-  onConfirm: (originalText: string, employeeId: string) => void | Promise<void>;
+  onConfirm: (segmentIndex: number, originalText: string, employeeId: string) => void | Promise<void>;
 }
 
 /**
@@ -20,14 +20,18 @@ const NameReviewPanel: React.FC<NameReviewPanelProps> = ({ participants, nameMen
   const [selections, setSelections] = useState<Record<string, string>>({});
   const [confirming, setConfirming] = useState<string | null>(null);
 
+  const keyFor = (mention: NameMentionView): string =>
+    `${mention.segment_index}\u0000${mention.original_text}`;
+
   if (nameMentions.length === 0) return null;
 
   const handleConfirm = async (mention: NameMentionView) => {
-    const employeeId = selections[mention.original_text] ?? mention.employee_id;
+    const key = keyFor(mention);
+    const employeeId = selections[key] ?? mention.employee_id;
     if (!employeeId) return;
-    setConfirming(mention.original_text);
+    setConfirming(key);
     try {
-      await onConfirm(mention.original_text, employeeId);
+      await onConfirm(mention.segment_index, mention.original_text, employeeId);
     } finally {
       setConfirming(null);
     }
@@ -44,18 +48,20 @@ const NameReviewPanel: React.FC<NameReviewPanelProps> = ({ participants, nameMen
       </p>
       <div className="space-y-3">
         {nameMentions.map((mention) => {
-          const selected = selections[mention.original_text] ?? mention.employee_id ?? '';
+          const key = keyFor(mention);
+          const selected = selections[key] ?? mention.employee_id ?? '';
           return (
-            <div key={mention.original_text} className="bg-white rounded-xl border border-amber-100 p-3 flex items-center gap-3">
+            <div key={key} className="bg-white rounded-xl border border-amber-100 p-3 flex items-center gap-3">
               <div className="flex-1 min-w-0">
                 <p className="text-sm font-bold text-slate-800">「{mention.original_text}」</p>
+                <p className="mt-1 text-xs text-slate-600 leading-relaxed">{mention.segment_text}</p>
                 <p className="text-[10px] text-slate-400">
                   {mention.method === 'conflict_review' ? '對到多個可能的人，請自己選' : '這個名字太短，先確認一下是不是這個人'}
                 </p>
               </div>
               <select
                 value={selected}
-                onChange={(e) => setSelections((prev) => ({ ...prev, [mention.original_text]: e.target.value }))}
+                onChange={(e) => setSelections((prev) => ({ ...prev, [key]: e.target.value }))}
                 className="border border-slate-200 rounded-lg px-2 py-1.5 text-xs text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-200"
               >
                 <option value="" disabled>選一個人</option>
@@ -65,11 +71,11 @@ const NameReviewPanel: React.FC<NameReviewPanelProps> = ({ participants, nameMen
               </select>
               <button
                 type="button"
-                disabled={selected === '' || confirming === mention.original_text}
+                disabled={selected === '' || confirming === key}
                 onClick={() => handleConfirm(mention)}
                 className="bg-amber-600 hover:bg-amber-700 disabled:bg-slate-200 disabled:text-slate-400 text-white text-xs font-bold px-3 py-1.5 rounded-lg transition-colors shrink-0"
               >
-                {confirming === mention.original_text ? '確認中…' : '確認'}
+                {confirming === key ? '確認中…' : '確認'}
               </button>
             </div>
           );
