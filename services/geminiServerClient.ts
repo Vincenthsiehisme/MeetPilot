@@ -23,8 +23,13 @@ import { PairJudgement } from './topicLink';
  * vault「MeetPilot · 會議記錄規範與拖曳上傳」）。在建 client 的當下就讀（server 啟動時），
  * 讀不到或空檔直接讓啟動失敗，理由同 `createLlmLogger` 啟動就開檔：不要等第一場會分析完
  * 才發現規範沒生效。內容只決定「好的紀錄長什麼樣」，不是這個檔的職責，改行為去改規範檔。
+ *
+ * 預設相對 `process.cwd()`，跟啟動目錄綁死；換啟動目錄會讀不到。跟 `MEETPILOT_AUDIO_DIR`／
+ * `MEETPILOT_DB` 同一套逃生口慣例，可用 `MEETPILOT_ANALYSIS_SPEC_PATH` 覆寫。
  */
-const ANALYSIS_SPEC_PATH = resolve('prompts/meeting-record-spec.md');
+const ANALYSIS_SPEC_PATH = resolve(
+  (process.env.MEETPILOT_ANALYSIS_SPEC_PATH ?? '').trim() || 'prompts/meeting-record-spec.md'
+);
 
 function loadAnalysisSpec(): string {
   let raw: string;

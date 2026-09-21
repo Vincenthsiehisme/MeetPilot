@@ -494,8 +494,7 @@ export function createApp(deps: AppDeps): express.Express {
 
   // 前端仍在用的一條 Gemini 路由。轉錄與分析的路由在 W2 T2 之後零呼叫端（那兩條事的發起點
   // 改成 server 端的 transcriptionPipeline），已經移除；geminiServerClient 的
-  // transcribeSlice 留著，pipeline 在用；分析改走 analysisClient.ts 的 Claude client
-  // （2026-09-20），同樣是 pipeline 內部呼叫，沒有對外路由。
+  // transcribeSlice、analyzeTranscript 留著，pipeline 內部呼叫，沒有對外路由。
 
   // 1. Polish Transcript（components/TranscriptView.tsx）
   app.post('/api/gemini/polish', async (req, res) => {

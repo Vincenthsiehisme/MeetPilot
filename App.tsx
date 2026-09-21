@@ -180,7 +180,16 @@ const App: React.FC = () => {
     refreshMeetings();
     getAllJobsFromDB()
       .then(jobs => setLocalJobs(
-        [...jobs].sort((a, b) => b.createdAt - a.createdAt).map(upgradeLocalJobAnalysis)
+        [...jobs].sort((a, b) => b.createdAt - a.createdAt).map(job => {
+          try {
+            return upgradeLocalJobAnalysis(job);
+          } catch (err: any) {
+            // 單筆舊資料形狀壞掉不該拖垮其他筆：這筆原樣顯示（analysis 可能渲染不出來），
+            // 但至少不會讓整份本機任務清單從畫面消失
+            console.error(`本機任務 ${job.id} 的 analysis 升級失敗`, err);
+            return job;
+          }
+        })
       ))
       .catch((err: any) => {
         console.error('讀取本機任務紀錄失敗', err);
@@ -532,6 +541,9 @@ const App: React.FC = () => {
     e.preventDefault();
     dragCounter.current = 0;
     setIsDragging(false);
+    // 跟 handleDragEnter 同一套判準：拖曳頁面上的文字選取也會觸發 drop 事件，
+    // 但 dataTransfer.types 不含 'Files'，不該當成「拖錯檔案」跳錯誤視窗
+    if (!e.dataTransfer.types.includes('Files')) return;
     const pick = pickDroppedAudioFile(e.dataTransfer.files);
     // 明寫 `=== false` 而不是 `!pick.ok`：tsconfig 沒開 strict，`!pick.ok` 這種寫法在這個 repo
     // 收斂不到 { ok: false; reason } 那一側（同樣的坑見 meetingAdapter.ts／meetingEdits.ts）
@@ -582,7 +594,7 @@ const App: React.FC = () => {
               {busyMessage}
             </span>
           )}
-          <FileUpload onFileSelect={addMeeting} />
+          <FileUpload onFileSelect={addMeeting} onRejected={(reason) => showAlert('無法建立任務', reason)} />
         </div>
       </header>
 
@@ -749,7 +761,7 @@ const App: React.FC = () => {
                     上傳音檔後由伺服器轉錄與分析，這個分頁可以關掉，處理不會中斷。
                   </p>
                   <div className="flex gap-4 items-center">
-                    <FileUpload onFileSelect={addMeeting} />
+                    <FileUpload onFileSelect={addMeeting} onRejected={(reason) => showAlert('無法建立任務', reason)} />
                   </div>
                 </div>
               )}
