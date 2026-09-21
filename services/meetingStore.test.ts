@@ -125,6 +125,41 @@ describe('createMeeting', () => {
   });
 });
 
+describe('createMeeting 的 participant_ids（人名校正 N2，D-016）', () => {
+  const seedPerson = (employeeId: string) => {
+    db.prepare(
+      'INSERT INTO people (employee_id, display_name, email, active, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)',
+    ).run(employeeId, `測試-${employeeId}`, `${employeeId}@liontravel.com`, T0, T0);
+  };
+
+  it('不帶 participant_ids 時行為不變（既有呼叫端不受影響）', () => {
+    const m = store.createMeeting({ meeting_id: 'm-1', created_at: T0 });
+    expect(m.status).toBe('CREATED');
+    expect(store.getParticipants('m-1')).toEqual([]);
+  });
+
+  it('帶 participant_ids 時一併寫入 meeting_participants', () => {
+    seedPerson('p-1');
+    seedPerson('p-2');
+    store.createMeeting({ meeting_id: 'm-1', created_at: T0, participant_ids: ['p-1', 'p-2'] });
+    expect(store.getParticipants('m-1').sort()).toEqual(['p-1', 'p-2']);
+  });
+
+  it('participant_ids 指到不存在的員編時整筆連 Meeting 都不建立（同一個交易，FK 擋下）', () => {
+    expect(() => store.createMeeting({ meeting_id: 'm-1', created_at: T0, participant_ids: ['no-such-id'] }))
+      .toThrow();
+    expect(store.getMeeting('m-1')).toBeNull();
+  });
+
+  it('刪除 Meeting 時 meeting_participants 隨外鍵 cascade 一起清掉', () => {
+    seedPerson('p-1');
+    store.createMeeting({ meeting_id: 'm-1', created_at: T0, participant_ids: ['p-1'] });
+    store.deleteMeeting('m-1');
+    expect(db.prepare('SELECT COUNT(*) c FROM meeting_participants WHERE meeting_id = ?').get('m-1'))
+      .toMatchObject({ c: 0 });
+  });
+});
+
 describe('setStatus', () => {
   it('合法轉移寫得進去', () => {
     newMeeting();

@@ -69,14 +69,14 @@ describe('meetingClient', () => {
 
     const file = new File([new Uint8Array([1, 2, 3])], 'a.m4a', { type: 'audio/mp4' });
 
-    const createdBack = await createMeeting({ fileName: file.name, fileSize: file.size });
+    const createdBack = await createMeeting({ fileName: file.name, fileSize: file.size, participantIds: ['p-1'] });
     expect(createdBack).toEqual(created);
 
     const [createUrl, createInit] = fetchMock.mock.calls[0];
     expect(createUrl).toBe('/api/meetings');
     expect(createInit.method).toBe('POST');
     expect(createInit.headers['Content-Type']).toBe('application/json');
-    expect(JSON.parse(createInit.body)).toEqual({ fileName: 'a.m4a', fileSize: 3 });
+    expect(JSON.parse(createInit.body)).toEqual({ fileName: 'a.m4a', fileSize: 3, participantIds: ['p-1'] });
 
     const uploaded = await uploadAudio(createdBack.meeting_id, file);
     expect(uploaded).toEqual(transcribing);
@@ -221,7 +221,7 @@ describe('meetingClient', () => {
     fetchMock.mockResolvedValueOnce(respond(202, JSON.stringify({ meeting: meeting({ status: 'TRANSCRIBING' }) })));
     const onCreated = vi.fn();
 
-    const back = await submitAudio(new File(['x'], 'b.wav'), { meetingId: 'm_existing' }, onCreated);
+    const back = await submitAudio(new File(['x'], 'b.wav'), { meetingId: 'm_existing' }, null, onCreated);
 
     expect(back.status).toBe('TRANSCRIBING');
     expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -239,7 +239,7 @@ describe('meetingClient', () => {
       .mockResolvedValueOnce(respond(202, JSON.stringify({ meeting: meeting({ status: 'TRANSCRIBING' }) })));
     const onCreated = vi.fn();
 
-    await submitAudio(new File(['x'], 'a.m4a'), null, onCreated);
+    await submitAudio(new File(['x'], 'a.m4a'), null, ['p-1'], onCreated);
 
     expect(fetchMock.mock.calls.map(([url, init]: any[]) => `${init.method} ${url}`)).toEqual([
       'POST /api/meetings',
@@ -254,7 +254,7 @@ describe('meetingClient', () => {
       .mockResolvedValueOnce(respond(500, JSON.stringify({ error: '寫入音檔失敗' })));
     const onCreated = vi.fn();
 
-    await expect(submitAudio(new File(['x'], 'a.m4a'), null, onCreated)).rejects.toThrow('寫入音檔失敗');
+    await expect(submitAudio(new File(['x'], 'a.m4a'), null, ['p-1'], onCreated)).rejects.toThrow('寫入音檔失敗');
     expect(onCreated).toHaveBeenCalledWith(meeting());
   });
 

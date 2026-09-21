@@ -10,6 +10,7 @@ import { GeminiServerClient } from './geminiServerClient';
 import { ListenConfig } from './httpGuards';
 import { openMeetingDb } from './meetingDb';
 import { MeetingStore, createMeetingStore } from './meetingStore';
+import { PeopleStore, createPeopleStore } from './peopleStore';
 import { MATCH_KEY_VERSION } from './topicTag';
 import { TranscriptionQueue } from './transcriptionQueue';
 import { TopicLinker } from './topicLinker';
@@ -22,9 +23,11 @@ import { createVaultProjector, VaultProjector } from './vaultProjector';
  */
 
 const T0 = 1_700_000_000_000;
+const TEST_EMPLOYEE_ID = 'p-1';
 
 let db: DatabaseSync;
 let store: MeetingStore;
+let peopleStore: PeopleStore;
 let audioDir: string;
 let audioStore: AudioFileStore;
 let server: Server;
@@ -71,6 +74,7 @@ const startWith = async (options: {
       ...options.listenConfig,
     },
     meetingStore: store,
+    peopleStore,
     audioStore: options.audioStore ?? audioStore,
     // 預設佇列照 pipeline.run 的第一步做：只有 CREATED 才推進 TRANSCRIBING（已經在轉的不重設）
     transcriptionQueue: options.queue ?? fakeQueue(id => {
@@ -96,7 +100,9 @@ const start = (options: {
 } = {}) =>
   startWith(options);
 
-const createMeeting = async (body: Record<string, unknown> = { fileName: 'a.m4a', fileSize: 10 }) => {
+const createMeeting = async (
+  body: Record<string, unknown> = { fileName: 'a.m4a', fileSize: 10, participantIds: [TEST_EMPLOYEE_ID] },
+) => {
   const res = await fetch(`${url}/api/meetings`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -115,6 +121,13 @@ const putAudio = (meetingId: string, payload: Buffer, headers: Record<string, st
 beforeEach(() => {
   db = openMeetingDb(':memory:');
   store = createMeetingStore(db);
+  peopleStore = createPeopleStore(db);
+  // 既有測試多半不關心與會者，統一先種一個人（TEST_EMPLOYEE_ID），
+  // createMeeting() helper 的預設 body 用它，個別測試要測「查無此人」再自己蓋掉
+  peopleStore.importRoster(
+    [{ employeeId: TEST_EMPLOYEE_ID, displayName: '測試員工', title: null, email: 'test@liontravel.com', department: null, aliases: [] }],
+    T0,
+  );
   audioDir = mkdtempSync(join(tmpdir(), 'meetpilot-app-'));
   audioStore = createAudioFileStore(audioDir);
   enqueued = [];
@@ -125,6 +138,66 @@ afterEach(async () => {
   if (server) await new Promise<void>(resolve => server.close(() => resolve()));
   db.close();
   rmSync(audioDir, { recursive: true, force: true });
+});
+
+describe('POST /api/meetings：與會者必填（D-016）', () => {
+  it('沒有 participantIds 回 400，不靜默放行', async () => {
+    await start();
+    const { status, body } = await createMeeting({ fileName: 'a.m4a', fileSize: 10 });
+    expect(status).toBe(400);
+    expect(body.error).toContain('participantIds');
+  });
+
+  it('participantIds 是空陣列回 400', async () => {
+    await start();
+    const { status } = await createMeeting({ fileName: 'a.m4a', fileSize: 10, participantIds: [] });
+    expect(status).toBe(400);
+  });
+
+  it('participantIds 含查無此人的員編回 400，錯誤訊息列出哪個員編', async () => {
+    await start();
+    const { status, body } = await createMeeting({
+      fileName: 'a.m4a', fileSize: 10, participantIds: [TEST_EMPLOYEE_ID, 'no-such-id'],
+    });
+    expect(status).toBe(400);
+    expect(body.error).toContain('no-such-id');
+  });
+
+  it('合法的 participantIds 寫進 meeting_participants', async () => {
+    await start();
+    peopleStore.importRoster(
+      [{ employeeId: 'p-2', displayName: '第二個人', title: null, email: 'p2@liontravel.com', department: null, aliases: [] }],
+      T0,
+    );
+    const { status, body } = await createMeeting({
+      fileName: 'a.m4a', fileSize: 10, participantIds: [TEST_EMPLOYEE_ID, 'p-2'],
+    });
+    expect(status).toBe(201);
+    expect(store.getParticipants(body.meeting.meeting_id).sort()).toEqual([TEST_EMPLOYEE_ID, 'p-2'].sort());
+  });
+});
+
+describe('GET /api/people', () => {
+  it('只回在職的人，欄位形狀不含 email 與 active', async () => {
+    peopleStore.importRoster(
+      [{ employeeId: 'p-2', displayName: '第二個人', title: '經理', email: 'p2@liontravel.com', department: '某部門', aliases: [] }],
+      T0,
+    );
+    db.prepare('UPDATE people SET active = 0 WHERE employee_id = ?').run('p-2');
+    await start();
+
+    const res = await fetch(`${url}/api/people`);
+    const body = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(body.people).toHaveLength(1); // p-2 離職，不出現
+    expect(body.people[0]).toEqual({
+      employeeId: TEST_EMPLOYEE_ID,
+      displayName: '測試員工',
+      title: null,
+      department: null,
+    });
+  });
 });
 
 describe('PUT /api/meetings/:id/audio', () => {
@@ -713,7 +786,7 @@ describe('POST /api/meetings 帶 title', () => {
   // （2026-09-20 Codex review 抓到）
   it('合法標題 trim 後存下來', async () => {
     await start();
-    const { status, body } = await createMeeting({ fileName: 'a.m4a', fileSize: 10, title: '  週會  ' });
+    const { status, body } = await createMeeting({ fileName: 'a.m4a', fileSize: 10, title: '  週會  ', participantIds: [TEST_EMPLOYEE_ID] });
     expect(status).toBe(201);
     expect(body.meeting.title).toBe('週會');
   });
@@ -721,7 +794,7 @@ describe('POST /api/meetings 帶 title', () => {
   it('空白、超過 100 字、含控制字元的標題回 400，不建立會議', async () => {
     await start();
     for (const title of ['   ', 'x'.repeat(101), '週會\n第二週']) {
-      const { status, body } = await createMeeting({ fileName: 'a.m4a', fileSize: 10, title });
+      const { status, body } = await createMeeting({ fileName: 'a.m4a', fileSize: 10, title, participantIds: [TEST_EMPLOYEE_ID] });
       expect(status).toBe(400);
       expect(body.error).toBeTruthy();
     }
@@ -730,7 +803,7 @@ describe('POST /api/meetings 帶 title', () => {
 
   it('沒給 title 時是 null，不是空字串', async () => {
     await start();
-    const { body } = await createMeeting({ fileName: 'a.m4a', fileSize: 10 });
+    const { body } = await createMeeting({ fileName: 'a.m4a', fileSize: 10, participantIds: [TEST_EMPLOYEE_ID] });
     expect(body.meeting.title).toBeNull();
   });
 });

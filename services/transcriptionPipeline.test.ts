@@ -9,12 +9,14 @@ import { openMeetingDb } from './meetingDb';
 import { MeetingStore, createMeetingStore } from './meetingStore';
 import { SLICE_OVERLAP_SECONDS } from './transcriptMerge';
 import { createTopicExtractor } from './topicExtractor';
+import { PeopleStore, createPeopleStore } from './peopleStore';
 import {
   SLICE_DURATION_SECONDS,
   TranscriptionPipelineDeps,
   buildPreviousContext,
   createTranscriptionPipeline,
   requeueInterruptedMeetings,
+  resolveParticipantNames,
 } from './transcriptionPipeline';
 
 const T0 = 1_700_000_000_000;
@@ -216,6 +218,117 @@ describe('run：整場跑完', () => {
     expect(contexts[0]).toBe('');
     expect(contexts[1]).toBe('S: 片段 0');
     expect(contexts[2]).toBe('S: 片段 0\nS: 片段 600');
+  });
+});
+
+describe('resolveParticipantNames（人名校正 N3）', () => {
+  let peopleStore: PeopleStore;
+
+  beforeEach(() => {
+    peopleStore = createPeopleStore(db);
+  });
+
+  it('沒有 peopleStore（null）時回空陣列，不影響既有沒有這個依賴的呼叫端', () => {
+    newMeeting();
+    expect(resolveParticipantNames('m-1', store, null)).toEqual([]);
+  });
+
+  it('這場會沒有與會者時回空陣列，即使 peopleStore 有資料', () => {
+    newMeeting();
+    peopleStore.importRoster(
+      [{ employeeId: 'p-1', displayName: '陳國煌', title: null, email: 'p1@liontravel.com', department: null, aliases: ['Philchen'] }],
+      T0,
+    );
+    expect(resolveParticipantNames('m-1', store, peopleStore)).toEqual([]);
+  });
+
+  it('回傳正名與別名的聯集，去重', () => {
+    peopleStore.importRoster(
+      [{ employeeId: 'p-1', displayName: '陳國煌', title: null, email: 'p1@liontravel.com', department: null, aliases: ['Philchen', 'philchen'] }],
+      T0,
+    );
+    store.createMeeting({ meeting_id: 'm-1', created_at: T0, participant_ids: ['p-1'] });
+
+    expect(resolveParticipantNames('m-1', store, peopleStore).sort()).toEqual(['Philchen', 'philchen', '陳國煌'].sort());
+  });
+
+  it('多個與會者的名字合併成一份清單', () => {
+    peopleStore.importRoster(
+      [
+        { employeeId: 'p-1', displayName: '陳國煌', title: null, email: 'p1@liontravel.com', department: null, aliases: [] },
+        { employeeId: 'p-2', displayName: '陳雅婷', title: null, email: 'p2@liontravel.com', department: null, aliases: ['Tina'] },
+      ],
+      T0,
+    );
+    store.createMeeting({ meeting_id: 'm-1', created_at: T0, participant_ids: ['p-1', 'p-2'] });
+
+    expect(resolveParticipantNames('m-1', store, peopleStore).sort()).toEqual(['Tina', '陳國煌', '陳雅婷'].sort());
+  });
+});
+
+describe('與會者提示接進轉錄與分析呼叫（人名校正 N3）', () => {
+  let peopleStore: PeopleStore;
+
+  beforeEach(() => {
+    peopleStore = createPeopleStore(db);
+    peopleStore.importRoster(
+      [{ employeeId: 'p-1', displayName: '陳國煌', title: null, email: 'p1@liontravel.com', department: null, aliases: ['Philchen'] }],
+      T0,
+    );
+  });
+
+  it('轉錄的每一片與分析呼叫都收到 participantNames', async () => {
+    store.createMeeting({
+      meeting_id: 'm-1', created_at: T0, source_file_name: 'a.m4a', source_file_size: 10, participant_ids: ['p-1'],
+    });
+    const transcribeCalls: (string[] | undefined)[] = [];
+    const analyzeCalls: (string[] | undefined)[] = [];
+    const pipeline = pipelineWith({
+      store,
+      peopleStore,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(THREE_SLICE_DURATION),
+      gemini: fakeGemini({
+        transcribeSlice: async ({ offsetSeconds = 0, participantNames }) => {
+          transcribeCalls.push(participantNames);
+          return [{ start: offsetSeconds, end: offsetSeconds + 30, text: `片段 ${offsetSeconds}`, speaker: 'S' }];
+        },
+        analyzeTranscript: async ({ participantNames }) => {
+          analyzeCalls.push(participantNames);
+          return analysisOutput;
+        },
+      }),
+      now: () => T0 + 1,
+    });
+
+    await pipeline.run('m-1');
+
+    expect(transcribeCalls).toHaveLength(3); // 三片
+    for (const names of transcribeCalls) expect(names?.sort()).toEqual(['Philchen', '陳國煌'].sort());
+    expect(analyzeCalls).toHaveLength(1);
+    expect(analyzeCalls[0]?.sort()).toEqual(['Philchen', '陳國煌'].sort());
+  });
+
+  it('沒帶 peopleStore 時 participantNames 是空陣列，既有不關心人名校正的測試不受影響', async () => {
+    newMeeting(); // 這場會沒有 participant_ids
+    const seen: (string[] | undefined)[] = [];
+    const pipeline = pipelineWith({
+      store,
+      // 刻意不傳 peopleStore：驗證它是真的 optional，不是「忘了給會壞」
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(THREE_SLICE_DURATION),
+      gemini: fakeGemini({
+        transcribeSlice: async ({ offsetSeconds = 0, participantNames }) => {
+          seen.push(participantNames);
+          return [{ start: offsetSeconds, end: offsetSeconds + 30, text: `片段 ${offsetSeconds}`, speaker: 'S' }];
+        },
+      }),
+      now: () => T0 + 1,
+    });
+
+    await pipeline.run('m-1');
+
+    expect(seen.every(names => names?.length === 0)).toBe(true);
   });
 });
 

@@ -23,6 +23,8 @@ import {
   PatchTitleResponse,
   PatchTranscriptRequest,
   PatchTranscriptResponse,
+  PeopleListResponse,
+  PersonSummary,
 } from './meetingApi';
 
 async function requestJson<T>(endpoint: string, init: RequestInit): Promise<T> {
@@ -75,6 +77,12 @@ export const uploadAudio = async (meetingId: string, file: File): Promise<Meetin
 export const listMeetings = async (): Promise<MeetingView[]> => {
   const data = await requestJson<MeetingListResponse>('/api/meetings', { method: 'GET' });
   return data.meetings;
+};
+
+/** 建立會議前的與會者選取用（人名校正 N2）。只回在職的人 */
+export const listPeople = async (): Promise<PersonSummary[]> => {
+  const data = await requestJson<PeopleListResponse>('/api/people', { method: 'GET' });
+  return data.people;
 };
 
 export const getMeetingDetail = (meetingId: string): Promise<MeetingDetailResponse> =>
@@ -148,15 +156,23 @@ export const patchTitle = async (meetingId: string, title: string): Promise<stri
  *
  * onCreated 在「建立成功、還沒開始上傳」時呼叫：上傳是整條裡最久的一段，呼叫端要在這個時間點
  * 就把那場會放進畫面，失敗時使用者才找得到它去補音檔。
+ *
+ * `participantIds` 只在新建（`target === null`）時有意義：既有會議在建立當下已經定過與會者
+ * （D-016 不允許事後改），補送音檔這條路不重新宣告一次。
  */
 export const submitAudio = async (
   file: File,
   target: { meetingId: string } | null,
+  participantIds: string[] | null,
   onCreated?: (meeting: MeetingView) => void
 ): Promise<MeetingView> => {
   if (target !== null) return uploadAudio(target.meetingId, file);
 
-  const created = await createMeeting({ fileName: file.name, fileSize: file.size });
+  const created = await createMeeting({
+    fileName: file.name,
+    fileSize: file.size,
+    participantIds: participantIds ?? [],
+  });
   if (onCreated) onCreated(created);
   return uploadAudio(created.meeting_id, file);
 };

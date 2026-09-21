@@ -166,6 +166,12 @@ export interface TranscribeSliceInput {
   sliceDurationSeconds?: number;
   /** 這片屬於哪一場會議，記進 llm.jsonl 才查得出單場會議的 token 花費 */
   meetingId?: string;
+  /**
+   * 這場會與會者的正名與已知別名（人名校正 N3，SDD 1.3.2 第 1 層）。只送名字，不含員編——
+   * 這支介面只認識文字，不知道人名校正這件事存在。只給這場會的與會者，不給全公司名單：
+   * 範圍愈小同音誤配對的機率愈低，token 也愈省。
+   */
+  participantNames?: string[];
 }
 
 export interface AnalyzeTranscriptInput {
@@ -173,6 +179,8 @@ export interface AnalyzeTranscriptInput {
   meetingTags?: string[];
   meetingContext?: string;
   meetingId?: string;
+  /** 同 `TranscribeSliceInput.participantNames`。只送名字，不含員編 */
+  participantNames?: string[];
 }
 
 /** 一條決議／待辦／未決事項的出處：段落編號範圍（1-based），跟送給模型的 `[#n ...]` 對應 */
@@ -319,6 +327,24 @@ const JUDGE_PAIR_SYSTEM_INSTRUCTION = `你要判斷兩場會議有沒有在討�
 const formatTagsForJudge = (tags: readonly { title: string; content: string }[]): string =>
   tags.map((tag, i) => `${i + 1}. ${tag.title}${tag.content ? `：${tag.content}` : ''}`).join('\n');
 
+/**
+ * 人名校正 N3（SDD 1.3.2 第 1 層）：「這場會可能提到的人名」提示，轉錄與分析各自的
+ * systemInstruction 語言不同（英文／中文），各寫一份而不是共用一份跨語言字串。
+ * 沒有與會者（尚未做人名校正的舊會議、或呼叫端沒傳）就回空字串，不改變既有 prompt——
+ * 這條規則刻意不影響沒有與會者資料的既有路徑。
+ */
+const buildKnownNamesRuleEn = (participantNames: readonly string[] | undefined, ruleNumber: number): string => {
+  if (!participantNames || participantNames.length === 0) return '';
+  return `\n${ruleNumber}. **KNOWN NAMES**: The following people may be mentioned by name in this recording. `
+    + `If a spoken name sounds like one of these, use this exact spelling: ${participantNames.join(', ')}.`;
+};
+
+const buildKnownNamesHintZh = (participantNames: readonly string[] | undefined): string => {
+  if (!participantNames || participantNames.length === 0) return '';
+  return `\n\n## 已知人名\n\n這場會議的與會者可能會在逐字稿裡被提到。如果聽起來像以下名單中的某個人，`
+    + `請一律使用這份名單裡的寫法：${participantNames.join('、')}。`;
+};
+
 export interface GeminiServerClient {
   /**
    * 這個 client 現在用的 embedding model（W4）。
@@ -440,6 +466,7 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
         mimeType = 'audio/wav',
         sliceDurationSeconds,
         meetingId,
+        participantNames,
       } = input;
 
       const ai = getAI();
@@ -452,7 +479,7 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
       parts.push({ inlineData: { data: base64Data, mimeType } });
 
       const promptConfig = {
-        systemInstruction: `You are a professional speech-to-text transcriber. 
+        systemInstruction: `You are a professional speech-to-text transcriber.
 Your goal is to generate a precise, word-for-word transcription of the audio file in Traditional Chinese (繁體中文).
 
 RULES:
@@ -460,7 +487,7 @@ RULES:
 2. **VERBATIM**: Write exactly what is said. Include all content.
 3. **SPEAKER ID**: Identify speakers (Speaker 1, Speaker 2) based on voice. Use context to maintain consistency.
 4. **TIMESTAMPS**: Provide start/end times in seconds.
-5. **LANGUAGE**: Output mainly in Traditional Chinese. If English technical terms are used, keep them in English.
+5. **LANGUAGE**: Output mainly in Traditional Chinese. If English technical terms are used, keep them in English.${buildKnownNamesRuleEn(participantNames, 6)}
 
 Output JSON format:
 { "segments": [{ "start": 0.0, "end": 5.5, "text": "完整的句子內容...", "speaker": "Speaker 1" }] }`,
@@ -594,10 +621,11 @@ ${fullText}`,
      * `prompts/meeting-record-spec.md` 的全文，不在這裡另抄一份規則——「好的紀錄長什麼樣」
      * 改行為去改規範檔。逐字稿標段落編號送給模型，模型回 `segment_from`／`segment_to`，
      * 換算成秒是呼叫端（`transcriptionPipeline.ts`）用 `buildAnalysisV3FromModelOutput` 做的事，
-     * 這裡只負責組請求、驗回應形狀。
+     * 這裡只負責組請求、驗回應形狀。已知人名（人名校正 N3）附加在規範正本之後，不修改規範檔本身：
+     * 那份檔案是跨會議的固定規則，與會者名單是逐場會議才有的資料。
      */
     async analyzeTranscript(input: AnalyzeTranscriptInput): Promise<AnalysisModelOutput> {
-      const { transcript, meetingTags = [], meetingContext = '', meetingId } = input;
+      const { transcript, meetingTags = [], meetingContext = '', meetingId, participantNames } = input;
 
       const ai = getAI();
 
@@ -620,7 +648,7 @@ ${contextLines.length > 0 ? `\n本次會議背景與標籤：\n${contextLines.jo
 ${formatTranscriptForAnalysis(transcript)}`,
         config: {
           maxOutputTokens: 8192,
-          systemInstruction: analysisSpec,
+          systemInstruction: analysisSpec + buildKnownNamesHintZh(participantNames),
           responseMimeType: 'application/json',
           responseSchema: ANALYSIS_RESPONSE_SCHEMA,
         },

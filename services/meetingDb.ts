@@ -8,7 +8,8 @@
  * 用 node 內建的 `node:sqlite`，不加原生依賴。
  *
  * 表只在真的要落地的那一包才建。W1 建了四張（meetings、transcripts、analyses、meeting_tags），
- * W3 加了 topic_tags，W4 加了 topic_links、link_exclusions、topic_tag_embeddings、link_runs；
+ * W3 加了 topic_tags，W4 加了 topic_links、link_exclusions、topic_tag_embeddings、link_runs，
+ * 人名校正 N1（SDD 1.3.2）加了 people、person_aliases，N2 加了 meeting_participants；
  * RecallFeedback 等到 W6 再加一條 migration：現在建空表等於憑空猜欄位，而那些欄位的形狀
  * 要等策略實作完才確定。
  */
@@ -176,6 +177,59 @@ const MIGRATIONS: readonly string[] = [
   // 只是欄位內容從 v3 起帶 evidence／decided_by／assignee／due。舊資料讀出來時
   // 由 meetingStore 的 getAnalysis 做 lazy 升級（v2 → v3），不改寫既有資料列。
   `ALTER TABLE analyses ADD COLUMN open_questions TEXT NOT NULL DEFAULT '[]';`,
+  // 人名校正 N1（SDD 1.3.2，`C-PEOPLE`／`person_aliases`）。
+  //
+  // `active` 預設 1（在職）：一期的名單來源是單一時間點的快照，看不出誰離職，重新匯入
+  // 也不會把它改回去（見 PeopleStore.importRoster 的 upsert 語句，UPDATE 子句刻意不寫這一欄）。
+  // 使用者 2026-09-21 裁決現階段全部當在職，維護方式待定，記在 plan 的 Next actions。
+  //
+  // `person_aliases` 是整個設計的核心資產（1.3.2）：同一個人可以有好幾個別名，`UNIQUE(employee_id, alias)`
+  // 讓重新匯入不會疊出重複列；`source` 分 import／manual，配合 1.2 的人工優先且黏著規則——
+  // 這裡不覆寫既有列（見 PeopleStore 用 INSERT OR IGNORE），不分來源都不覆寫，
+  // 因為「不覆寫」本身就同時滿足「不重複」與「manual 不被 import 洗掉」兩條規則。
+  `
+  CREATE TABLE people (
+    employee_id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    title TEXT,
+    email TEXT NOT NULL,
+    department TEXT,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE person_aliases (
+    alias_id TEXT PRIMARY KEY,
+    employee_id TEXT NOT NULL REFERENCES people(employee_id) ON DELETE CASCADE,
+    alias TEXT NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('import', 'manual')),
+    corrected_at INTEGER,
+    created_at INTEGER NOT NULL,
+    UNIQUE (employee_id, alias)
+  );
+
+  CREATE INDEX idx_person_aliases_alias ON person_aliases(alias);
+  `,
+  // 人名校正 N2（SDD 1.3.2、D-016：`F-CREATE` 必填至少一位與會者）。
+  //
+  // `meeting_id` 掛 CASCADE：刪會議時這張表要跟著清，跟 meeting_tags 同一個理由。
+  // `employee_id` 不掛 CASCADE：people 目前沒有刪除操作（離職是標 active=false，見 N1），
+  // 這裡不需要處理「引用的人被刪掉」這個目前不會發生的情境。
+  //
+  // 「至少一位」這條規則刻意不在這裡用 CHECK 或 trigger 強制：SQLite 沒有簡單的方法對
+  // 「關聯表至少有一列」做宣告式約束，而這條規則的正確位置是 `F-CREATE`（Recorder 互動的
+  // 邊界），不是 Meeting 這個實體本身的資料完整性——沒有與會者的 Meeting 在資料層不是
+  // 非法狀態，只是不該被 `F-CREATE` 這條路允許送出來（見 meetingStore.ts 的 CreateMeetingInput 註解）
+  `
+  CREATE TABLE meeting_participants (
+    meeting_id TEXT NOT NULL REFERENCES meetings(meeting_id) ON DELETE CASCADE,
+    employee_id TEXT NOT NULL REFERENCES people(employee_id),
+    PRIMARY KEY (meeting_id, employee_id)
+  );
+
+  CREATE INDEX idx_meeting_participants_employee ON meeting_participants(employee_id);
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

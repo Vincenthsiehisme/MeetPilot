@@ -17,6 +17,7 @@ import { AudioSlicer, planSlices } from './audioSlicer';
 import { GeminiServerClient } from './geminiServerClient';
 import { MeetingStore } from './meetingStore';
 import { checkMeetingTitle } from './meetingTitle';
+import { PeopleStore } from './peopleStore';
 import { SeamReportEntry } from './meetingApi';
 import { DEFAULT_SEAM_REPAIR, RepairResult, SeamRepairConfig, repairSeamGap } from './seamRepair';
 import { TopicExtractor } from './topicExtractor';
@@ -30,6 +31,12 @@ export const SLICE_DURATION_SECONDS = 10 * 60;
 
 export interface TranscriptionPipelineDeps {
   store: MeetingStore;
+  /**
+   * 人員名單（人名校正 N3）。轉錄與分析呼叫靠它把與會者姓名塞進提示，見 resolveParticipantNames。
+   * **型別上是 optional／nullable，但跟 `vaultProjector` 同一個理由**：不是使用者可關的功能開關，
+   * `server.ts` 一律建一個真的；optional 只是為了讓不驗證人名提示的既有測試不用注入一個真的
+   */
+  peopleStore?: PeopleStore | null;
   audioStore: AudioFileStore;
   slicer: AudioSlicer;
   gemini: GeminiServerClient;
@@ -72,8 +79,38 @@ export function buildPreviousContext(transcript: readonly TranscriptSegment[]): 
     .slice(-1000);
 }
 
+/**
+ * 這場會與會者的正名與已知別名，塞進轉錄／分析呼叫的提示（人名校正 N3，SDD 1.3.2 第 1 層）。
+ * 沒有與會者（尚未做人名校正的舊資料、或這場會建立時還沒有這個規則）就回空陣列，
+ * `geminiServerClient.ts` 收到空陣列時不會改變既有 prompt。
+ *
+ * 名字集合是「員編本身的正名」聯集「person_aliases 裡的所有別名」：後者在匯入當下
+ * 已經含正名的一種寫法（見 rosterImport.ts 的 buildAliasCandidates），這裡仍然兩者都查，
+ * 不假設匯入資料一定完整——manual 建立的 Person 可能沒有任何別名。
+ */
+export function resolveParticipantNames(
+  meetingId: string,
+  store: Pick<MeetingStore, 'getParticipants'>,
+  peopleStore: Pick<PeopleStore, 'getPerson' | 'listAliasesForEmployees'> | null,
+): string[] {
+  if (!peopleStore) return [];
+  const employeeIds = store.getParticipants(meetingId);
+  if (employeeIds.length === 0) return [];
+
+  const names = new Set<string>();
+  for (const employeeId of employeeIds) {
+    const person = peopleStore.getPerson(employeeId);
+    if (person) names.add(person.display_name);
+  }
+  for (const alias of peopleStore.listAliasesForEmployees(employeeIds)) {
+    names.add(alias.alias);
+  }
+  return Array.from(names);
+}
+
 export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
   const { store, audioStore, slicer, gemini, topicExtractor } = deps;
+  const peopleStore = deps.peopleStore ?? null;
   const topicLinker = deps.topicLinker ?? null;
   const vaultProjector = deps.vaultProjector ?? null;
   const now = deps.now ?? (() => Date.now());
@@ -98,6 +135,8 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
     const seamReport: SeamReportEntry[] = store.getSeamReport(meetingId) ?? [];
     // 額度跨接縫共用。續傳時重新給滿：這一輪是新的一次執行，沿用上一輪的殘額沒有意義
     let repairBudgetLeft = repairConfig.budget;
+    // 整場會算一次就好：與會者名單在轉錄過程中不會變，不用每片重查
+    const participantNames = resolveParticipantNames(meetingId, store, peopleStore);
 
     store.setSliceProgress(meetingId, processedSlices, plan.length, now());
 
@@ -111,6 +150,7 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
         previousContext: buildPreviousContext(transcript),
         mimeType: 'audio/wav',
         sliceDurationSeconds: slice.durationSeconds,
+        participantNames,
         meetingId,
       });
 
@@ -134,6 +174,7 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
                 previousContext: buildPreviousContext(transcript),
                 mimeType: 'audio/wav',
                 sliceDurationSeconds: durationSeconds,
+                participantNames,
                 meetingId,
               });
             },
@@ -210,6 +251,7 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
       meetingTags: store.getTags(meetingId),
       meetingContext: meeting.meeting_context ?? '',
       meetingId,
+      participantNames: resolveParticipantNames(meetingId, store, peopleStore),
     });
     store.saveAnalysis(
       meetingId,

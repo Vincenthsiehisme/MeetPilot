@@ -116,6 +116,25 @@ describe('transcribeSlice', () => {
     expect(request.model).toBe('gemini-3.8-flash');
   });
 
+  it('帶 participantNames 時把已知人名塞進 systemInstruction 第 6 條規則（人名校正 N3）', async () => {
+    generateContent.mockResolvedValue({ text: '{"segments":[]}' });
+    await client().transcribeSlice({ base64Data: 'AAAA', participantNames: ['陳國煌', 'Philchen'] });
+
+    const request = generateContent.mock.calls[0][0] as any;
+    expect(request.config.systemInstruction).toContain('6. **KNOWN NAMES**');
+    expect(request.config.systemInstruction).toContain('陳國煌, Philchen');
+  });
+
+  it('沒有 participantNames 或空陣列時不加人名規則，既有 prompt 不變', async () => {
+    generateContent.mockResolvedValue({ text: '{"segments":[]}' });
+    await client().transcribeSlice({ base64Data: 'AAAA' });
+    await client().transcribeSlice({ base64Data: 'AAAA', participantNames: [] });
+
+    for (const call of generateContent.mock.calls) {
+      expect((call[0] as any).config.systemInstruction).not.toContain('KNOWN NAMES');
+    }
+  });
+
   it('thinking level 調低，降低 thinking 吃光 maxOutputTokens 讓 response.text 變空的機率', async () => {
     generateContent.mockResolvedValue({ text: '{"segments":[]}' });
     await client().transcribeSlice({ base64Data: 'AAAA' });
@@ -339,6 +358,32 @@ describe('analyzeTranscript', () => {
   it('正常回應解析成 AnalysisModelOutput', async () => {
     generateContent.mockResolvedValue({ text: JSON.stringify(okOutput) });
     expect(await client().analyzeTranscript({ transcript })).toEqual(okOutput);
+  });
+
+  it('帶 participantNames 時把已知人名塞進 systemInstruction（人名校正 N3）', async () => {
+    generateContent.mockResolvedValue({
+      text: '{"title":"t","overview":"x","topics":[],"decisions":[],"action_items":[],"open_questions":[]}',
+    });
+    await client().analyzeTranscript({
+      transcript: [{ start: 0, end: 1, text: 'x' }],
+      participantNames: ['陳國煌', 'Philchen'],
+    });
+
+    const request = generateContent.mock.calls[0][0] as any;
+    expect(request.config.systemInstruction).toContain('已知人名');
+    expect(request.config.systemInstruction).toContain('陳國煌、Philchen');
+  });
+
+  it('沒有 participantNames 或空陣列時不加人名規則，既有 prompt 不變', async () => {
+    generateContent.mockResolvedValue({
+      text: '{"title":"t","overview":"x","topics":[],"decisions":[],"action_items":[],"open_questions":[]}',
+    });
+    await client().analyzeTranscript({ transcript: [{ start: 0, end: 1, text: 'x' }] });
+    await client().analyzeTranscript({ transcript: [{ start: 0, end: 1, text: 'x' }], participantNames: [] });
+
+    for (const call of generateContent.mock.calls) {
+      expect((call[0] as any).config.systemInstruction).not.toContain('已知人名');
+    }
   });
 
   it('回的內容不是合法 JSON 時拋錯，不回一份空的分析', async () => {

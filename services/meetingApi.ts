@@ -31,6 +31,20 @@ export interface CreateMeetingRequest {
   title?: string;
   meetingContext?: string;
   tags?: string[];
+  /** 這場會的與會者員編，至少一個（人名校正 N2，SDD D-016）。server 沒收到會拒絕建立 */
+  participantIds: string[];
+}
+
+/** `GET /api/people` 的一列，只給前端選取用，不含 email／active（人名校正 N2） */
+export interface PersonSummary {
+  employeeId: string;
+  displayName: string;
+  title: string | null;
+  department: string | null;
+}
+
+export interface PeopleListResponse {
+  people: PersonSummary[];
 }
 
 /**
