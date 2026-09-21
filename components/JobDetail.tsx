@@ -18,11 +18,15 @@ const JobDetail: React.FC<JobDetailProps> = ({ job, onUpdateJob, onAlert, onRetr
   // null 是「沒在編輯標題」；編輯中是輸入框裡的草稿
   const [titleDraft, setTitleDraft] = useState<string | null>(null);
 
-  // 換會議時把草稿清掉：這個元件實例不會因為切換選中對象而重新掛載（沒有 key），
-  // 沒有這行的話，會議 A 編輯到一半沒存就切去 B，按儲存會把 A 的草稿寫成 B 的標題
-  // （2026-09-20 Codex review 抓到）
+  // 換會議時把草稿與分頁都重置：這個元件實例不會因為切換選中對象而重新掛載（沒有 key）。
+  // 草稿不清的話，會議 A 編輯到一半沒存就切去 B，按儲存會把 A 的草稿寫成 B 的標題
+  // （2026-09-20 Codex review 抓到）；分頁不清的話，在會議 A 停在「AI 會議記錄」分頁時切去
+  // 還沒有 analysis 的會議 B，三個分頁的顯示條件全部對不上 activeTab，內容區會整個變空白，
+  // 分頁列也因為 disabled 蓋掉了 active 樣式而看不出選到哪個。「任務進度」永遠有內容可顯示，
+  // 是唯一安全的重置目標
   useEffect(() => {
     setTitleDraft(null);
+    setActiveTab('status');
   }, [job.id]);
 
   const saveTitle = () => {

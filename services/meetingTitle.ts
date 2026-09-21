@@ -42,7 +42,7 @@ export const jobDisplayName = (job: Named): string => job.title ?? job.fileName;
 export const jobDownloadBaseName = (job: Named): string => {
   if (job.title === undefined) return job.fileName;
   const cleaned = job.title
-    .replace(/[/\\:*?"<>|]/g, '')
+    .replace(/[/\\:*?"<>|[\]]/g, '')
     .replace(/\p{Cc}/gu, '')
     .replace(/\s+/g, ' ')
     .trim();

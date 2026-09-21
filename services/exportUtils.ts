@@ -174,6 +174,7 @@ export const exportJobAsJSON = (job: Job) => {
   
   const data = {
     job_id: job.id,
+    title: job.title ?? null,
     file_name: job.fileName,
     created_at: new Date(job.createdAt).toISOString(),
     status: job.status,

@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { downloadBlob, exportSummaryAsMarkdown, exportSummaryAsText } from './exportUtils';
+import { downloadBlob, exportJobAsJSON, exportSummaryAsMarkdown, exportSummaryAsText } from './exportUtils';
 import { AnalysisV3 } from './analysisContract';
+import { Job, JobStatus } from '../types';
 
 // 這個檔只測 downloadBlob 的兩個時序，那兩件事都是「失敗時沒有任何錯誤訊息」的那種壞法：
 // detached anchor 在部分 Firefox 版本按了沒反應，同步 revoke 在 Safari 會下載到空檔。
@@ -142,5 +143,51 @@ describe('exportSummaryAsMarkdown／exportSummaryAsText 的標題與空題目', 
   it('Text：沒有討論題目時顯式寫「本場沒有討論題目」，不是空白', async () => {
     exportSummaryAsText({ fileName: 'a.m4a' }, analysis);
     expect(await lastBlob().text()).toContain('(本場沒有討論題目)');
+  });
+});
+
+// exportJobAsJSON 的完整備份要看得到標題：檔名已經改用標題（jobDownloadBaseName），
+// 內文卻沒有帶 title 欄位的話，使用者改過標題再下載備份，檔案內容完全看不出叫什麼名字
+describe('exportJobAsJSON 的 title 欄位', () => {
+  let dom: ReturnType<typeof makeDom>;
+
+  const baseJob: Job = {
+    id: 'job-1',
+    fileName: 'a.m4a',
+    fileSize: 1024,
+    createdAt: 0,
+    updatedAt: 0,
+    status: JobStatus.COMPLETED,
+    currentStep: 0,
+    steps: [],
+  };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    dom = makeDom();
+    vi.stubGlobal('document', dom.document);
+    vi.stubGlobal('URL', { createObjectURL: vi.fn(() => 'blob:fake-url'), revokeObjectURL: vi.fn() });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  const lastBlob = (): Blob => {
+    const calls = (globalThis.URL.createObjectURL as ReturnType<typeof vi.fn>).mock.calls;
+    return calls[calls.length - 1][0];
+  };
+
+  it('有標題時 JSON 內文帶 title，不是只有檔名反映在檔案名稱上', async () => {
+    exportJobAsJSON({ ...baseJob, title: '週會' });
+    const parsed = JSON.parse(await lastBlob().text());
+    expect(parsed.title).toBe('週會');
+  });
+
+  it('沒有標題時 title 是 null，不是整個欄位消失', async () => {
+    exportJobAsJSON(baseJob);
+    const parsed = JSON.parse(await lastBlob().text());
+    expect(parsed.title).toBeNull();
   });
 });

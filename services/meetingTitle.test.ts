@@ -53,4 +53,8 @@ describe('jobDownloadBaseName', () => {
   it('標題清完是空的才退回原始檔名', () => {
     expect(jobDownloadBaseName({ title: '???', fileName: 'x.m4a' })).toBe('x.m4a');
   });
+
+  it('中括號也去掉，跟 vaultProjector.ts 的 sanitizeTitle 同一組字元', () => {
+    expect(jobDownloadBaseName({ title: 'Q1 Review [DRAFT]', fileName: 'x.m4a' })).toBe('Q1 Review DRAFT');
+  });
 });
