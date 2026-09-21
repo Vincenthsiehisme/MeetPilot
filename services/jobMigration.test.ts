@@ -46,6 +46,24 @@ describe('toMigrationRecord 的成功路徑', () => {
     expect(expectOk(toMigrationRecord({ ...pending, fileName: undefined })).record.meeting.title).toBeNull();
   });
 
+  // title 走 checkMeetingTitle 同一支驗證，不能繞過：v1 overview 沒有長度或控制字元限制，
+  // 直接存成 title 的話 pipeline「title === null 才填建議」的判斷會永久鎖死一個壞掉的值
+  it('overview 含控制字元時標題驗不過，退回 null 而不是直接存進去', () => {
+    const withBadOverview = {
+      ...completedJob,
+      analysis: { ...completedJob.analysis, overview: '討論\n供應商報價' },
+    };
+    expect(expectOk(toMigrationRecord(withBadOverview)).record.meeting.title).toBeNull();
+  });
+
+  it('overview 超過標題長度上限時標題驗不過，退回 null', () => {
+    const withLongOverview = {
+      ...completedJob,
+      analysis: { ...completedJob.analysis, overview: '字'.repeat(101) },
+    };
+    expect(expectOk(toMigrationRecord(withLongOverview)).record.meeting.title).toBeNull();
+  });
+
   it('action_items 升成 v3 並標 unknown，出處與人名一律 null', () => {
     const { record } = expectOk(toMigrationRecord(completedJob));
     expect(record.analysis?.action_items).toEqual([

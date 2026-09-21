@@ -11,6 +11,7 @@
 import { GeminiOutput, Job, JobStatus, Meeting, TranscriptSegment } from '../types';
 import { AnalysisV3, isAnalysisSemanticallyEmpty, upgradeAnalysisToV2, upgradeAnalysisV2ToV3 } from './analysisContract';
 import { MeetingStatus } from './meetingState';
+import { checkMeetingTitle } from './meetingTitle';
 
 export interface MigrationRecord {
   meeting: Meeting;
@@ -141,10 +142,17 @@ export const toMigrationRecord = (raw: unknown): MigrationOutcome => {
   }
   const upgraded = analysis ? upgradeAnalysisV2ToV3(upgradeAnalysisToV2(analysis, id, createdAt)) : null;
 
+  // READY 的用 overview 當標題，其餘只有檔名可用。跟 POST /api/meetings、PATCH /title 走同一支
+  // checkMeetingTitle：不然搬過來的舊資料能繞過驗證，把超長或含控制字元的值直接存成 title，
+  // pipeline「title === null 才填建議」的判斷就永遠不會補正（同一類問題 2026-09-20 Codex review
+  // 在 createApp.ts 抓過一次，這裡是同一個規則漏掉的第二個寫入端）。驗不過就當沒有候選，留 null，
+  // 不塞「未命名」這種假標題
+  const titleCandidate = upgraded?.overview.trim() || asString(raw.fileName) || null;
+  const titleCheck = titleCandidate !== null ? checkMeetingTitle(titleCandidate) : null;
+
   const meeting: Meeting = {
     meeting_id: id,
-    // READY 的用 overview 當標題，其餘只有檔名可用。兩者都沒有就留 null，不塞「未命名」這種假標題
-    title: upgraded?.overview.trim() || asString(raw.fileName) || null,
+    title: titleCheck?.ok === true ? titleCheck.title : null,
     status: mapped.status,
     created_at: createdAt,
     updated_at: updatedAt,

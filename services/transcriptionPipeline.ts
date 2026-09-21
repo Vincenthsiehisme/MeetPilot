@@ -16,6 +16,7 @@ import { AudioFileStore } from './audioFileStore';
 import { AudioSlicer, planSlices } from './audioSlicer';
 import { GeminiServerClient } from './geminiServerClient';
 import { MeetingStore } from './meetingStore';
+import { checkMeetingTitle } from './meetingTitle';
 import { SeamReportEntry } from './meetingApi';
 import { DEFAULT_SEAM_REPAIR, RepairResult, SeamRepairConfig, repairSeamGap } from './seamRepair';
 import { TopicExtractor } from './topicExtractor';
@@ -215,6 +216,18 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
       buildAnalysisV3FromModelOutput(output, transcript.segments, meetingId, now()),
       now(),
     );
+
+    // 建議標題只在還沒有的時候填：使用者改過的名字不能被下一次分析洗掉。
+    // 模型給的標題不合規則（空、超長、控制字元）時標題留 null 並記 log，不讓這場會 FAILED——
+    // 標題是清單裡認得出哪一場的方便，不是分析內容，為它讓使用者重跑整場分析代價不對稱
+    if (meeting.title === null) {
+      const suggested = checkMeetingTitle(output.title);
+      if (suggested.ok === true) {
+        store.setTitle(meetingId, suggested.title, now());
+      } else {
+        console.warn(`[Transcription] Meeting ${meetingId} 的建議標題不可用（${suggested.reason}），標題留空`);
+      }
+    }
   };
 
   const markFailed = (meetingId: string, reason: string, cause: unknown): void => {

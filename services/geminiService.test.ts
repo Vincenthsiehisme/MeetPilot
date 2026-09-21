@@ -1,36 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { polishTranscript, askDocumentStream } from './geminiService';
+import { polishTranscript } from './geminiService';
 import { HttpError } from './httpError';
 import type { TranscriptSegment } from '../types';
 
-// 這個檔測的是重試鏈本身：postJson / postStream 怎麼把回應翻成 HttpError，
+// 這個檔測的是重試鏈本身：postJson 怎麼把回應翻成 HttpError，
 // 以及 withRetry 在什麼時候重試、什麼時候放棄。fetch 全部換成替身，退避用 fake timers 推，
 // 測試不用真的等 8 秒。
 
 const transcript: TranscriptSegment[] = [{ start: 0, end: 3, text: '測試內容' }];
-
-// 串流回應替身：reads 是每次 reader.read() 要回的東西。字串代表一段 SSE 內容，
-// Error 代表那次 read 直接 reject。不用真的 ReadableStream，才能精準指定第幾次 read 壞掉。
-const streamResponse = (reads: Array<string | Error>): Response => {
-  const encoder = new TextEncoder();
-  let i = 0;
-  return {
-    ok: true,
-    status: 200,
-    statusText: 'OK',
-    headers: new Headers(),
-    body: {
-      getReader: () => ({
-        read: async () => {
-          if (i >= reads.length) return { done: true, value: undefined };
-          const next = reads[i++];
-          if (next instanceof Error) throw next;
-          return { done: false, value: encoder.encode(next) };
-        },
-      }),
-    },
-  } as unknown as Response;
-};
 
 let fetchMock: ReturnType<typeof vi.fn>;
 
@@ -131,85 +108,5 @@ describe('geminiService 的重試鏈', () => {
     expect(err.status).toBe(429);
     // maxRetries = 3：第三次失敗後不再重試
     expect(fetchMock).toHaveBeenCalledTimes(3);
-  });
-});
-
-describe('askDocumentStream', () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-    fetchMock = vi.fn();
-    vi.stubGlobal('fetch', fetchMock);
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
-    vi.unstubAllGlobals();
-    vi.restoreAllMocks();
-  });
-
-  it('連線撞 429 會重試，接上串流後完整 yield 內容', async () => {
-    fetchMock
-      .mockImplementationOnce(async () => new Response(JSON.stringify({ error: '請求過於頻繁' }), {
-        status: 429,
-        headers: { 'Retry-After': '2' },
-      }))
-      .mockImplementationOnce(async () => streamResponse([
-        'data: {"text":"你好"}\n\n',
-        'data: {"text":"世界"}\n\n',
-        'data: [DONE]\n\n',
-      ]));
-
-    const received: string[] = [];
-    const settled = (async () => {
-      for await (const chunk of askDocumentStream(transcript, [], '問題')) received.push(chunk);
-    })().catch(err => err);
-
-    await drainRetries();
-    const outcome = await settled;
-
-    expect(outcome).toBeUndefined();
-    expect(received).toEqual(['你好', '世界']);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-  });
-
-  it('連線階段一直 429 就丟 HttpError，一個字都不會 yield', async () => {
-    respondWith(() => new Response(JSON.stringify({ error: '請求過於頻繁' }), {
-      status: 429,
-      headers: { 'Retry-After': '2' },
-    }));
-
-    const received: string[] = [];
-    const settled = (async () => {
-      for await (const chunk of askDocumentStream(transcript, [], '問題')) received.push(chunk);
-    })().catch(err => err);
-
-    await drainRetries();
-    const err = await settled;
-
-    expect(err).toBeInstanceOf(HttpError);
-    expect(err.status).toBe(429);
-    expect(received).toEqual([]);
-    expect(fetchMock).toHaveBeenCalledTimes(3);
-  });
-
-  it('開始 yield 之後不重試：串流讀到一半壞掉就直接往外丟', async () => {
-    respondWith(() => streamResponse([
-      'data: {"text":"開頭"}\n\n',
-      new Error('串流中斷'),
-    ]));
-
-    const received: string[] = [];
-    const settled = (async () => {
-      for await (const chunk of askDocumentStream(transcript, [], '問題')) received.push(chunk);
-    })().catch(err => err);
-
-    await drainRetries();
-    const err = await settled;
-
-    expect(received).toEqual(['開頭']);
-    expect(err.message).toBe('串流中斷');
-    // 重試會讓使用者在同一則回覆裡看到重複的字，所以只連線一次
-    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });

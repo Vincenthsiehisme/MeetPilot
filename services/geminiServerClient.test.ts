@@ -85,7 +85,7 @@ describe('formatTranscriptForAI', () => {
 });
 
 describe('formatTranscriptWithTimeForAI', () => {
-  it('每段帶 [MM:SS-MM:SS] 時間戳，Chat 的引用靠它', () => {
+  it('每段帶 [MM:SS-MM:SS] 時間戳，extractTopicTags 的 prompt 靠它', () => {
     expect(formatTranscriptWithTimeForAI([{ start: 65, end: 130.9, text: '重點', speaker: 'A' }]))
       .toBe('[01:05-02:10] A: 重點');
   });
@@ -280,6 +280,7 @@ describe('formatTranscriptForAnalysis', () => {
 
 describe('analyzeTranscript', () => {
   const okOutput = {
+    title: '預算與報價',
     overview: '討論預算',
     topics: [{ title: '預算', content: '內容' }],
     decisions: [{ text: '採用方案 A', segment_from: 1, segment_to: 1, decided_by: null }],
@@ -348,6 +349,16 @@ describe('analyzeTranscript', () => {
   it('解析出來的形狀不對時拋錯（responseSchema 不保證型別完全符合預期）', async () => {
     generateContent.mockResolvedValue({ text: JSON.stringify({ ...okOutput, overview: 123 }) });
     await expect(client().analyzeTranscript({ transcript })).rejects.toThrow(/overview/);
+  });
+
+  it('responseSchema 把 title 列為必填，回應缺 title 時拋錯，不回一份沒名字的分析', async () => {
+    generateContent.mockResolvedValue({ text: JSON.stringify(okOutput) });
+    await client().analyzeTranscript({ transcript });
+    const schema = (generateContent.mock.calls[0][0] as any).config.responseSchema;
+    expect(schema.required).toContain('title');
+
+    generateContent.mockResolvedValue({ text: JSON.stringify({ ...okOutput, title: undefined }) });
+    await expect(client().analyzeTranscript({ transcript })).rejects.toThrow(/title/);
   });
 
   it('紀錄的 configuredMaxOutputTokens 是這支呼叫實際設的上限，跟 transcribe 沒設的 null 不一樣', async () => {
@@ -563,7 +574,7 @@ describe('meetingId 記進 telemetry，事後才查得出單場會議花了多�
 
   it('analyzeTranscript 有傳 meetingId 就記得下來', async () => {
     generateContent.mockResolvedValue({
-      text: '{"overview":"x","topics":[],"decisions":[],"action_items":[],"open_questions":[]}',
+      text: '{"title":"t","overview":"x","topics":[],"decisions":[],"action_items":[],"open_questions":[]}',
     });
     await client().analyzeTranscript({
       transcript: [{ start: 0, end: 1, text: 'x', speaker: 'A' }],

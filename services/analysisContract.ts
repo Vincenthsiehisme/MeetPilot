@@ -160,6 +160,8 @@ export interface AnalysisModelSegmentRef {
 }
 
 export interface AnalysisModelOutput {
+  /** 建議標題（規範〈標題〉節）。存進 `meetings.title`、不在 C-ANALYSIS 裡；只在那場會還沒有標題時採用 */
+  title: string;
   overview: string;
   topics: { title: string; content: string }[];
   decisions: (AnalysisModelSegmentRef & { text: string; decided_by: string | null })[];
@@ -180,6 +182,7 @@ const isSegmentRef = (v: unknown): v is AnalysisModelSegmentRef =>
  */
 export function assertAnalysisModelOutput(value: unknown): asserts value is AnalysisModelOutput {
   if (!isPlainObject(value)) throw new Error('分析模型回應的結構化輸出不是物件');
+  if (typeof value.title !== 'string') throw new Error('結構化輸出的 title 不是字串');
   if (typeof value.overview !== 'string') throw new Error('結構化輸出的 overview 不是字串');
   if (
     !Array.isArray(value.topics)

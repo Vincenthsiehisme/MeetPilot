@@ -7,7 +7,7 @@ import { dirname } from 'node:path';
 // 不上 observability 平台的門檻見 vault 的 AGENT-EVAL-METHODS〈不要上 observability 平台〉。
 
 export type LlmCallKind =
-  | 'transcribe' | 'polish' | 'analyze' | 'chat-stream' | 'extract-tags'
+  | 'transcribe' | 'polish' | 'analyze' | 'extract-tags'
   // W4：'embed' 是題目標籤的 embedding（S2 召回的原料），'link-judge' 是兩場會的 S3 判定。
   // 分成兩個 kind 而不是一個 'link'：兩者的額度池、成本與失敗意義都不同——embedding 失敗是
   // 「這場會算不出候選」，判定失敗是「候選判不完」，混成一個之後那份紀錄回答不了「首選模型多常不可用」
@@ -37,8 +37,8 @@ export interface LlmUsage {
 export interface LlmCallInput {
   kind: LlmCallKind;
   // 這場呼叫算在哪一場會議頭上，事後才查得出「這場會燒了多少 token」。
-  // null／缺省代表這次呼叫真的沒有單一會議可歸——目前只有前端兩條舊路由
-  // （polish、chat-stream）還沒把 meetingId 帶進請求，其餘 kind 一律會傳
+  // null／缺省代表這次呼叫真的沒有單一會議可歸——目前只有前端的 polish 舊路由
+  // 還沒把 meetingId 帶進請求，其餘 kind 一律會傳
   meetingId?: string | null;
   // 這次實際打的 model id
   model: string;

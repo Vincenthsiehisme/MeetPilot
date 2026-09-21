@@ -6,6 +6,7 @@ import {
   importLegacyJobs,
   listMeetings,
   patchAnalysis,
+  patchTitle,
   patchTranscript,
   retryMeeting,
   submitAudio,
@@ -284,5 +285,15 @@ describe('meetingClient', () => {
     const err = await listMeetings().catch((e: unknown) => e);
     expect((err as HttpError).status).toBe(502);
     expect((err as HttpError).message).toContain('伺服器短暫無回應');
+  });
+
+  it('改標題打 PATCH /title，body 只有 title，回傳 server 存下來的那一份', async () => {
+    fetchMock.mockResolvedValueOnce(respond(200, JSON.stringify({ title: '週會' })));
+
+    await expect(patchTitle('m_1', ' 週會 ')).resolves.toBe('週會');
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe('/api/meetings/m_1/title');
+    expect(init.method).toBe('PATCH');
+    expect(JSON.parse(init.body)).toEqual({ title: ' 週會 ' });
   });
 });

@@ -30,12 +30,14 @@ export interface GeminiOutput {
   }[];
   decisions: string[];
   action_items: string[];
-  // risk 與 open_questions 已移除，移至 Chat 功能
+  // v1 沒有 open_questions；C-ANALYSIS v3（analysisContract.ts）把它加回來，v1 → v2 → v3 升級時補空陣列
 }
 
 export interface Job {
   id: string;
   fileName: string;
+  /** 這場會的名字。分析完成時模型給建議、之後人可以改；沒有就 undefined，畫面退回 fileName（meetingTitle.ts） */
+  title?: string;
   fileSize: number;
   createdAt: number;
   updatedAt: number;
@@ -68,6 +70,7 @@ export interface Job {
  */
 export interface Meeting {
   meeting_id: string;
+  /** 分析完成時 pipeline 填模型的建議（只在還是 null 時），之後由 `PATCH /title` 改；畫面名稱與下載檔名用它 */
   title: string | null;
   status: MeetingStatus;
   created_at: number;
@@ -88,12 +91,6 @@ export interface Meeting {
   topic_extraction_status: TopicExtractionStatus | null;
   /** 抽取失敗的原因。只有 'failed' 會有值，其餘一律 null */
   topic_extraction_error: string | null;
-}
-
-export interface ChatMessage {
-  role: 'user' | 'model';
-  text: string;
-  timestamp: number;
 }
 
 export interface AppState {

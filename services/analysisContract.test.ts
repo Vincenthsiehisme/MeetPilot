@@ -131,6 +131,7 @@ const transcript: TranscriptSegment[] = [seg(0, 10, '第一段'), seg(10, 20, '�
 
 describe('buildAnalysisV3FromModelOutput', () => {
   const baseOutput: AnalysisModelOutput = {
+    title: '標題',
     overview: '主旨',
     topics: [{ title: 'T', content: 'C' }],
     decisions: [{ text: '決議', segment_from: 1, segment_to: 2, decided_by: '小美' }],
@@ -185,6 +186,7 @@ describe('buildAnalysisV3FromModelOutput', () => {
 
 describe('assertAnalysisModelOutput', () => {
   const valid: AnalysisModelOutput = {
+    title: '標題',
     overview: 'x',
     topics: [{ title: 'T', content: 'C' }],
     decisions: [{ text: 'd', segment_from: 1, segment_to: 1, decided_by: null }],
@@ -202,6 +204,11 @@ describe('assertAnalysisModelOutput', () => {
 
   it('overview 不是字串時拋錯', () => {
     expect(() => assertAnalysisModelOutput({ ...valid, overview: 123 })).toThrow(/overview/);
+  });
+
+  it('缺 title 或 title 不是字串時拋錯', () => {
+    expect(() => assertAnalysisModelOutput({ ...valid, title: undefined })).toThrow(/title/);
+    expect(() => assertAnalysisModelOutput({ ...valid, title: 42 })).toThrow(/title/);
   });
 
   it('decisions 缺 decided_by 或型別不對時拋錯', () => {

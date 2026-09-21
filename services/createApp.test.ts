@@ -35,7 +35,7 @@ let cancelled: string[];
 const fakeGemini = (): GeminiServerClient => ({
   transcribeSlice: async () => [],
   polishTranscript: async () => '潤過的',
-  analyzeTranscript: async () => ({ overview: 'x', topics: [], decisions: [], action_items: [], open_questions: [] }),
+  analyzeTranscript: async () => ({ title: 't', overview: 'x', topics: [], decisions: [], action_items: [], open_questions: [] }),
   // 路由這一層不跑轉錄鏈，抽標籤也不會被呼叫到；形狀要在，缺了型別就對不上
   extractTopicTags: async () => [],
   embeddingModel: 'fake-embedding',
@@ -704,5 +704,71 @@ describe('W5：PATCH 逐字稿／分析之後同步重投影', () => {
 
     expect(res.status).not.toBe(200);
     expect(vaultFileContent()).toBe(before);
+  });
+});
+
+describe('POST /api/meetings 帶 title', () => {
+  // 跟 PATCH /title 走同一支 checkMeetingTitle：不然帶不合規則標題的建立請求能繞過驗證，
+  // 把壞掉的值直接存成 title，pipeline「title === null 才填建議」的判斷永遠不會補正
+  // （2026-09-20 Codex review 抓到）
+  it('合法標題 trim 後存下來', async () => {
+    await start();
+    const { status, body } = await createMeeting({ fileName: 'a.m4a', fileSize: 10, title: '  週會  ' });
+    expect(status).toBe(201);
+    expect(body.meeting.title).toBe('週會');
+  });
+
+  it('空白、超過 100 字、含控制字元的標題回 400，不建立會議', async () => {
+    await start();
+    for (const title of ['   ', 'x'.repeat(101), '週會\n第二週']) {
+      const { status, body } = await createMeeting({ fileName: 'a.m4a', fileSize: 10, title });
+      expect(status).toBe(400);
+      expect(body.error).toBeTruthy();
+    }
+    expect((await (await fetch(`${url}/api/meetings`)).json() as any).meetings).toEqual([]);
+  });
+
+  it('沒給 title 時是 null，不是空字串', async () => {
+    await start();
+    const { body } = await createMeeting({ fileName: 'a.m4a', fileSize: 10 });
+    expect(body.meeting.title).toBeNull();
+  });
+});
+
+describe('PATCH /api/meetings/:id/title', () => {
+  const readyMeeting = (id = 'm-1') => {
+    store.createMeeting({ meeting_id: id, created_at: T0, source_file_name: 'a.m4a', source_file_size: 1 });
+    store.setStatus(id, 'TRANSCRIBING', T0);
+    store.setStatus(id, 'ANALYZING', T0);
+    store.setStatus(id, 'READY', T0);
+  };
+  const patchTitle = (id: string, body: unknown) =>
+    fetch(`${url}/api/meetings/${id}/title`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+  it('寫入標題，之後 GET 詳情帶新標題', async () => {
+    readyMeeting();
+    await start();
+    const res = await patchTitle('m-1', { title: ' 週會 ' });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ title: '週會' });
+    const detail = await (await fetch(`${url}/api/meetings/m-1`)).json() as any;
+    expect(detail.meeting.title).toBe('週會');
+  });
+
+  it('空標題回 400，訊息講得出原因', async () => {
+    readyMeeting();
+    await start();
+    const res = await patchTitle('m-1', { title: '   ' });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as any).error).toContain('空');
+  });
+
+  it('找不到的會回 404', async () => {
+    await start();
+    expect((await patchTitle('nope', { title: '週會' })).status).toBe(404);
   });
 });

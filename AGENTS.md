@@ -61,9 +61,9 @@ codegraph sync      # 沒東西要同步時很快，有東西時會印 Synced N 
 | `export async function* generateAudioSlices()`（具名 generator） | **只有預設參數與型別，body 的呼叫一個都沒有** |
 
 **2026-09-14（W2）更新：`generateAudioSlices` 與 `services/audioService.ts` 已經刪掉**（切片搬到
-server 端 ffmpeg）。下面這段的結論仍然成立，但那個具名 generator 的對照組**已經沒辦法重跑**；
-repo 現存的 generator 只剩 `askDocumentStream` 一個（匿名）。下次要驗具名 generator 的行為，
-得自己寫一個來試。
+server 端 ffmpeg）。**2026-09-20 更新：`askDocumentStream` 連同整個問答功能也刪掉了。** 下面這段的
+結論仍然成立，但兩個對照組**都已經沒辦法重跑**；repo 現在沒有任何 generator。下次要驗 generator 的
+行為，得自己寫一個來試。
 
 具名 generator 最危險：它會回東西，讓人以為 body 被解析過。`generateAudioSlices` 的兩筆是
 `SLICE_OVERLAP_SECONDS`（來自 `audioService.ts:150` 的預設參數）與 `TranscriptSegment`
@@ -74,7 +74,8 @@ repo 現存的 generator 只剩 `askDocumentStream` 一個（匿名）。下次�
 
 所以 `callees` 對 generator 沒有意義，空和非空都不能當證據。要確認某個函式有沒有走共用
 路徑，只有讀碼算數。`callers` 從共用函式那頭反查可以縮小範圍，但**它只到檔案層級**：
-`codegraph callers postStream` 回的是 `file geminiService.ts`，不會指名 `askDocumentStream`。
+當時 `codegraph callers postStream` 回的是 `file geminiService.ts`，不會指名 `askDocumentStream`
+（兩個符號都已隨問答功能刪除，這裡留的是行為紀錄）。
 
 **三、符號查詢是模糊比對，查一個不存在的名字可能拿到別人的答案。** 2026-09-14 刪掉
 `askDocument` 之後，`codegraph callers askDocument` 仍回 3 筆，內容其實是
@@ -116,7 +117,7 @@ codegraph affected --stdin --quiet --filter "services/*.test.ts"
 | `services/printDocument.ts` | `printDocument.test.ts` | — |
 | `services/escapeHtml.ts` | `escapeHtml.test.ts`、`printDocument.test.ts` | — |
 | `services/storageService.ts` | **（空）** | **假的空。有測試**，但 `storageService.test.ts` 用 `vi.resetModules()` ＋ `await import('./storageService')` 動態載入（為了清模組層的連線快取），圖上沒有 import 邊 |
-| `services/geminiService.ts` | （空） | 真的空，沒有測試 import 它 |
+| `services/geminiService.ts` | （2026-09-14 實測時空） | 當時真的空；之後加了 `geminiService.test.ts`，這一列**未重測**，別當成現況 |
 | `server.ts` | （空） | 真的空 |
 | `App.tsx` | （空） | 真的空 |
 

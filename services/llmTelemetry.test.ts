@@ -205,7 +205,7 @@ describe('buildLlmRecord', () => {
     });
   });
 
-  it('meetingId 有傳就記得下來，沒傳（含前端 polish／chat-stream 舊路由）記 null', () => {
+  it('meetingId 有傳就記得下來，沒傳（前端 polish 舊路由）記 null', () => {
     const withId = buildLlmRecord({
       kind: 'transcribe',
       meetingId: 'meeting-123',
@@ -220,11 +220,11 @@ describe('buildLlmRecord', () => {
     expect(withId.meetingId).toBe('meeting-123');
 
     const withoutId = buildLlmRecord({
-      kind: 'chat-stream',
+      kind: 'polish',
       model: 'gemini-3.8-flash',
       modelIndex: 0,
       attempt: 1,
-      streamed: true,
+      streamed: false,
       latencyMs: 100,
       outcome: 'ok',
       now: FIXED_NOW,
@@ -351,7 +351,7 @@ describe('buildLlmRecord', () => {
 
   it('串流成功時 ttfbMs 記得下來', () => {
     const record = buildLlmRecord({
-      kind: 'chat-stream',
+      kind: 'transcribe',
       model: 'gemini-3.8-flash',
       modelIndex: 0,
       attempt: 1,

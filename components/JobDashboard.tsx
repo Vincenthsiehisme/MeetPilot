@@ -1,6 +1,7 @@
 
 import React from 'react';
 import { Job, JobStatus } from '../types';
+import { jobDisplayName } from '../services/meetingTitle';
 
 interface JobDashboardProps {
   jobs: Job[];
@@ -37,7 +38,8 @@ const JobDashboard: React.FC<JobDashboardProps> = ({
   const hasFinishedJobs = jobs.some(j => j.status === JobStatus.COMPLETED || j.status === JobStatus.FAILED);
 
   const filteredJobs = jobs.filter(job => {
-    const matchesSearch = job.fileName.toLowerCase().includes(searchQuery.toLowerCase());
+    const query = searchQuery.toLowerCase();
+    const matchesSearch = jobDisplayName(job).toLowerCase().includes(query) || job.fileName.toLowerCase().includes(query);
     const matchesFilter = filterStatus === 'ALL' || job.status === filterStatus;
     return matchesSearch && matchesFilter;
   });
@@ -121,7 +123,7 @@ const JobDashboard: React.FC<JobDashboardProps> = ({
                 
                 <div className="mb-2">
                   <div className="flex justify-between items-start gap-2">
-                    <h4 className={`font-bold text-sm truncate flex-1 ${isActive ? 'text-indigo-900' : 'text-slate-700'}`}>{job.fileName}</h4>
+                    <h4 className={`font-bold text-sm truncate flex-1 ${isActive ? 'text-indigo-900' : 'text-slate-700'}`}>{jobDisplayName(job)}</h4>
                     <button 
                       onClick={(e) => { e.stopPropagation(); onDeleteJob(job.id); }}
                       className="opacity-0 group-hover:opacity-100 text-slate-300 hover:text-rose-500 transition-all p-0.5"

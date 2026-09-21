@@ -104,7 +104,7 @@ describe('buildPrintDocument', () => {
 
     expect(html.startsWith('<!DOCTYPE html>')).toBe(true);
     expect(html).toContain('<title>meeting.mp3 - Meeting Minutes</title>');
-    expect(html).toContain('<h1>會議記錄</h1>');
+    expect(html).toContain('<h1>meeting.mp3</h1>');
     expect(html).toContain('<h3>會議主旨</h3>\n<div class="pre">討論 Q4 目標</div>');
     expect(html).toContain(
       '<div class="topic-item"><span class="topic-title">預算</span><div class="pre">第一行\n第二行</div></div>'
@@ -113,5 +113,20 @@ describe('buildPrintDocument', () => {
     expect(html.indexOf('<h2>討論</h2>')).toBeLessThan(html.indexOf('<h2>決議</h2>'));
     expect(html.indexOf('<h2>決議</h2>')).toBeLessThan(html.indexOf('<h2>待辦</h2>'));
     expect(html.indexOf('<h2>待辦</h2>')).toBeLessThan(html.indexOf('<h2>未決事項</h2>'));
+  });
+});
+
+describe('標題', () => {
+  it('有標題時 <title>（另存 PDF 的預設檔名）用清過的標題、h1 用原標題，FILE 仍是原始檔名', () => {
+    const html = buildPrintDocument({ ...baseJob, title: 'Q3/預算: 覆盤' }, baseAnalysis);
+    expect(html).toContain('<title>Q3預算 覆盤 - Meeting Minutes</title>');
+    expect(html).toContain('<h1>Q3/預算: 覆盤</h1>');
+    expect(html).toContain('FILE: meeting.mp3');
+  });
+
+  it('沒有標題時 h1 退回原始檔名（跟畫面上的 SummaryView 一致），<title> 也是原始檔名', () => {
+    const html = buildPrintDocument(baseJob, baseAnalysis);
+    expect(html).toContain('<h1>meeting.mp3</h1>');
+    expect(html).toContain('<title>meeting.mp3 - Meeting Minutes</title>');
   });
 });

@@ -4,7 +4,7 @@ import { AnalysisV3 } from './analysisContract';
 import { AudioFileStore } from './audioFileStore';
 import { openMeetingDb } from './meetingDb';
 import { MeetingStore, createMeetingStore } from './meetingStore';
-import { deleteMeetingRequest, patchAnalysisRequest, patchTranscriptRequest } from './meetingEdits';
+import { deleteMeetingRequest, patchAnalysisRequest, patchTitleRequest, patchTranscriptRequest } from './meetingEdits';
 
 const T0 = 1_700_000_000_000;
 const T1 = T0 + 5_000;
@@ -379,5 +379,37 @@ describe('PATCH /api/meetings/:id/analysis', () => {
 
     expect(outcome.status).toBe(404);
     expect((outcome.body as { error: string }).error).toContain('還沒有分析結果');
+  });
+});
+
+describe('PATCH /api/meetings/:id/title', () => {
+  it('trim 後寫入並回傳寫進去的標題，updated_at 更新、status 不動', () => {
+    readyMeeting();
+    const outcome = patchTitleRequest({ store }, 'm-1', { title: '  Q3 預算覆盤  ' }, T1);
+    expect(outcome).toEqual({ status: 200, body: { title: 'Q3 預算覆盤' } });
+    const meeting = store.getMeeting('m-1')!;
+    expect(meeting.title).toBe('Q3 預算覆盤');
+    expect(meeting.updated_at).toBe(T1);
+    expect(meeting.status).toBe('READY');
+  });
+
+  it('不是字串、空字串、超過 100 字、含換行、沒給欄位各回 400，而且不寫入', () => {
+    readyMeeting();
+    for (const body of [{ title: 42 }, { title: '   ' }, { title: 'x'.repeat(101) }, { title: 'a\nb' }, {}, null]) {
+      expect(patchTitleRequest({ store }, 'm-1', body, T1).status).toBe(400);
+    }
+    expect(store.getMeeting('m-1')?.title).toBeNull();
+  });
+
+  it('Meeting 不存在時回 404', () => {
+    expect(patchTitleRequest({ store }, 'nope', { title: '週會' }, T1).status).toBe(404);
+  });
+
+  it('分析中回 409：pipeline 在分析結尾才判標題是不是 null，這時放行會被它蓋掉', () => {
+    readyMeeting();
+    moveTo('ANALYZING');
+    const outcome = patchTitleRequest({ store }, 'm-1', { title: '週會' }, T1);
+    expect(outcome.status).toBe(409);
+    expect(store.getMeeting('m-1')?.title).toBeNull();
   });
 });
