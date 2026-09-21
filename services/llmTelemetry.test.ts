@@ -63,6 +63,7 @@ describe('extractUsage', () => {
       extractUsage({ usageMetadata: { promptTokenCount: '1200', candidatesTokenCount: NaN } })
     ).toEqual({ promptTokens: null, outputTokens: null, thoughtsTokens: null, totalTokens: null });
   });
+
 });
 
 describe('extractFinishReason', () => {
@@ -78,6 +79,7 @@ describe('extractFinishReason', () => {
     expect(extractFinishReason(null)).toBeNull();
     expect(extractFinishReason(undefined)).toBeNull();
   });
+
 });
 
 describe('extractBlockReason', () => {
@@ -109,6 +111,7 @@ describe('extractCandidatesCount', () => {
     expect(extractCandidatesCount(null)).toBeNull();
     expect(extractCandidatesCount(undefined)).toBeNull();
   });
+
 });
 
 describe('describeLlmError', () => {

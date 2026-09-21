@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
-import { GeminiOutput, TranscriptSegment } from '../types';
+import { TranscriptSegment } from '../types';
+import { AnalysisModelOutput } from './analysisContract';
 import { AudioFileStore } from './audioFileStore';
 import { AudioSlicer } from './audioSlicer';
 import { GeminiServerClient } from './geminiServerClient';
@@ -41,11 +42,14 @@ const fakeSlicer = (durationSeconds: number, readSlice?: AudioSlicer['readSlice'
   readSlice: readSlice ?? (async (_path, start) => Buffer.from(`wav@${start}`)),
 });
 
-const analysis: GeminiOutput = {
+/** gemini.analyzeTranscript 的回傳形狀（segment_from／segment_to，不是秒數）。
+ * segment_from/to 都指第 1 段：analyze() 呼叫前已經擋掉空逐字稿，至少有第 1 段可以指 */
+const analysisOutput: AnalysisModelOutput = {
   overview: '一句話主旨',
   topics: [{ title: '議題 A', content: '內容' }],
-  decisions: ['決定 A'],
-  action_items: ['待辦 A'],
+  decisions: [{ text: '決定 A', segment_from: 1, segment_to: 1, decided_by: null }],
+  action_items: [{ text: '待辦 A', segment_from: 1, segment_to: 1, assignee: null, due: null }],
+  open_questions: [],
 };
 
 /**
@@ -78,7 +82,7 @@ const fakeGemini = (overrides: Partial<GeminiServerClient> = {}): GeminiServerCl
     { start: offsetSeconds, end: offsetSeconds + 30, text: `第 ${offsetSeconds} 秒開始`, speaker: 'Speaker 1' },
   ],
   polishTranscript: async () => '潤過的',
-  analyzeTranscript: async () => analysis,
+  analyzeTranscript: async () => analysisOutput,
   extractTopicTags: async () => [{ title: '題目 A', content: '這場會對題目 A 的討論' }],
   embeddingModel: 'fake-embedding',
   // W4 的兩支。這一層不算關聯，形狀要在，缺了型別就對不上
@@ -550,7 +554,7 @@ describe('run：失敗', () => {
 
   it('每一片都沒轉出內容時擋在分析前面，不送空逐字稿去生一份憑空的摘要', async () => {
     newMeeting();
-    const analyzeTranscript = vi.fn(async () => analysis);
+    const analyzeTranscript = vi.fn(async () => analysisOutput);
     const pipeline = pipelineWith({
       store,
       audioStore: fakeAudioStore(new Set(['m-1'])),

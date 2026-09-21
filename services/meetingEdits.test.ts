@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
-import { AnalysisV2 } from './analysisContract';
+import { AnalysisV3 } from './analysisContract';
 import { AudioFileStore } from './audioFileStore';
 import { openMeetingDb } from './meetingDb';
 import { MeetingStore, createMeetingStore } from './meetingStore';
@@ -31,12 +31,16 @@ const fakeQueue = (cancelled: string[] = []) => ({
   cancel: (id: string) => { cancelled.push(id); return true; },
 });
 
-const analysis: AnalysisV2 = {
-  contract_version: 2,
+const analysis: AnalysisV3 = {
+  contract_version: 3,
   overview: '主旨',
   topics: [{ title: '議題 A', content: '內容' }],
-  decisions: ['決定 A'],
-  action_items: [{ text: '待辦 A', source_meeting_id: 'm-1', created_at: T0, status: 'unknown' }],
+  decisions: [{ text: '決定 A', evidence: { start: 0, end: 5 }, decided_by: null }],
+  action_items: [{
+    text: '待辦 A', source_meeting_id: 'm-1', created_at: T0, status: 'unknown',
+    assignee: null, due: null, evidence: null,
+  }],
+  open_questions: [],
 };
 
 // 已經跑完的一場會：逐字稿、分析、標籤、音檔都在
@@ -243,7 +247,11 @@ describe('PATCH /api/meetings/:id/transcript', () => {
 });
 
 describe('PATCH /api/meetings/:id/analysis', () => {
-  const edited: AnalysisV2 = { ...analysis, overview: '改過的主旨', decisions: ['改過的決定'] };
+  const edited: AnalysisV3 = {
+    ...analysis,
+    overview: '改過的主旨',
+    decisions: [{ text: '改過的決定', evidence: { start: 1, end: 9 }, decided_by: '小美' }],
+  };
 
   it('整份覆寫並回傳寫進去的那一份', () => {
     readyMeeting();
@@ -267,8 +275,23 @@ describe('PATCH /api/meetings/:id/analysis', () => {
   it.each([
     ['analysis 不是物件', { analysis: '一段文字' }, 'analysis 必須是物件'],
     ['整個 body 沒有 analysis', {}, 'analysis 必須是物件'],
-    ['contract_version 不是 2', { analysis: { ...edited, contract_version: 1 } }, 'contract_version 必須是 2'],
-    ['欄位形狀不對', { analysis: { ...edited, topics: '不是陣列' } }, '形狀不是 C-ANALYSIS v2'],
+    ['contract_version 不是 3', { analysis: { ...edited, contract_version: 2 } }, 'contract_version 必須是 3'],
+    ['欄位形狀不對', { analysis: { ...edited, topics: '不是陣列' } }, '形狀不是 C-ANALYSIS v3'],
+    [
+      'decisions 的 evidence 形狀不對',
+      { analysis: { ...edited, decisions: [{ text: 'x', evidence: { start: '0', end: 5 }, decided_by: null }] } },
+      '形狀不是 C-ANALYSIS v3',
+    ],
+    [
+      'decisions 的 evidence start 大於 end',
+      { analysis: { ...edited, decisions: [{ text: 'x', evidence: { start: 9, end: 1 }, decided_by: null }] } },
+      '形狀不是 C-ANALYSIS v3',
+    ],
+    [
+      'open_questions 不是陣列',
+      { analysis: { ...edited, open_questions: '不是陣列' } },
+      '形狀不是 C-ANALYSIS v3',
+    ],
   ])('%s 時回 400，既有分析不動', (_label, body, expected) => {
     readyMeeting();
 
@@ -279,15 +302,17 @@ describe('PATCH /api/meetings/:id/analysis', () => {
     expect(store.getAnalysis('m-1')?.overview).toBe('主旨');
   });
 
-  it('四個欄位都空的分析回 400，標準與 saveAnalysis 一致', () => {
+  it('五個欄位都空的分析回 400，標準與 saveAnalysis 一致', () => {
     readyMeeting();
 
     const outcome = patchAnalysisRequest({ store }, 'm-1', {
-      analysis: { contract_version: 2, overview: '  ', topics: [], decisions: [], action_items: [] },
+      analysis: {
+        contract_version: 3, overview: '  ', topics: [], decisions: [], action_items: [], open_questions: [],
+      },
     }, T1);
 
     expect(outcome.status).toBe(400);
-    expect((outcome.body as { error: string }).error).toContain('四個欄位都是空的');
+    expect((outcome.body as { error: string }).error).toContain('五個欄位都是空的');
     expect(store.getAnalysis('m-1')?.overview).toBe('主旨');
   });
 
@@ -306,10 +331,13 @@ describe('PATCH /api/meetings/:id/analysis', () => {
   );
 
   it.each([
-    ['status 不是三值列舉', { text: 't', source_meeting_id: 'm-1', created_at: T0, status: '完成了嗎' }],
-    ['created_at 不是數字', { text: 't', source_meeting_id: 'm-1', created_at: '不是數字', status: 'open' }],
-    ['source_meeting_id 不是字串', { text: 't', source_meeting_id: 42, created_at: T0, status: 'open' }],
-    ['缺 status', { text: 't', source_meeting_id: 'm-1', created_at: T0 }],
+    ['status 不是三值列舉', { text: 't', source_meeting_id: 'm-1', created_at: T0, status: '完成了嗎', assignee: null, due: null, evidence: null }],
+    ['created_at 不是數字', { text: 't', source_meeting_id: 'm-1', created_at: '不是數字', status: 'open', assignee: null, due: null, evidence: null }],
+    ['source_meeting_id 不是字串', { text: 't', source_meeting_id: 42, created_at: T0, status: 'open', assignee: null, due: null, evidence: null }],
+    ['缺 status', { text: 't', source_meeting_id: 'm-1', created_at: T0, assignee: null, due: null, evidence: null }],
+    ['assignee 不是字串或 null', { text: 't', source_meeting_id: 'm-1', created_at: T0, status: 'open', assignee: 42, due: null, evidence: null }],
+    ['due 不是字串或 null', { text: 't', source_meeting_id: 'm-1', created_at: T0, status: 'open', assignee: null, due: 42, evidence: null }],
+    ['evidence 不是 null 或 {start,end}', { text: 't', source_meeting_id: 'm-1', created_at: T0, status: 'open', assignee: null, due: null, evidence: '不對' }],
   ])('action_items 的 %s 時回 400，不讓壞形狀原樣落地', (_label, item) => {
     readyMeeting();
 
@@ -322,11 +350,17 @@ describe('PATCH /api/meetings/:id/analysis', () => {
     expect(store.getAnalysis('m-1')?.overview).toBe('主旨');
   });
 
-  it('action_items 形狀正確時收下，assignee 可以不給', () => {
+  it('action_items 形狀正確時收下，assignee／due／evidence 可以是 null', () => {
     readyMeeting();
 
     const outcome = patchAnalysisRequest({ store }, 'm-1', {
-      analysis: { ...edited, action_items: [{ text: 't', source_meeting_id: 'm-1', created_at: T0, status: 'done' }] },
+      analysis: {
+        ...edited,
+        action_items: [{
+          text: 't', source_meeting_id: 'm-1', created_at: T0, status: 'done',
+          assignee: null, due: null, evidence: null,
+        }],
+      },
     }, T1);
 
     expect(outcome.status).toBe(200);

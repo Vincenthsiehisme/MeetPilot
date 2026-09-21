@@ -47,7 +47,7 @@ const fakeGemini = (options: FakeOptions = {}): GeminiServerClient => ({
   embeddingModel: options.embeddingModel ?? 'test-embedding',
   transcribeSlice: async () => [],
   polishTranscript: async () => '',
-  analyzeTranscript: async () => ({ overview: 'x', topics: [], decisions: [], action_items: [] }),
+  analyzeTranscript: async () => ({ overview: 'x', topics: [], decisions: [], action_items: [], open_questions: [] }),
   extractTopicTags: async () => [],
   embedTopicTags: options.embed ?? (async (texts) => {
     embedded.push([...texts]);

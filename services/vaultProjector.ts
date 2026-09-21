@@ -18,7 +18,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, w
 import { homedir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { TranscriptSegment } from '../types';
-import { ActionItemV2 } from './analysisContract';
+import { ActionItemV3, DecisionV3, Evidence, OpenQuestionV3 } from './analysisContract';
 import { MeetingStatus } from './meetingState';
 import { MeetingStore } from './meetingStore';
 import { LINK_ALGO_VERSION } from './topicLink';
@@ -130,24 +130,30 @@ export const toMeetpilotStatus = (status: MeetingStatus): MeetpilotStatus => {
   return 'linking';
 };
 
-const ACTION_ITEM_STATUS_LABEL: Record<ActionItemV2['status'], string> = {
-  unknown: '狀態不明',
-  open: '待處理',
-  done: '已完成',
-};
-
 interface RelatedMeetingRender {
   displayName: string;
   confidence: number;
   sharedTopics: readonly string[];
   evidence: string;
-  decisions: readonly string[];
+  /** 那場會的決議物件（v3），不是純字串——SDD 1.3.1 已改成子彈清單，這裡只取 text，
+   * 出處是那場會自己逐字稿的位置，跟這份投影檔（另一場會）沒有對得上的意義 */
+  decisions: readonly DecisionV3[];
 }
+
+/** v3 的 evidence 顯示成 MM:SS–MM:SS，跟 exportUtils.ts／printDocument.ts 同一種格式 */
+const formatEvidenceRange = (evidence: Evidence | null): string | null => {
+  if (evidence === null) return null;
+  const fmt = (s: number) => `${Math.floor(s / 60).toString().padStart(2, '0')}:${Math.floor(s % 60).toString().padStart(2, '0')}`;
+  return `${fmt(evidence.start)}–${fmt(evidence.end)}`;
+};
 
 /**
  * `## 相關會議` 段。**空集合與未完成絕不可以寫成同一句話**（SDD 1.3.1，2.3 的「不會有人發現的
  * 壞法」）：`linking` 是「還沒算」，`linked` 加空陣列是「算過了，沒有同題目的會」，
  * `link_failed` 要帶原因與重試方式。
+ *
+ * 「那場會的結論」改成子彈清單（v0.6）：原本用全形分號串成一行，決議本身可能就含逗號或分號，
+ * 串起來之後分不出是幾條；改成每條一個 `    - ` 子彈，跟本檔自己 `## 結論` 段的格式一致。
  */
 const renderRelatedMeetingsSection = (
   status: MeetpilotStatus,
@@ -161,12 +167,17 @@ const renderRelatedMeetingsSection = (
   }
   if (related.length === 0) return '沒有找到與這場會同題目的歷史會議。';
   return related
-    .map((r) => [
-      `- [[${r.displayName}]]（信心 ${r.confidence.toFixed(2)}）`,
-      `  - 共同題目：${r.sharedTopics.join('、')}`,
-      `  - 判定理由：${r.evidence}`,
-      `  - 那場會的結論：${r.decisions.length > 0 ? r.decisions.join('；') : '（那場會沒有結論）'}`,
-    ].join('\n'))
+    .map((r) => {
+      const decisionsBlock = r.decisions.length > 0
+        ? [`  - 那場會的結論：`, ...r.decisions.map((d) => `    - ${d.text}`)].join('\n')
+        : '  - 那場會的結論：（那場會沒有明確決議）';
+      return [
+        `- [[${r.displayName}]]（信心 ${r.confidence.toFixed(2)}）`,
+        `  - 共同題目：${r.sharedTopics.join('、')}`,
+        `  - 判定理由：${r.evidence}`,
+        decisionsBlock,
+      ].join('\n');
+    })
     .join('\n');
 };
 
@@ -175,14 +186,39 @@ const renderTopicTagsSection = (tags: readonly TopicTag[]): string =>
     ? tags.map((t) => `- ${t.title}${t.source === 'manual' ? '（人工修正）' : ''}`).join('\n')
     : '（沒有抽到題目標籤）';
 
-const renderDecisionsSection = (decisions: readonly string[]): string =>
-  decisions.length > 0 ? decisions.map((d) => `- ${d}`).join('\n') : '（沒有結論）';
+/** 決議每條附出處與拍板者，缺的部分省略；v2 升上來的舊資料 evidence／decided_by 是 null，
+ * 呈現退回純文字（SDD 1.3.1 v0.6） */
+const renderDecisionsSection = (decisions: readonly DecisionV3[]): string => {
+  if (decisions.length === 0) return '本場沒有明確決議。';
+  return decisions.map((d) => {
+    const meta = [d.decided_by ? `拍板：${d.decided_by}` : null, formatEvidenceRange(d.evidence)]
+      .filter((x): x is string => x !== null);
+    return meta.length > 0 ? `- ${d.text}（${meta.join('，')}）` : `- ${d.text}`;
+  }).join('\n');
+};
 
-/** `unknown` 照 D-004 原樣顯示為「狀態不明」，不補成待處理（SDD 1.3.1〈各段的內容與來源〉） */
-const renderActionItemsSection = (items: readonly ActionItemV2[]): string =>
-  items.length > 0
-    ? items.map((it) => `- ${it.text}（狀態：${ACTION_ITEM_STATUS_LABEL[it.status]}）`).join('\n')
-    : '（沒有待辦）';
+/** 待辦每條附負責人、期限與出處，缺的部分省略。**不印 status**（v0.6 起）：
+ * status 是系統內部的追蹤欄位，留在 SQLite，不是規範要求人讀的內容 */
+const renderActionItemsSection = (items: readonly ActionItemV3[]): string => {
+  if (items.length === 0) return '本場沒有待辦。';
+  return items.map((it) => {
+    const meta = [
+      it.assignee ? `負責人：${it.assignee}` : null,
+      it.due ? `期限：${it.due}` : null,
+      formatEvidenceRange(it.evidence),
+    ].filter((x): x is string => x !== null);
+    return meta.length > 0 ? `- ${it.text}（${meta.join('；')}）` : `- ${it.text}`;
+  }).join('\n');
+};
+
+/** 未決事項（v3 新增段）：有人提出、當場沒結論的問題，只附出處 */
+const renderOpenQuestionsSection = (questions: readonly OpenQuestionV3[]): string => {
+  if (questions.length === 0) return '本場沒有未決事項。';
+  return questions.map((q) => {
+    const meta = formatEvidenceRange(q.evidence);
+    return meta !== null ? `- ${q.text}（${meta}）` : `- ${q.text}`;
+  }).join('\n');
+};
 
 const renderTopicsSection = (topics: readonly { title: string; content: string }[]): string =>
   topics.length > 0
@@ -191,8 +227,9 @@ const renderTopicsSection = (topics: readonly { title: string; content: string }
 
 interface SystemRegionInput {
   title: string;
-  decisions: readonly string[];
-  actionItems: readonly ActionItemV2[];
+  decisions: readonly DecisionV3[];
+  actionItems: readonly ActionItemV3[];
+  openQuestions: readonly OpenQuestionV3[];
   topics: readonly { title: string; content: string }[];
   topicTags: readonly TopicTag[];
   relatedSection: string;
@@ -207,6 +244,9 @@ export const renderSystemRegion = (input: SystemRegionInput): string => [
   '',
   '## 待辦',
   renderActionItemsSection(input.actionItems),
+  '',
+  '## 未決事項',
+  renderOpenQuestionsSection(input.openQuestions),
   '',
   '## 討論題目',
   renderTopicsSection(input.topics),
@@ -466,6 +506,7 @@ export const createVaultProjector = (deps: VaultProjectorDeps) => {
       title,
       decisions: analysis.decisions,
       actionItems: analysis.action_items,
+      openQuestions: analysis.open_questions,
       topics: analysis.topics,
       topicTags,
       relatedSection,

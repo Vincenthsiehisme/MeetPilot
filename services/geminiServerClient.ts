@@ -10,10 +10,40 @@
  * 全部照 server.ts 原樣搬過來，路由那邊只剩參數檢查與 res 的形狀。
  */
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
-import { GeminiOutput, TranscriptSegment } from '../types';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { TranscriptSegment } from '../types';
+import { AnalysisModelOutput, assertAnalysisModelOutput } from './analysisContract';
 import { normalizeTranscribedSegments } from './transcribeSegments';
 import { LlmCallKind, LlmLogger } from './llmTelemetry';
 import { PairJudgement } from './topicLink';
+
+/**
+ * 會議記錄規範正本，`analyzeTranscript` 的 systemInstruction 從這裡讀（2026-09-20，
+ * vault「MeetPilot · 會議記錄規範與拖曳上傳」）。在建 client 的當下就讀（server 啟動時），
+ * 讀不到或空檔直接讓啟動失敗，理由同 `createLlmLogger` 啟動就開檔：不要等第一場會分析完
+ * 才發現規範沒生效。內容只決定「好的紀錄長什麼樣」，不是這個檔的職責，改行為去改規範檔。
+ *
+ * 預設相對 `process.cwd()`，跟啟動目錄綁死；換啟動目錄會讀不到。跟 `MEETPILOT_AUDIO_DIR`／
+ * `MEETPILOT_DB` 同一套逃生口慣例，可用 `MEETPILOT_ANALYSIS_SPEC_PATH` 覆寫。
+ */
+const ANALYSIS_SPEC_PATH = resolve(
+  (process.env.MEETPILOT_ANALYSIS_SPEC_PATH ?? '').trim() || 'prompts/meeting-record-spec.md'
+);
+
+function loadAnalysisSpec(): string {
+  let raw: string;
+  try {
+    raw = readFileSync(ANALYSIS_SPEC_PATH, 'utf8');
+  } catch (err) {
+    const reason = (err as { message?: unknown } | null)?.message ?? err;
+    throw new Error(`規範檔 ${ANALYSIS_SPEC_PATH} 讀取失敗：${reason}。analyze 不能在沒有規範的情況下跑`);
+  }
+  if (!raw.trim()) {
+    throw new Error(`規範檔 ${ANALYSIS_SPEC_PATH} 是空的，analyze 不能在沒有規範的情況下跑`);
+  }
+  return raw;
+}
 
 // Lazy GoogleGenAI client
 let aiClient: GoogleGenAI | null = null;
@@ -110,6 +140,23 @@ export function formatTranscriptWithTimeForAI(transcript: TranscriptSegment[]): 
   ).join('\n');
 }
 
+/**
+ * 給 `analyzeTranscript` 用：逐字稿標成 `[#n MM:SS-MM:SS] 講者: 內容`，一段一行、
+ * n 是 1-based 陣列索引。**不能沿用 `formatTranscriptForAI`**（同講者連續發言會合併成一段），
+ * 那會讓編號對不上 `transcript` 陣列的實際索引，`buildAnalysisV3FromModelOutput` 換算出處
+ * 時會拿到錯的段落。模型回段落編號，不回秒數：秒數模型會算錯，編號只要查表。
+ */
+export function formatTranscriptForAnalysis(transcript: readonly TranscriptSegment[]): string {
+  const formatTime = (seconds: number) => {
+    const m = Math.floor(seconds / 60).toString().padStart(2, '0');
+    const s = Math.floor(seconds % 60).toString().padStart(2, '0');
+    return `${m}:${s}`;
+  };
+  return transcript
+    .map((seg, i) => `[#${i + 1} ${formatTime(seg.start)}-${formatTime(seg.end)}] ${seg.speaker ?? 'Unknown'}: ${seg.text}`)
+    .join('\n');
+}
+
 export interface TranscribeSliceInput {
   base64Data: string;
   offsetSeconds?: number;
@@ -127,6 +174,66 @@ export interface AnalyzeTranscriptInput {
   meetingContext?: string;
   meetingId?: string;
 }
+
+/** 一條決議／待辦／未決事項的出處：段落編號範圍（1-based），跟送給模型的 `[#n ...]` 對應 */
+const SEGMENT_REF_SCHEMA_PROPERTIES = {
+  segment_from: { type: Type.INTEGER, description: '這條的出處從第幾個編號的段落開始（1-based）' },
+  segment_to: { type: Type.INTEGER, description: '這條的出處到第幾個編號的段落結束（1-based，可與 segment_from 相同）' },
+};
+
+/**
+ * `analyzeTranscript` 的 responseSchema，對應 `analysisContract.ts` 的 `AnalysisModelOutput`。
+ * 可為空的欄位一律 `nullable: true`，不是 optional：規範要求「沒明講就 null」，
+ * 而 `nullable` 是唯一能讓模型合法回傳 null（不是編一個值）的寫法。
+ */
+const ANALYSIS_RESPONSE_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    overview: { type: Type.STRING },
+    topics: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: { title: { type: Type.STRING }, content: { type: Type.STRING } },
+        required: ['title', 'content'],
+      },
+    },
+    decisions: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          text: { type: Type.STRING },
+          ...SEGMENT_REF_SCHEMA_PROPERTIES,
+          decided_by: { type: Type.STRING, nullable: true, description: '只用逐字稿講過的人名，沒明講就 null' },
+        },
+        required: ['text', 'segment_from', 'segment_to', 'decided_by'],
+      },
+    },
+    action_items: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          text: { type: Type.STRING },
+          ...SEGMENT_REF_SCHEMA_PROPERTIES,
+          assignee: { type: Type.STRING, nullable: true },
+          due: { type: Type.STRING, nullable: true, description: '逐字稿的原話（例如「下週三」），不要換算成日期' },
+        },
+        required: ['text', 'segment_from', 'segment_to', 'assignee', 'due'],
+      },
+    },
+    open_questions: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: { text: { type: Type.STRING }, ...SEGMENT_REF_SCHEMA_PROPERTIES },
+        required: ['text', 'segment_from', 'segment_to'],
+      },
+    },
+  },
+  required: ['overview', 'topics', 'decisions', 'action_items', 'open_questions'],
+};
 
 /** 模型回的一條題目標籤。落地前還要算比對鍵，見 services/topicExtractor.ts */
 export interface ExtractedTopicTag {
@@ -219,7 +326,9 @@ export interface GeminiServerClient {
   readonly embeddingModel: string;
   transcribeSlice(input: TranscribeSliceInput): Promise<TranscriptSegment[]>;
   polishTranscript(transcript: TranscriptSegment[]): Promise<string>;
-  analyzeTranscript(input: AnalyzeTranscriptInput): Promise<GeminiOutput>;
+  /** 會議記錄分析（`C-ANALYSIS` v3）。規範正本 `prompts/meeting-record-spec.md`，出處回段落編號
+   * 不是秒數，見 `AnalysisModelOutput` 檔頭與 `analysisContract.ts` 的 `buildAnalysisV3FromModelOutput` */
+  analyzeTranscript(input: AnalyzeTranscriptInput): Promise<AnalysisModelOutput>;
   /** 題目標籤抽取（W3）。回空陣列是合法結果（模型說這份逐字稿沒有可抽的題目），不是錯誤 */
   extractTopicTags(input: { transcript: TranscriptSegment[]; meetingId?: string }): Promise<ExtractedTopicTag[]>;
   /** 題目標籤的 embedding（W4，S2 召回的原料）。回傳順序與送進去的順序一致 */
@@ -229,6 +338,9 @@ export interface GeminiServerClient {
 }
 
 export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClient {
+  // 規範檔在建 client 的當下就讀，讀不到或空檔直接讓啟動失敗
+  const analysisSpec = loadAnalysisSpec();
+
   // Generate content with automatic retry and model fallback for high availability
   async function generateContentWithFallback(
     ai: GoogleGenAI,
@@ -473,64 +585,56 @@ ${fullText}`,
       return response.text || '無法生成修潤內容';
     },
 
-    async analyzeTranscript(input: AnalyzeTranscriptInput): Promise<GeminiOutput> {
+    /**
+     * 會議記錄分析（`C-ANALYSIS` v3，2026-09-20 重寫）。systemInstruction 是規範正本
+     * `prompts/meeting-record-spec.md` 的全文，不在這裡另抄一份規則——「好的紀錄長什麼樣」
+     * 改行為去改規範檔。逐字稿標段落編號送給模型，模型回 `segment_from`／`segment_to`，
+     * 換算成秒是呼叫端（`transcriptionPipeline.ts`）用 `buildAnalysisV3FromModelOutput` 做的事，
+     * 這裡只負責組請求、驗回應形狀。
+     */
+    async analyzeTranscript(input: AnalyzeTranscriptInput): Promise<AnalysisModelOutput> {
       const { transcript, meetingTags = [], meetingContext = '', meetingId } = input;
 
       const ai = getAI();
-      const formattedTranscript = formatTranscriptForAI(transcript);
-      const contextStr = `
-會議標籤：${meetingTags.join(', ')}
-背景補充：${meetingContext}
-`.trim();
+
+      // 只在真的有內容時才組這兩行，不能用模板字面值先組字串再判斷是否為空——
+      // 「會議標籤：」「背景補充：」這兩個標籤本身就不是空白，.trim() 濾不掉
+      const contextLines = [
+        meetingTags.length > 0 ? `會議標籤：${meetingTags.join(', ')}` : null,
+        meetingContext.trim() ? `背景補充：${meetingContext}` : null,
+      ].filter((line): line is string => line !== null);
 
       const response = await generateContentWithFallback(ai, {
         kind: 'analyze',
         meetingId,
         preferredModel: 'gemini-3.8-flash',
-        contents: `請將這份會議記錄整理成結構化的「議題討論紀錄」。
-這是一份逐字稿，可能包含口語贅字。請在分析時自動進行潤飾與歸納。
-請根據對話內容，產出「繁體中文」的分析報告。
-${contextStr ? `\n本次會議背景與標籤：\n${contextStr}\n` : ''}
+        contents: `這是一份逐字稿，每段前面標了編號與時間 [#編號 開始-結束]。決議、待辦、未決事項
+每一條都要用 segment_from／segment_to 標出對應的段落編號範圍；找不到明確對應段落的內容，
+不要寫成一條。
+${contextLines.length > 0 ? `\n本次會議背景與標籤：\n${contextLines.join('\n')}\n` : ''}
 會議記錄內容：
-${formattedTranscript}`,
+${formatTranscriptForAnalysis(transcript)}`,
         config: {
           maxOutputTokens: 8192,
-          systemInstruction: `
-你是一位專業的會議記錄師。請忽略流水帳式的摘要，改為「以議題為導向」的結構化整理。
-
-你需要產出以下 JSON 格式：
-1. **overview**: 用一句話概括整場會議的核心主旨。
-2. **topics**: 識別會議中討論的數個具體議題。針對每個議題，請撰寫詳細的內容整理，包含討論過程中的關鍵觀點。
-3. **decisions**: 會議中明確達成的所有決議。
-4. **action_items**: 後續需要執行的行動項目與負責人。
-
-請直接回傳純 JSON，不要包含 Markdown 標記。`,
+          systemInstruction: analysisSpec,
           responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              overview: { type: Type.STRING },
-              topics: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    title: { type: Type.STRING },
-                    content: { type: Type.STRING },
-                  },
-                  required: ['title', 'content'],
-                },
-              },
-              decisions: { type: Type.ARRAY, items: { type: Type.STRING } },
-              action_items: { type: Type.ARRAY, items: { type: Type.STRING } },
-            },
-            required: ['overview', 'topics', 'decisions', 'action_items'],
-          },
+          responseSchema: ANALYSIS_RESPONSE_SCHEMA,
+        },
+        validateResponse: (candidate) => {
+          if (
+            typeof candidate?.text !== 'string'
+            || candidate.text.trim() === ''
+            || cleanJsonString(candidate.text) === '{}'
+          ) {
+            throw new RetryableLlmResponseError('Gemini 分析回應沒有文字內容');
+          }
         },
       });
 
       const jsonStr = cleanJsonString(response.text);
-      return JSON.parse(jsonStr) as GeminiOutput;
+      const parsed = JSON.parse(jsonStr);
+      assertAnalysisModelOutput(parsed);
+      return parsed;
     },
 
     async extractTopicTags(input: { transcript: TranscriptSegment[]; meetingId?: string }): Promise<ExtractedTopicTag[]> {

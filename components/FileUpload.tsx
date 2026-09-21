@@ -1,11 +1,13 @@
 
 import React, { useRef } from 'react';
+import { ACCEPTED_AUDIO_ACCEPT_ATTR, pickDroppedAudioFile } from '../services/droppedFiles';
 
 interface FileUploadProps {
   onFileSelect: (file: File) => void;
+  onRejected?: (reason: string) => void;
 }
 
-const FileUpload: React.FC<FileUploadProps> = ({ onFileSelect }) => {
+const FileUpload: React.FC<FileUploadProps> = ({ onFileSelect, onRejected }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleClick = () => {
@@ -13,12 +15,17 @@ const FileUpload: React.FC<FileUploadProps> = ({ onFileSelect }) => {
   };
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      onFileSelect(file);
-      // 清空 input 以便連續上傳同名檔案
-      e.target.value = '';
+    const files = e.target.files;
+    // 清空 input 以便連續上傳同名檔案（先讀 e.target.files 再清空，事件物件之後不能再用）
+    e.target.value = '';
+    if (!files || files.length === 0) return;
+    // 跟拖曳入口走同一套判準（droppedFiles.ts），兩個入口不該有兩套把關強度
+    const pick = pickDroppedAudioFile(files);
+    if (pick.ok === false) {
+      onRejected?.(pick.reason);
+      return;
     }
+    onFileSelect(pick.file);
   };
 
   return (
@@ -27,7 +34,7 @@ const FileUpload: React.FC<FileUploadProps> = ({ onFileSelect }) => {
         type="file"
         ref={fileInputRef}
         onChange={handleChange}
-        accept="audio/*,video/*,.mov,.m4a,.mp4,.mp3,.wav,.webm"
+        accept={ACCEPTED_AUDIO_ACCEPT_ATTR}
         className="hidden"
       />
       <button

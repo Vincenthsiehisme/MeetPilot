@@ -14,7 +14,7 @@ import {
 import { AUDIO_CONTENT_TYPE } from './meetingApi';
 import { HttpError } from './httpError';
 import type { Meeting } from '../types';
-import type { AnalysisV2 } from './analysisContract';
+import type { AnalysisV3 } from './analysisContract';
 
 // 這個檔測的是「送出音檔的新路徑」長什麼樣：建立 Meeting 之後把 File 本體 PUT 上去。
 // 上傳那一次的 body 與 Content-Type 是防回歸的重點 —— 包成 JSON 或 base64 就是把
@@ -185,12 +185,16 @@ describe('meetingClient', () => {
   });
 
   it('改分析是整份覆寫，body 包在 analysis 底下', async () => {
-    const analysis: AnalysisV2 = {
-      contract_version: 2,
+    const analysis: AnalysisV3 = {
+      contract_version: 3,
       overview: '總結',
       topics: [],
       decisions: [],
-      action_items: [{ text: '寄簡報', source_meeting_id: 'm_1', created_at: 1, status: 'unknown' }],
+      action_items: [{
+        text: '寄簡報', source_meeting_id: 'm_1', created_at: 1, status: 'unknown',
+        assignee: null, due: null, evidence: null,
+      }],
+      open_questions: [],
     };
     fetchMock.mockResolvedValueOnce(respond(200, JSON.stringify({ analysis })));
 
@@ -201,10 +205,10 @@ describe('meetingClient', () => {
     expect(JSON.parse(init.body)).toEqual({ analysis });
   });
 
-  it('分析四欄全空被 server 擋下時回 400，訊息帶出來', async () => {
+  it('分析五欄全空被 server 擋下時回 400，訊息帶出來', async () => {
     fetchMock.mockResolvedValueOnce(respond(400, JSON.stringify({ error: '分析內容是空的，不寫入' })));
 
-    const empty: AnalysisV2 = { contract_version: 2, overview: '', topics: [], decisions: [], action_items: [] };
+    const empty: AnalysisV3 = { contract_version: 3, overview: '', topics: [], decisions: [], action_items: [], open_questions: [] };
     const err = await patchAnalysis('m_1', empty).catch((e: unknown) => e);
     expect((err as HttpError).status).toBe(400);
     expect((err as HttpError).message).toBe('分析內容是空的，不寫入');

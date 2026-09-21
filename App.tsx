@@ -23,15 +23,16 @@ import {
   buildAudioBackupTargets,
   buildDashboardView,
   editBlockedReason,
-  geminiOutputToAnalysisV2,
   hasMeetingsInProgress,
   isMeetingInProgress,
   loadDetailForSelection,
   meetingDetailToJob,
   needsAudioUpload,
-  summarizeImportResponse
+  summarizeImportResponse,
+  upgradeLocalJobAnalysis
 } from './services/meetingAdapter';
 import { downloadBlob } from './services/exportUtils';
+import { pickDroppedAudioFile } from './services/droppedFiles';
 import {
   getAllJobsFromDB,
   deleteJobFromDB,
@@ -88,8 +89,8 @@ const App: React.FC = () => {
   // 兩邊一定要一起改，所以一律走 selectRecord，不要直接呼叫 setSelection。
   const selectionRef = useRef<Selection | null>(null);
   const [activeServerJob, setActiveServerJob] = useState<Job | null>(null);
-  // 原始的 detail 也留著：寫回 analysis 時要拿原本那份 AnalysisV2 把 metadata 接回去，
-  // activeServerJob 裡的是降成 v1 的顯示用版本，接不回來
+  // 原始的 detail 也留著：判斷「現在存的是不是還在看的那一場」與「這場會現在能不能編輯」
+  // 都要看 meeting 的原始狀態，activeServerJob 是轉成 Job 形狀給元件用的顯示版本，缺這些欄位
   const [activeDetail, setActiveDetail] = useState<MeetingDetailResponse | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
   // 正在跑的長動作（上傳、搬遷）。有值時 header 會顯示，免得使用者以為按鈕沒反應又按一次
@@ -97,6 +98,10 @@ const App: React.FC = () => {
   // 搬遷之後「被退件、音檔只剩瀏覽器這一份」的那幾場。列在本機那一區給使用者逐筆下載
   const [audioBackupTargets, setAudioBackupTargets] = useState<AudioBackupTarget[]>([]);
   const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(true);
+  // 整頁拖曳上傳（AC-6）。用計數器不用布林：拖過子元素時瀏覽器會先觸發子元素的
+  // dragleave 再觸發它自己的 dragenter，布林版本會在兩者之間閃一下 false
+  const [isDragging, setIsDragging] = useState<boolean>(false);
+  const dragCounter = useRef(0);
   const [confirmConfig, setConfirmConfig] = useState<{
     isOpen: boolean;
     title: string;
@@ -174,7 +179,18 @@ const App: React.FC = () => {
   useEffect(() => {
     refreshMeetings();
     getAllJobsFromDB()
-      .then(jobs => setLocalJobs([...jobs].sort((a, b) => b.createdAt - a.createdAt)))
+      .then(jobs => setLocalJobs(
+        [...jobs].sort((a, b) => b.createdAt - a.createdAt).map(job => {
+          try {
+            return upgradeLocalJobAnalysis(job);
+          } catch (err: any) {
+            // 單筆舊資料形狀壞掉不該拖垮其他筆：這筆原樣顯示（analysis 可能渲染不出來），
+            // 但至少不會讓整份本機任務清單從畫面消失
+            console.error(`本機任務 ${job.id} 的 analysis 升級失敗`, err);
+            return job;
+          }
+        })
+      ))
       .catch((err: any) => {
         console.error('讀取本機任務紀錄失敗', err);
         showAlert(
@@ -456,15 +472,9 @@ const App: React.FC = () => {
         await patchTranscript(meetingId, { polished_content: updates.polishedContent });
       }
       if (updates.analysis !== undefined) {
-        // 沒有原本那份 v2 就接不回 metadata。硬造一份會把每一筆待辦的來源與建立時間洗掉，
-        // 寧可明確失敗
-        if (activeDetail === null || activeDetail.analysis === null) {
-          throw new Error('讀不到這場會議原本的分析內容，沒有存檔。重新整理後再試一次。');
-        }
-        await patchAnalysis(
-          meetingId,
-          geminiOutputToAnalysisV2(updates.analysis, activeDetail.analysis, meetingId, Date.now())
-        );
+        // v3 每筆自帶 metadata（evidence、decided_by、assignee、created_at…），
+        // SummaryView 編輯的就是這份物件，直接送出即可，不用像 v1 字串那樣猜哪一筆是哪一筆
+        await patchAnalysis(meetingId, updates.analysis);
       }
       await refreshActiveDetail(meetingId);
       await refreshMeetings();
@@ -508,8 +518,57 @@ const App: React.FC = () => {
     ? null
     : (selection.source === 'server' ? (activeServerJob ?? listJob ?? null) : (listJob ?? null));
 
+  // 整頁拖曳上傳（AC-6）：跟按鈕走同一條 addMeeting → submitAudioFile 路徑，
+  // 不是另外重寫一次上傳邏輯
+  const handleDragEnter = (e: React.DragEvent) => {
+    e.preventDefault();
+    dragCounter.current += 1;
+    if (e.dataTransfer.types.includes('Files')) setIsDragging(true);
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    // 一定要擋掉：瀏覽器預設行為是離開這個分頁去開啟檔案，不擋的話 drop 事件永遠不會觸發
+    e.preventDefault();
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    dragCounter.current = Math.max(0, dragCounter.current - 1);
+    if (dragCounter.current === 0) setIsDragging(false);
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    dragCounter.current = 0;
+    setIsDragging(false);
+    // 跟 handleDragEnter 同一套判準：拖曳頁面上的文字選取也會觸發 drop 事件，
+    // 但 dataTransfer.types 不含 'Files'，不該當成「拖錯檔案」跳錯誤視窗
+    if (!e.dataTransfer.types.includes('Files')) return;
+    const pick = pickDroppedAudioFile(e.dataTransfer.files);
+    // 明寫 `=== false` 而不是 `!pick.ok`：tsconfig 沒開 strict，`!pick.ok` 這種寫法在這個 repo
+    // 收斂不到 { ok: false; reason } 那一側（同樣的坑見 meetingAdapter.ts／meetingEdits.ts）
+    if (pick.ok === false) {
+      showAlert('無法建立任務', pick.reason);
+      return;
+    }
+    addMeeting(pick.file);
+  };
+
   return (
-    <div className="h-screen bg-slate-50 flex flex-col antialiased overflow-hidden">
+    <div
+      className="h-screen bg-slate-50 flex flex-col antialiased overflow-hidden relative"
+      onDragEnter={handleDragEnter}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
+      {isDragging && (
+        <div className="absolute inset-0 z-50 bg-indigo-600/90 flex flex-col items-center justify-center text-white pointer-events-none">
+          <i className="fa-solid fa-cloud-arrow-up text-5xl mb-4"></i>
+          <p className="text-xl font-bold">放開就建立任務</p>
+          <p className="text-sm text-indigo-100 mt-1">支援音訊與影片檔</p>
+        </div>
+      )}
       <header className="h-14 bg-white border-b border-slate-200 px-4 flex items-center justify-between sticky top-0 z-30 shadow-sm shrink-0">
         <div className="flex items-center gap-3">
           <button 
@@ -535,7 +594,7 @@ const App: React.FC = () => {
               {busyMessage}
             </span>
           )}
-          <FileUpload onFileSelect={addMeeting} />
+          <FileUpload onFileSelect={addMeeting} onRejected={(reason) => showAlert('無法建立任務', reason)} />
         </div>
       </header>
 
@@ -702,7 +761,7 @@ const App: React.FC = () => {
                     上傳音檔後由伺服器轉錄與分析，這個分頁可以關掉，處理不會中斷。
                   </p>
                   <div className="flex gap-4 items-center">
-                    <FileUpload onFileSelect={addMeeting} />
+                    <FileUpload onFileSelect={addMeeting} onRejected={(reason) => showAlert('無法建立任務', reason)} />
                   </div>
                 </div>
               )}

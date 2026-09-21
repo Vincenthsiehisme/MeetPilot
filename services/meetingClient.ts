@@ -7,7 +7,7 @@
  * 這裡沒有 `withRetry`：音檔上傳失敗要讓使用者自己決定重送，自動重試一個 100 分鐘的檔
  * 等於把剛解掉的記憶體與頻寬問題再做一次；進度查詢本來就在 polling，下一拍自然會再試。
  */
-import { AnalysisV2 } from './analysisContract';
+import { AnalysisV3 } from './analysisContract';
 import { errorFromResponse } from './httpResponse';
 import {
   AUDIO_CONTENT_TYPE,
@@ -115,7 +115,7 @@ export const patchTranscript = async (
 };
 
 /** 整份覆寫。contract_version 不是 2 或四欄全空時 server 回 400 */
-export const patchAnalysis = async (meetingId: string, analysis: AnalysisV2): Promise<AnalysisV2> => {
+export const patchAnalysis = async (meetingId: string, analysis: AnalysisV3): Promise<AnalysisV3> => {
   const data = await requestJson<PatchAnalysisResponse>(meetingPath(meetingId, '/analysis'), {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },

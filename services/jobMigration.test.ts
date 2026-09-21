@@ -46,10 +46,13 @@ describe('toMigrationRecord 的成功路徑', () => {
     expect(expectOk(toMigrationRecord({ ...pending, fileName: undefined })).record.meeting.title).toBeNull();
   });
 
-  it('action_items 升成 v2 並標 unknown', () => {
+  it('action_items 升成 v3 並標 unknown，出處與人名一律 null', () => {
     const { record } = expectOk(toMigrationRecord(completedJob));
     expect(record.analysis?.action_items).toEqual([
-      { text: '整理比較表', source_meeting_id: 'job-1', created_at: 1_700_000_000_000, status: 'unknown' },
+      {
+        text: '整理比較表', source_meeting_id: 'job-1', created_at: 1_700_000_000_000, status: 'unknown',
+        assignee: null, due: null, evidence: null,
+      },
     ]);
   });
 

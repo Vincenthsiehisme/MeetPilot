@@ -171,6 +171,11 @@ const MIGRATIONS: readonly string[] = [
     created_at INTEGER NOT NULL
   );
   `,
+  // `C-ANALYSIS` v2 → v3：決議、待辦、未決事項每條要能回查逐字稿出處（analysisContract.ts）。
+  // 新增一段「未決事項」，既有三欄（overview／topics／decisions／action_items）的形狀不變，
+  // 只是欄位內容從 v3 起帶 evidence／decided_by／assignee／due。舊資料讀出來時
+  // 由 meetingStore 的 getAnalysis 做 lazy 升級（v2 → v3），不改寫既有資料列。
+  `ALTER TABLE analyses ADD COLUMN open_questions TEXT NOT NULL DEFAULT '[]';`,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

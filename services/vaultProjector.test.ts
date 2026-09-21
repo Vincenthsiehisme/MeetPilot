@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openMeetingDb } from './meetingDb';
 import { createMeetingStore, MeetingStore } from './meetingStore';
+import { DecisionV3, Evidence } from './analysisContract';
 import {
   buildFileName,
   computeChecksum,
@@ -39,9 +40,13 @@ afterEach(() => {
 interface ReadyMeetingInput {
   id?: string;
   overview: string;
+  /** 純文字的簡便寫法：每則升成 { text, evidence: null, decided_by: null }。
+   * 要測 evidence／decided_by 本身的測試直接用 decisionObjects */
   decisions?: string[];
+  decisionObjects?: DecisionV3[];
   topics?: { title: string; content: string }[];
-  actionItems?: { text: string; source_meeting_id: string; created_at: number; status: 'unknown' | 'open' | 'done' }[];
+  actionItems?: { text: string; source_meeting_id: string; created_at: number; status: 'unknown' | 'open' | 'done'; assignee?: string | null; due?: string | null; evidence?: Evidence | null }[];
+  openQuestions?: string[];
   segments?: { start: number; end: number; text: string; speaker?: string }[];
 }
 
@@ -59,11 +64,15 @@ function makeReadyMeeting(input: ReadyMeetingInput): string {
   store.saveAnalysis(
     id,
     {
-      contract_version: 2,
+      contract_version: 3,
       overview: input.overview,
       topics: input.topics ?? [],
-      decisions: input.decisions ?? [],
-      action_items: input.actionItems ?? [],
+      decisions: input.decisionObjects
+        ?? (input.decisions ?? []).map((text) => ({ text, evidence: null, decided_by: null })),
+      action_items: (input.actionItems ?? []).map((a) => ({
+        assignee: null, due: null, evidence: null, ...a,
+      })),
+      open_questions: (input.openQuestions ?? []).map((text) => ({ text, evidence: null })),
     },
     T0,
   );
@@ -234,7 +243,7 @@ describe('project：AC-1 檔名與 frontmatter、找檔靠 id 不靠檔名', () 
     const firstFileName = listMdFiles(vaultDir)[0];
 
     store.replaceAnalysis(id, {
-      contract_version: 2, overview: '改過的標題', topics: [], decisions: [], action_items: [],
+      contract_version: 3, overview: '改過的標題', topics: [], decisions: [], action_items: [], open_questions: [],
     }, T0 + 1000);
     projector.project(id);
 
@@ -264,12 +273,16 @@ describe('project：AC-1 檔名與 frontmatter、找檔靠 id 不靠檔名', () 
 });
 
 describe('project：AC-2 系統區內容', () => {
-  it('完整投影結論、待辦（帶狀態不明文字）、討論題目、題目標籤', () => {
+  it('完整投影結論（帶拍板者與時間戳）、待辦（帶負責人與期限，不印 status）、未決事項、討論題目、題目標籤', () => {
     const id = makeReadyMeeting({
       overview: '定價會議',
-      decisions: ['採用方案 A'],
+      decisionObjects: [{ text: '採用方案 A', evidence: { start: 0, end: 30 }, decided_by: '小美' }],
       topics: [{ title: '報價', content: '討論 Q4 報價策略' }],
-      actionItems: [{ text: '確認交期', source_meeting_id: 'm-1', created_at: T0, status: 'unknown' }],
+      actionItems: [{
+        text: '確認交期', source_meeting_id: 'm-1', created_at: T0, status: 'unknown',
+        assignee: '小美', due: '下週三',
+      }],
+      openQuestions: ['要不要外包'],
     });
     store.saveTopicExtraction(id, {
       status: 'ok',
@@ -279,8 +292,10 @@ describe('project：AC-2 系統區內容', () => {
     projector.project(id);
     const raw = readOnlyFile(vaultDir);
 
-    expect(raw).toContain('## 結論\n- 採用方案 A');
-    expect(raw).toContain('確認交期（狀態：狀態不明）');
+    expect(raw).toContain('## 結論\n- 採用方案 A（拍板：小美，00:00–00:30）');
+    expect(raw).toContain('- 確認交期（負責人：小美；期限：下週三）');
+    expect(raw).not.toContain('狀態不明');
+    expect(raw).toContain('## 未決事項\n- 要不要外包');
     expect(raw).toContain('### 報價\n討論 Q4 報價策略');
     expect(raw).toContain('- 供應商報價的付款條件');
   });
@@ -299,8 +314,9 @@ describe('project：AC-2 系統區內容', () => {
     const id = makeReadyMeeting({ overview: '空的會議' });
     projector.project(id);
     const raw = readOnlyFile(vaultDir);
-    expect(raw).toContain('## 結論\n（沒有結論）');
-    expect(raw).toContain('## 待辦\n（沒有待辦）');
+    expect(raw).toContain('## 結論\n本場沒有明確決議。');
+    expect(raw).toContain('## 待辦\n本場沒有待辦。');
+    expect(raw).toContain('## 未決事項\n本場沒有未決事項。');
     expect(raw).toContain('## 討論題目\n（沒有討論題目）');
     expect(raw).toContain('## 題目標籤\n（沒有抽到題目標籤）');
   });
@@ -341,7 +357,8 @@ describe('project：AC-3 三種關聯狀態分得開', () => {
     expect(raw).toContain(`- [[${buildFileName(T0, '上一季定價會議').replace(/\.md$/, '')}]]（信心 0.85）`);
     expect(raw).toContain('共同題目：供應商報價');
     expect(raw).toContain('判定理由：同一件事');
-    expect(raw).toContain('那場會的結論：調降報價 5%');
+    // 子彈清單格式（v0.6）：標籤一行，決議各自一個縮排子彈
+    expect(raw).toContain('  - 那場會的結論：\n    - 調降報價 5%');
   });
 
   it('link_failed：帶原因與重試指令', () => {
@@ -396,7 +413,7 @@ describe('project：AC-4 checksum 與錯誤路徑', () => {
   it('重投影且系統區沒被動過時，checksum 通過，正常整份重寫', () => {
     const id = makeReadyMeeting({ overview: '週會', decisions: ['第一版結論'] });
     projector.project(id);
-    store.replaceAnalysis(id, { contract_version: 2, overview: '週會', topics: [], decisions: ['第二版結論'], action_items: [] }, T0 + 1);
+    store.replaceAnalysis(id, { contract_version: 3, overview: '週會', topics: [], decisions: [{ text: '第二版結論', evidence: null, decided_by: null }], action_items: [], open_questions: [] }, T0 + 1);
     const result = projector.project(id);
     expect(result.status).toBe('written');
     expect(readOnlyFile(vaultDir)).toContain('第二版結論');
@@ -494,7 +511,7 @@ describe('project：AC-5 原子寫入與人工區保留', () => {
     );
     writeFileSync(path, withManualEdit);
 
-    store.replaceAnalysis(id, { contract_version: 2, overview: '週會', topics: [], decisions: ['第二版'], action_items: [] }, T0 + 1);
+    store.replaceAnalysis(id, { contract_version: 3, overview: '週會', topics: [], decisions: [{ text: '第二版', evidence: null, decided_by: null }], action_items: [], open_questions: [] }, T0 + 1);
     projector.project(id);
 
     const after = readFileSync(path, 'utf8');
@@ -522,17 +539,34 @@ describe('project：AC-5 原子寫入與人工區保留', () => {
 });
 
 describe('renderSystemRegion／computeChecksum：純函式，checksum 對輸入敏感', () => {
+  const asDecisions = (texts: string[]): DecisionV3[] =>
+    texts.map((text) => ({ text, evidence: null, decided_by: null }));
+
   it('相同輸入永遠算出相同 checksum（重算是 idempotent 的前提）', () => {
     const region = renderSystemRegion({
-      title: '週會', decisions: ['a'], actionItems: [], topics: [], topicTags: [], relatedSection: '關聯計算尚未完成。',
+      title: '週會', decisions: asDecisions(['a']), actionItems: [], openQuestions: [], topics: [],
+      topicTags: [], relatedSection: '關聯計算尚未完成。',
     });
     expect(computeChecksum(region)).toBe(computeChecksum(region));
   });
 
   it('內容不同 checksum 就不同', () => {
-    const base = { title: '週會', actionItems: [], topics: [], topicTags: [], relatedSection: '關聯計算尚未完成。' };
-    const r1 = renderSystemRegion({ ...base, decisions: ['a'] });
-    const r2 = renderSystemRegion({ ...base, decisions: ['b'] });
+    const base = {
+      title: '週會', actionItems: [], openQuestions: [], topics: [], topicTags: [],
+      relatedSection: '關聯計算尚未完成。',
+    };
+    const r1 = renderSystemRegion({ ...base, decisions: asDecisions(['a']) });
+    const r2 = renderSystemRegion({ ...base, decisions: asDecisions(['b']) });
+    expect(computeChecksum(r1)).not.toBe(computeChecksum(r2));
+  });
+
+  it('未決事項不同 checksum 也不同（新增段，不能被漏算）', () => {
+    const base = {
+      title: '週會', decisions: asDecisions(['a']), actionItems: [], topics: [], topicTags: [],
+      relatedSection: '關聯計算尚未完成。',
+    };
+    const r1 = renderSystemRegion({ ...base, openQuestions: [] });
+    const r2 = renderSystemRegion({ ...base, openQuestions: [{ text: '要不要外包', evidence: null }] });
     expect(computeChecksum(r1)).not.toBe(computeChecksum(r2));
   });
 });

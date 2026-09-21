@@ -125,6 +125,8 @@ W2 新增的 `audioSlicer`、`audioFileStore`、`transcriptionPipeline`、`trans
 `geminiServerClient`、`meetingClient`、`meetingAdapter` 各有同名測試，**尚未逐檔實測 affected 的覆蓋**，
 別假設它們都查得到。
 
+2026-09-20 新增的 `droppedFiles.ts` **已實測**：`affected` 回 `droppedFiles.test.ts`。
+
 所以改到後面五個檔案時，`affected` 回空**不代表不用跑測試**，三條 gate 一律照跑。
 改 `storageService.ts` 一定要手動指定 `services/storageService.test.ts`。
 
@@ -146,6 +148,25 @@ W2 新增的 `audioSlicer`、`audioFileStore`、`transcriptionPipeline`、`trans
 
 修法是把 `@types/react` 與 `@types/react-dom` 加進 devDependencies，但加上去會一次噴出一批
 既有的型別錯誤，要排時間，**當成獨立一包做，不要夾在別的任務裡順手加**。
+
+**沒開 `strict` 還有第二個後果，跟上面那條無關：判別聯合（discriminated union）對布林欄位的
+窄化會失效，就算在有明確型別的 `services/` 檔案也一樣（2026-09-20 實測）。**
+
+```ts
+type Pick = { ok: true; file: File } | { ok: false; reason: string };
+function f(p: Pick) {
+  if (!p.ok) { p.reason }              // 錯：p 仍是整個 union，讀不到 reason
+  if (p.ok) {} else { p.reason }       // 同樣錯，else 分支一樣收斂不到
+  if (p.ok === false) { p.reason }     // 對：明確比較 === false 才會窄化
+}
+```
+
+用 `npx tsc --noEmit --strict` 單獨測這段會過；拿掉 `--strict` 就跟這個 repo 的 tsconfig 一樣紅。
+這跟上一條「`App.tsx` 型別是 `any`」是不同成因：這裡型別是對的、有明確標註，純粹是 TS 的
+控制流程分析在非 strict 模式下對布林判別式較弱。**寫任何 `{ ok: true; ... } | { ok: false; ... }`
+形狀的回傳值時，判斷式一律寫成 `x.ok === false`（或 `x.ok === true`），不要寫 `!x.ok`
+或 `if (x.ok) {} else {}`**——後兩種在這個 repo 會安靜地把整個 union 留在原地，`tsc` 才會抓到，
+但 `services/` 以外（`App.tsx`、`components/`）沒有 tsc 覆蓋，抓不到就是執行期才炸。
 
 ## 這個 repo 的已知地雷
 

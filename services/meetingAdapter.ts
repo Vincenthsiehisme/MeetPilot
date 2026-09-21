@@ -7,7 +7,7 @@
  * 這個檔全是純函式：App.tsx 沒有元件測試基礎設施，能測的邏輯一律放這裡。
  */
 import { GeminiOutput, Job, JobStatus, Meeting, StepStatus } from '../types';
-import { AnalysisV2, ActionItemV2 } from './analysisContract';
+import { upgradeAnalysisToV2, upgradeAnalysisV2ToV3 } from './analysisContract';
 import {
   AUDIO_ALREADY_ON_SERVER_HINTS,
   AudioResidencyGroup,
@@ -158,93 +158,18 @@ export const meetingToJob = (meeting: Meeting): Job => {
 export const meetingsToJobs = (meetings: Meeting[]): Job[] => meetings.map(meetingToJob);
 
 /**
- * v2 的 action_item 降成 v1 的字串時，只給 `text`，不加任何後綴。
+ * 本機 IndexedDB 裡的舊 Job：`analysis` 是寫入當時的 v1（`GeminiOutput`）形狀——前端搬到
+ * server 端分析之前就是直接存 Gemini 的回應。載入畫面前先升到 v3（v1 → v2 → v3 兩段都是
+ * 純函式），跟 server 那邊的資料同一個形狀，`SummaryView` 不用為本機任務另外分渲染邏輯。
  *
- * 曾經把 assignee 與 status 併進文字（「訂會議室（負責人：小美，待處理）」），那是往返有損的：
- * `SummaryView` 讓使用者直接編輯這串字，原樣送回來就會把後綴寫進 `text` 本身，
- * 存一次多一層括號。顯示端與儲存端是同一個欄位時，顯示就不能加東西。
- *
- * 拿掉後綴在當前資料上零可見損失：`assignee` 的來源未定（U-007），沒有任何寫入路徑會給它值；
- * `status` 一律是 'unknown'（migration 補的、server 端新分析走 `upgradeAnalysisToV2` 也是）。
- * 兩個欄位本身沒有被丟掉，`geminiOutputToAnalysisV2` 寫回時會逐筆帶回去。
- * 真正要呈現 assignee 與 status，等 `components/` 能改的那一包給它們自己的欄位。
+ * 沒有 analysis（還沒分析完）原樣通過。前端已經不再寫新的本機任務，所以不會出現已經是
+ * v3 形狀的本機資料，這裡不特別判斷、一律當 v1 升級——真的遇到形狀對不上，
+ * `upgradeAnalysisToV2` 會在存取不存在的欄位時直接壞得明顯，不會靜默吞掉。
  */
-const renderActionItem = (item: ActionItemV2): string => item.text;
-
-export const analysisV2ToGeminiOutput = (analysis: AnalysisV2): GeminiOutput => ({
-  overview: analysis.overview,
-  topics: analysis.topics,
-  decisions: analysis.decisions,
-  action_items: analysis.action_items.map(renderActionItem),
-});
-
-/**
- * 使用者在 `SummaryView` 改完之後，把 v1 的 GeminiOutput 寫回成 v2。
- *
- * action_items 只有文字回得來，metadata（source_meeting_id、created_at、status、assignee）
- * 要自己從原本那份接回去，否則每存一次就把歷史待辦的來源與狀態洗掉一次。
- *
- * 接法分兩輪，而且第二輪有前提：
- *   第一輪：文字一字不差的認領原本那一筆。沒動過的項目不管位置怎麼變都保住自己的 metadata。
- *   第二輪：**只有在編輯後的筆數等於原筆數時**，剩下的才照順序配還沒被認領的那幾筆。
- *   其餘一律當成新增的，補本場 meeting_id、現在的 created_at 與 status 'unknown'。
- *
- * 第二輪的前提是這支函式最要緊的一行。筆數變了還照順序配，會發生這種事：原本是
- * 「上週就做完的事（m_上週, done）」與「小美要追的事（m_本週, open, 小美）」，使用者刪掉第一筆、
- * 順手把第二筆改成「小美要追的事（補上期限）」，照順序配就讓它繼承第一筆，變成
- * **一筆進行中的待辦掛著別場會議的 id、標成已完成、負責人不見了**。這種錯不會有任何症狀，
- * 事後也查不出來是哪一次存檔弄的。筆數相同時位置才有「同一筆被改了字」的意思。
- * 少接一次 metadata 只是少一點資訊，接錯一次是無聲的資料污染，兩者不對等。
- *
- * 文字重複時第一輪是貪心的（第 i 個相同文字認領第 i 個未被認領的），這是唯一能定義的行為：
- * v1 的字串沒有 id，兩筆一模一樣的文字在這一層本來就分不出誰是誰。
- *
- * 新增的一筆補 status 'unknown' 而不是 'open'：補 open 是替使用者宣告它待處理，
- * 跟 SDD D-004 擋掉的是同一件事。
- *
- * createdAt 由呼叫端傳進來，函式裡不叫 Date.now()：同一份輸入每次轉出不同結果的話，
- * 測試沒辦法寫死期望值，逐筆比對也失去意義（DEV-STANDARDS〈確定性〉）。
- */
-export const geminiOutputToAnalysisV2 = (
-  edited: GeminiOutput,
-  previous: AnalysisV2,
-  meetingId: string,
-  createdAt: number
-): AnalysisV2 => {
-  const claimedBy: (number | undefined)[] = edited.action_items.map(() => undefined);
-  const taken = previous.action_items.map(() => false);
-
-  edited.action_items.forEach((text, i) => {
-    const hit = previous.action_items.findIndex((item, k) => !taken[k] && item.text === text);
-    if (hit === -1) return;
-    taken[hit] = true;
-    claimedBy[i] = hit;
-  });
-
-  // 筆數變了就沒有「第 i 筆還是同一筆」這件事，第二輪整個不啟用
-  const sameLength = edited.action_items.length === previous.action_items.length;
-  let cursor = 0;
-  const nextIndexInOrder = (): number => {
-    if (!sameLength) return -1;
-    while (cursor < taken.length && taken[cursor]) cursor += 1;
-    if (cursor >= taken.length) return -1;
-    taken[cursor] = true;
-    return cursor;
-  };
-
-  return {
-    contract_version: 2,
-    overview: edited.overview,
-    topics: edited.topics,
-    decisions: edited.decisions,
-    action_items: edited.action_items.map((text, i) => {
-      const matched = claimedBy[i] ?? nextIndexInOrder();
-      if (matched === -1) {
-        return { text, source_meeting_id: meetingId, created_at: createdAt, status: 'unknown' as const };
-      }
-      return { ...previous.action_items[matched], text };
-    }),
-  };
+export const upgradeLocalJobAnalysis = (job: Job): Job => {
+  if (job.analysis === undefined) return job;
+  const v1 = job.analysis as unknown as GeminiOutput;
+  return { ...job, analysis: upgradeAnalysisV2ToV3(upgradeAnalysisToV2(v1, job.id, job.createdAt)) };
 };
 
 export const meetingDetailToJob = (detail: MeetingDetailResponse): Job => ({
@@ -252,7 +177,11 @@ export const meetingDetailToJob = (detail: MeetingDetailResponse): Job => ({
   // transcript 與 analysis 還沒產出時是 null，不是空物件；轉成 undefined 讓 JobDetail 的分頁停用
   transcript: detail.transcript === null ? undefined : detail.transcript.segments,
   polishedContent: detail.transcript?.polished_content ?? undefined,
-  analysis: detail.analysis === null ? undefined : analysisV2ToGeminiOutput(detail.analysis),
+  // v3 直接進畫面，不再降成 v1 字串。舊的 analysisV2ToGeminiOutput／geminiOutputToAnalysisV2
+  // 那套「用文字比對認領 metadata」的兩輪演算法已刪除：它存在的唯一理由是前端過去只拿得到
+  // 字串，改字時要自己猜哪一筆是哪一筆；v3 的每一筆決議／待辦／未決事項自帶 evidence 與
+  // metadata，SummaryView 直接編輯物件即可，不會有「猜錯認領」這種資料污染
+  analysis: detail.analysis === null ? undefined : detail.analysis,
   meetingTags: detail.tags,
 });
 

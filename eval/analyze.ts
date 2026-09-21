@@ -3,13 +3,15 @@
  *
  *   npx tsx --env-file-if-exists=.env eval/analyze.ts
  *
- * 沿用正式分析路徑的 systemInstruction 與 responseSchema，所以它測的是「現在這套分析出來的
- * 標籤能不能拿來關聯」，不是另一套為評測調過的 prompt。
- *
- * **正本在 `services/geminiServerClient.ts` 的 `analyzeTranscript`**（W2 之後；在那之前是
- * `server.ts` 的 `/api/gemini/analyze`，那條路由已經隨前端搬到 server 而刪除）。
- * 下面這份是複本，兩邊會各自漂移，而這支評測的意義正是「測現在這套 prompt」——
- * 改動正本時要同一次改這裡，或把它換成 import 同一份常數。
+ * **2026-09-20 起，這裡的 systemInstruction 與 responseSchema 不再是正式分析路徑的複本，
+ * 是一份凍結的歷史快照。** 正式分析（`services/geminiServerClient.ts` 的 `analyzeTranscript`）
+ * 已經改成規範正本 `prompts/meeting-record-spec.md`、輸出形狀是帶逐字稿出處的 v3
+ * （`AnalysisModelOutput`：`decisions`／`action_items`／`open_questions` 每筆帶
+ * `segment_from`／`segment_to`），跟這裡凍結的舊 schema（`overview`／`topics`／
+ * `decisions: string[]`／`action_items: string[]`）已經不是同一個系統。
+ * 這支評測測的是「W3 之前那套會壓成 3 到 5 個抽象標題的舊 prompt」這個歷史對照組
+ * （SDD 0.4 修正：跨會議比對必須用專為此設計的 prompt，不得沿用 analyze 的
+ * systemInstruction），不是「現在這套分析」。要測現在的分析路徑，得另外寫。
  *
  * 同一場會的多個音檔（錄音被切斷）在這裡依序串接成一份逐字稿再送出。這是 SDD D-001
  * 「最小工作單元是 Meeting 不是 Job」在評測端的落實：不合併的話，同一場會會變成兩個

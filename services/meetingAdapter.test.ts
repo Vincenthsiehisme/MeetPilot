@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
-import { GeminiOutput, Job, JobStatus, StepStatus } from '../types';
+import { Job, JobStatus, StepStatus } from '../types';
 import { MEETING_STATUSES, MeetingStatus } from './meetingState';
-import { AnalysisV2 } from './analysisContract';
+import { AnalysisV3 } from './analysisContract';
 import {
   AUDIO_ALREADY_ON_SERVER_HINTS,
   ImportResponse,
@@ -23,7 +23,6 @@ import {
   AUDIO_BACKUP_HINT,
   buildAudioBackupTargets,
   editBlockedReason,
-  geminiOutputToAnalysisV2,
   audioSubmitFailureMessage,
   isMeetingBusy,
   isMeetingInProgress,
@@ -33,6 +32,7 @@ import {
   needsAudioUpload,
   shouldApplyDetail,
   summarizeImportResponse,
+  upgradeLocalJobAnalysis,
 } from './meetingAdapter';
 
 const makeMeeting = (overrides: Partial<MeetingView> = {}): MeetingView => ({
@@ -173,16 +173,17 @@ describe('片段進度', () => {
 });
 
 describe('meetingDetailToJob', () => {
-  const analysis: AnalysisV2 = {
-    contract_version: 2,
+  const analysis: AnalysisV3 = {
+    contract_version: 3,
     overview: '總結',
     topics: [{ title: 'T', content: 'C' }],
-    decisions: ['D'],
+    decisions: [{ text: 'D', evidence: { start: 0, end: 10 }, decided_by: '小美' }],
     action_items: [
-      { text: '寄簡報', source_meeting_id: 'm_1', created_at: 1, status: 'unknown' },
-      { text: '訂會議室', source_meeting_id: 'm_1', created_at: 1, status: 'open', assignee: '小美' },
-      { text: '對帳', source_meeting_id: 'm_1', created_at: 1, status: 'done' },
+      { text: '寄簡報', source_meeting_id: 'm_1', created_at: 1, status: 'unknown', assignee: null, due: null, evidence: null },
+      { text: '訂會議室', source_meeting_id: 'm_1', created_at: 1, status: 'open', assignee: '小美', due: '下週三', evidence: { start: 5, end: 8 } },
+      { text: '對帳', source_meeting_id: 'm_1', created_at: 1, status: 'done', assignee: null, due: null, evidence: null },
     ],
+    open_questions: [{ text: '要不要外包', evidence: { start: 20, end: 25 } }],
   };
 
   const detail = (overrides: Partial<MeetingDetailResponse> = {}): MeetingDetailResponse => ({
@@ -211,204 +212,19 @@ describe('meetingDetailToJob', () => {
     expect(job.analysis).toBeUndefined();
   });
 
-  it('v2 的 action_item 降成字串時只給 text，不加後綴', () => {
-    // 加後綴會被使用者當成正文編回來，存一次多一層括號
+  it('v3 的分析物件直接進 Job，不再降成 v1 字串', () => {
+    // 舊版會把 action_items 降成字串陣列（analysisV2ToGeminiOutput），metadata 因此掉在半路，
+    // 寫回時得靠文字比對用兩輪演算法猜回來。v3 每筆自帶 metadata，直接原樣通過即可
     const job = meetingDetailToJob(detail());
-    expect(job.analysis!.action_items).toEqual(['寄簡報', '訂會議室', '對帳']);
+    expect(job.analysis).toBe(analysis);
+    expect(job.analysis!.action_items[1]).toEqual({
+      text: '訂會議室', source_meeting_id: 'm_1', created_at: 1, status: 'open',
+      assignee: '小美', due: '下週三', evidence: { start: 5, end: 8 },
+    });
+    expect(job.analysis!.open_questions).toEqual([{ text: '要不要外包', evidence: { start: 20, end: 25 } }]);
   });
 });
 
-describe('geminiOutputToAnalysisV2：使用者改完寫回 v2', () => {
-  const previous: AnalysisV2 = {
-    contract_version: 2,
-    overview: '舊總結',
-    topics: [{ title: '舊', content: '舊' }],
-    decisions: ['舊決議'],
-    action_items: [
-      { text: 'A', source_meeting_id: 'm_old', created_at: 11, status: 'unknown' },
-      { text: 'B', source_meeting_id: 'm_old', created_at: 22, status: 'open', assignee: '小美' },
-      { text: 'C', source_meeting_id: 'm_old', created_at: 33, status: 'done' },
-    ],
-  };
-
-  const edit = (action_items: string[]): GeminiOutput => ({
-    overview: '新總結',
-    topics: [{ title: '新', content: '新' }],
-    decisions: ['新決議'],
-    action_items,
-  });
-
-  it('只改文字時 metadata 全部保留', () => {
-    const next = geminiOutputToAnalysisV2(edit(['A', 'B 改過', 'C']), previous, 'm_now', 999);
-
-    expect(next.contract_version).toBe(2);
-    expect(next.overview).toBe('新總結');
-    expect(next.action_items).toEqual([
-      { text: 'A', source_meeting_id: 'm_old', created_at: 11, status: 'unknown' },
-      { text: 'B 改過', source_meeting_id: 'm_old', created_at: 22, status: 'open', assignee: '小美' },
-      { text: 'C', source_meeting_id: 'm_old', created_at: 33, status: 'done' },
-    ]);
-  });
-
-  it('新增一筆補 unknown，不是 open', () => {
-    const next = geminiOutputToAnalysisV2(edit(['A', 'B', 'C', 'D']), previous, 'm_now', 999);
-
-    expect(next.action_items).toHaveLength(4);
-    expect(next.action_items[3]).toEqual({
-      text: 'D', source_meeting_id: 'm_now', created_at: 999, status: 'unknown',
-    });
-    // 補 open 是替使用者宣告它待處理
-    expect(next.action_items[3].status).not.toBe('open');
-    expect(next.action_items[3].assignee).toBeUndefined();
-  });
-
-  it('刪掉中間一筆時後面那筆的 metadata 不會位移', () => {
-    const next = geminiOutputToAnalysisV2(edit(['A', 'C']), previous, 'm_now', 999);
-
-    expect(next.action_items).toEqual([
-      { text: 'A', source_meeting_id: 'm_old', created_at: 11, status: 'unknown' },
-      // 純按位置對齊的話這筆會拿到 B 的 created_at 22 與 assignee 小美
-      { text: 'C', source_meeting_id: 'm_old', created_at: 33, status: 'done' },
-    ]);
-  });
-
-  it('同一次又刪又改時，沒動過的那筆認領自己的 metadata，改過的那筆當成新增', () => {
-    const next = geminiOutputToAnalysisV2(edit(['C', 'B 改過']), previous, 'm_now', 999);
-
-    expect(next.action_items[0]).toEqual({
-      text: 'C', source_meeting_id: 'm_old', created_at: 33, status: 'done',
-    });
-    // 筆數從 3 變 2，位置已經沒有「還是同一筆」的意思。
-    // 舊版在這裡照順序配到 A，等於把別筆的來源與時間戳安靜貼上去
-    expect(next.action_items[1]).toEqual({
-      text: 'B 改過', source_meeting_id: 'm_now', created_at: 999, status: 'unknown',
-    });
-  });
-
-  it('刪掉第一筆又改了第二筆時，不會把別場會議的 metadata 搬過來（V5 回歸）', () => {
-    // verifier 跑出來的輸入：兩筆來自不同場會議、狀態不同、其中一筆有負責人
-    const crossMeeting: AnalysisV2 = {
-      contract_version: 2,
-      overview: '總結',
-      topics: [],
-      decisions: [],
-      action_items: [
-        { text: '上週就做完的事', source_meeting_id: 'm_上週', created_at: 11, status: 'done' },
-        { text: '小美要追的事', source_meeting_id: 'm_本週', created_at: 22, status: 'open', assignee: '小美' },
-      ],
-    };
-
-    const next = geminiOutputToAnalysisV2(
-      { overview: '總結', topics: [], decisions: [], action_items: ['小美要追的事（補上期限）'] },
-      crossMeeting,
-      'm_now',
-      999
-    );
-
-    expect(next.action_items).toHaveLength(1);
-    const only = next.action_items[0];
-    // 一筆進行中的待辦絕對不能變成別場會議的已完成待辦
-    expect(only.source_meeting_id).not.toBe('m_上週');
-    expect(only.status).not.toBe('done');
-    expect(only).toEqual({
-      text: '小美要追的事（補上期限）', source_meeting_id: 'm_now', created_at: 999, status: 'unknown',
-    });
-  });
-
-  it('兩筆文字相同時，第一輪是貪心的：第 i 筆認領第 i 個還沒被認領的', () => {
-    // v1 的字串沒有 id，一模一樣的兩筆在這一層本來就分不出誰是誰，
-    // 所以行為只能定義成貪心，並且寫下來
-    const duplicated: AnalysisV2 = {
-      contract_version: 2,
-      overview: '總結',
-      topics: [],
-      decisions: [],
-      action_items: [
-        { text: '對帳', source_meeting_id: 'm_1', created_at: 11, status: 'unknown' },
-        { text: '對帳', source_meeting_id: 'm_2', created_at: 22, status: 'open' },
-      ],
-    };
-
-    const kept = geminiOutputToAnalysisV2(
-      { overview: '總結', topics: [], decisions: [], action_items: ['對帳', '對帳'] },
-      duplicated,
-      'm_now',
-      999
-    );
-    expect(kept.action_items.map(i => i.created_at)).toEqual([11, 22]);
-
-    // 只留一筆時配到的是第一筆，第二筆的 metadata 就此丟掉（筆數變了，不做順序回退）
-    const halved = geminiOutputToAnalysisV2(
-      { overview: '總結', topics: [], decisions: [], action_items: ['對帳'] },
-      duplicated,
-      'm_now',
-      999
-    );
-    expect(halved.action_items[0].created_at).toBe(11);
-  });
-
-  it('全部刪光時 action_items 是空的，不會憑空留下舊的', () => {
-    const next = geminiOutputToAnalysisV2(edit([]), previous, 'm_now', 999);
-    expect(next.action_items).toEqual([]);
-  });
-
-  it('同一份輸入轉兩次結果一樣，時間戳由呼叫端給', () => {
-    const a = geminiOutputToAnalysisV2(edit(['A', 'D']), previous, 'm_now', 999);
-    const b = geminiOutputToAnalysisV2(edit(['A', 'D']), previous, 'm_now', 999);
-    expect(a).toEqual(b);
-  });
-});
-
-describe('action_items 的往返無損', () => {
-  it('v2 → 顯示字串 → 編輯 → 寫回 v2，四個 metadata 欄位原樣', () => {
-    const original: AnalysisV2 = {
-      contract_version: 2,
-      overview: '總結',
-      topics: [],
-      decisions: [],
-      action_items: [
-        { text: '寄簡報', source_meeting_id: 'm_1', created_at: 100, status: 'unknown' },
-        { text: '訂會議室', source_meeting_id: 'm_2', created_at: 200, status: 'open', assignee: '小美' },
-        { text: '對帳', source_meeting_id: 'm_3', created_at: 300, status: 'done' },
-      ],
-    };
-
-    const shown = meetingDetailToJob({
-      meeting: makeMeeting({ status: 'READY' }),
-      seamReport: null,
-      transcript: null,
-      analysis: original,
-      tags: [],
-      topicTags: [],
-      links: [],
-      linkRun: null,
-    }).analysis!;
-
-    // 使用者只動了 overview，action_items 原樣送回
-    const roundTripped = geminiOutputToAnalysisV2(
-      { ...shown, overview: '改過的總結' },
-      original,
-      'm_now',
-      999
-    );
-
-    expect(roundTripped.action_items).toEqual(original.action_items);
-    expect(roundTripped.overview).toBe('改過的總結');
-
-    // 再走一圈也不會多出東西
-    const shownAgain = meetingDetailToJob({
-      meeting: makeMeeting({ status: 'READY' }),
-      seamReport: null,
-      transcript: null,
-      analysis: roundTripped,
-      links: [],
-      linkRun: null,
-      tags: [],
-      topicTags: [],
-    }).analysis!;
-    expect(shownAgain.action_items).toEqual(['寄簡報', '訂會議室', '對帳']);
-  });
-});
 
 describe('polling 的停止條件與批次清除的名單（W3）', () => {
   it('server 正在寫的那幾個狀態要 poll', () => {
@@ -737,5 +553,42 @@ describe('音檔備份清單（V15）', () => {
     expect(message).toContain('下載音檔');
     // 「請先自行備份音檔」是空頭支票：前端當時沒有任何讀得到 blob 的路徑
     expect(message).not.toContain('自行備份');
+  });
+});
+
+describe('upgradeLocalJobAnalysis：本機 IndexedDB 舊 Job 的 v1 分析升到 v3', () => {
+  it('沒有 analysis 就原樣通過', () => {
+    const job = makeLocalJob({ analysis: undefined });
+    expect(upgradeLocalJobAnalysis(job)).toBe(job);
+  });
+
+  it('v1 的字串陣列升成 v3 物件，出處與人名一律 null', () => {
+    const job = makeLocalJob({
+      id: 'job_1',
+      createdAt: 1_700_000_000_000,
+      analysis: {
+        overview: '舊會議',
+        topics: [{ title: 'T', content: 'C' }],
+        decisions: ['舊決議'],
+        action_items: ['舊待辦'],
+      } as any,
+    });
+
+    const upgraded = upgradeLocalJobAnalysis(job);
+
+    expect(upgraded.analysis).toEqual({
+      contract_version: 3,
+      overview: '舊會議',
+      topics: [{ title: 'T', content: 'C' }],
+      decisions: [{ text: '舊決議', evidence: null, decided_by: null }],
+      action_items: [{
+        text: '舊待辦', source_meeting_id: 'job_1', created_at: 1_700_000_000_000,
+        status: 'unknown', assignee: null, due: null, evidence: null,
+      }],
+      open_questions: [],
+    });
+    // 只換 analysis，其餘欄位原樣
+    expect(upgraded.id).toBe('job_1');
+    expect(upgraded.fileName).toBe(job.fileName);
   });
 });
