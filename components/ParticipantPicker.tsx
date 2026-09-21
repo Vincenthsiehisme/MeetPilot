@@ -39,6 +39,7 @@ const ParticipantPicker: React.FC<ParticipantPickerProps> = ({
       p => p.displayName.toLowerCase().includes(q)
         || p.department?.toLowerCase().includes(q)
         || p.title?.toLowerCase().includes(q)
+        || p.aliases.some(alias => alias.toLowerCase().includes(q))
     );
   }, [people, query]);
 

@@ -41,6 +41,8 @@ export interface PersonSummary {
   displayName: string;
   title: string | null;
   department: string | null;
+  /** 匯入或人工確認的別名（含英文名），只給搜尋比對用，不在畫面上顯示 */
+  aliases: string[];
 }
 
 export interface PeopleListResponse {

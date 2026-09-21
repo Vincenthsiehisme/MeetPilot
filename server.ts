@@ -79,7 +79,7 @@ if (!topicLinker) {
 // 投影到 Obsidian vault（W5）。跟 topicLinker 不同，沒有 off 開關：目錄不可寫要在啟動時就爆，
 // 不要等到第一場會 READY 才發現寫不進去（同一套理由見上面 audioStore／llmLogger 的註解）
 const vaultDir = resolveVaultDir(process.env);
-const vaultProjector = createVaultProjector({ store: meetingStore, vaultDir });
+const vaultProjector = createVaultProjector({ store: meetingStore, vaultDir, nameResolver });
 console.log(`[MeetPilot] 會議 markdown 投影到 ${vaultDir}`);
 
 const transcriptionPipeline = createTranscriptionPipeline({

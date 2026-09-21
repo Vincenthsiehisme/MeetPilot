@@ -19,8 +19,10 @@ import { homedir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { TranscriptSegment } from '../types';
 import { ActionItemV3, DecisionV3, Evidence, OpenQuestionV3 } from './analysisContract';
+import { SeamReportEntry } from './meetingApi';
 import { MeetingStatus } from './meetingState';
 import { MeetingStore } from './meetingStore';
+import { NameMention, NameResolver } from './nameResolver';
 import { LINK_ALGO_VERSION } from './topicLink';
 import { TopicTag } from './topicTag';
 
@@ -225,6 +227,46 @@ const renderTopicsSection = (topics: readonly { title: string; content: string }
     ? topics.map((t) => `### ${t.title}\n${t.content}`).join('\n\n')
     : '（沒有討論題目）';
 
+/** `repair` 缺席只會發生在 verdict 不是 gap 的接縫，這裡只被拿來處理 gap，理論上一定有值；沒有就誠實印出來，不猜 */
+const describeRepair = (repair: SeamReportEntry['repair']): string => {
+  if (!repair) return '沒有嘗試修補';
+  if (repair.outcome === 'repaired') return '已補回來';
+  if (repair.outcome === 'failed') return '試過但補不回來，這段內容確實不在逐字稿裡';
+  return '沒有嘗試修補（額度用完或功能關閉）';
+};
+
+/**
+ * 完整性提示（會議記錄的完整性定義：記到＋可回查來源＋缺口要指出來，2026-09-22 使用者裁決）。
+ * 轉錄破洞（`seam_report` 的 `gap`）與人名待確認（`name_mentions` 的 `needs_review`）都是
+ * 技術層已經知道、但先前完全沒有進到人看的 markdown 的缺口——放在系統區最前面，讀者要先知道
+ * 「這份記錄哪裡不完整」才去讀內容，不是讀完才發現漏了什麼都沒人講。
+ */
+const renderCompletenessSection = (
+  seamReport: readonly SeamReportEntry[] | null,
+  needsReview: readonly NameMention[],
+): string => {
+  const gaps = (seamReport ?? []).filter((e) => e.verdict === 'gap');
+  const lines: string[] = [];
+  lines.push(
+    gaps.length === 0
+      ? '轉錄沒有已知破洞。'
+      : `轉錄有 ${gaps.length} 處接縫判定為破洞（部分內容可能沒有被轉錄到）：`,
+  );
+  for (const g of gaps) {
+    lines.push(`- 第 ${g.sliceIndex} 片與前一片之間：${describeRepair(g.repair)}`);
+  }
+  lines.push(
+    needsReview.length === 0
+      ? '人名沒有待確認的項目。'
+      : `人名有 ${needsReview.length} 筆待確認，逐字稿裡的原話先照樣保留：`,
+  );
+  for (const m of needsReview) {
+    const reason = m.method === 'short_alias_review' ? '別名過短' : '同名撞到多個員編';
+    lines.push(`- 「${m.original_text}」（第 ${m.segment_index + 1} 段，${reason}，待人工確認）`);
+  }
+  return lines.join('\n');
+};
+
 interface SystemRegionInput {
   title: string;
   decisions: readonly DecisionV3[];
@@ -233,11 +275,16 @@ interface SystemRegionInput {
   topics: readonly { title: string; content: string }[];
   topicTags: readonly TopicTag[];
   relatedSection: string;
+  seamReport: readonly SeamReportEntry[] | null;
+  needsReview: readonly NameMention[];
 }
 
 /** 系統區的完整內容（純函式，不含 I/O），也是 `auto_checksum` 要雜湊的那段文字 */
 export const renderSystemRegion = (input: SystemRegionInput): string => [
   `# ${input.title}`,
+  '',
+  '## 完整性',
+  renderCompletenessSection(input.seamReport, input.needsReview),
   '',
   '## 結論',
   renderDecisionsSection(input.decisions),
@@ -426,12 +473,14 @@ export type ProjectionResult =
 export interface VaultProjectorDeps {
   store: MeetingStore;
   vaultDir: string;
+  /** 完整性提示需要的兩樣：人名待確認清單只用得到 `listNeedsReview` */
+  nameResolver: Pick<NameResolver, 'listNeedsReview'>;
   /** 測試注入用；正式呼叫不要傳 */
   now?: () => number;
 }
 
 export const createVaultProjector = (deps: VaultProjectorDeps) => {
-  const { store, vaultDir } = deps;
+  const { store, vaultDir, nameResolver } = deps;
   const now = deps.now ?? (() => Date.now());
   mkdirSync(vaultDir, { recursive: true });
 
@@ -449,6 +498,8 @@ export const createVaultProjector = (deps: VaultProjectorDeps) => {
 
     const transcript = store.getTranscript(meetingId);
     const durationMinutes = computeDurationMinutes(transcript?.segments ?? []);
+    const seamReport = store.getSeamReport(meetingId);
+    const needsReview = nameResolver.listNeedsReview(meetingId);
 
     const links = store.getLinks(meetingId);
     const linkRun = store.getLinkRun(meetingId);
@@ -510,6 +561,8 @@ export const createVaultProjector = (deps: VaultProjectorDeps) => {
       topics: analysis.topics,
       topicTags,
       relatedSection,
+      seamReport,
+      needsReview,
     });
     const autoChecksum = computeChecksum(systemRegion);
     const generatedAt = new Date(now()).toISOString();

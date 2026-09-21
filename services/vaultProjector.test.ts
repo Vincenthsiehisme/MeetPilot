@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openMeetingDb } from './meetingDb';
 import { createMeetingStore, MeetingStore } from './meetingStore';
+import { createPeopleStore, PeopleStore } from './peopleStore';
+import { createNameResolver, NameResolver } from './nameResolver';
 import { DecisionV3, Evidence } from './analysisContract';
 import {
   buildFileName,
@@ -22,14 +24,18 @@ const T0 = 1_700_000_000_000; // 2023-11-14T22:13:20.000Z
 
 let db: DatabaseSync;
 let store: MeetingStore;
+let peopleStore: PeopleStore;
+let nameResolver: NameResolver;
 let vaultDir: string;
 let projector: VaultProjector;
 
 beforeEach(() => {
   db = openMeetingDb(':memory:');
   store = createMeetingStore(db);
+  peopleStore = createPeopleStore(db);
+  nameResolver = createNameResolver(db, peopleStore, store);
   vaultDir = mkdtempSync(join(tmpdir(), 'meetpilot-vault-'));
-  projector = createVaultProjector({ store, vaultDir, now: () => T0 });
+  projector = createVaultProjector({ store, vaultDir, nameResolver, now: () => T0 });
 });
 
 afterEach(() => {
@@ -314,11 +320,31 @@ describe('project：AC-2 系統區內容', () => {
     const id = makeReadyMeeting({ overview: '空的會議' });
     projector.project(id);
     const raw = readOnlyFile(vaultDir);
+    expect(raw).toContain('## 完整性\n轉錄沒有已知破洞。\n人名沒有待確認的項目。');
     expect(raw).toContain('## 結論\n本場沒有明確決議。');
     expect(raw).toContain('## 待辦\n本場沒有待辦。');
     expect(raw).toContain('## 未決事項\n本場沒有未決事項。');
     expect(raw).toContain('## 討論題目\n（沒有討論題目）');
     expect(raw).toContain('## 題目標籤\n（沒有抽到題目標籤）');
+  });
+
+  it('轉錄破洞與人名待確認會被寫進「完整性」段，不會安靜消失在技術欄位裡', () => {
+    const id = makeReadyMeeting({ overview: '缺口會議' });
+    store.saveSeamReport(id, [
+      { sliceIndex: 1, verdict: 'duplicate', similarity: 0.9, droppedSegments: 3 },
+      { sliceIndex: 2, verdict: 'gap', similarity: 0.2, droppedSegments: 0, repair: { outcome: 'failed', attempts: 3 } },
+    ]);
+    db.prepare(
+      'INSERT INTO name_mentions (mention_id, meeting_id, segment_index, original_text, employee_id, method, confidence, created_at) '
+      + 'VALUES (?, ?, ?, ?, NULL, ?, 0, ?)',
+    ).run('nm-1', id, 4, '阿明', 'short_alias_review', T0);
+
+    projector.project(id);
+    const raw = readOnlyFile(vaultDir);
+
+    expect(raw).toContain('## 完整性\n轉錄有 1 處接縫判定為破洞（部分內容可能沒有被轉錄到）：\n- 第 2 片與前一片之間：試過但補不回來，這段內容確實不在逐字稿裡');
+    expect(raw).toContain('人名有 1 筆待確認，逐字稿裡的原話先照樣保留：\n- 「阿明」（第 5 段，別名過短，待人工確認）');
+    expect(raw).not.toContain('duplicate'); // 重複判定不是缺口，不該出現在完整性提示裡
   });
 });
 
@@ -545,7 +571,7 @@ describe('renderSystemRegion／computeChecksum：純函式，checksum 對輸入�
   it('相同輸入永遠算出相同 checksum（重算是 idempotent 的前提）', () => {
     const region = renderSystemRegion({
       title: '週會', decisions: asDecisions(['a']), actionItems: [], openQuestions: [], topics: [],
-      topicTags: [], relatedSection: '關聯計算尚未完成。',
+      topicTags: [], relatedSection: '關聯計算尚未完成。', seamReport: null, needsReview: [],
     });
     expect(computeChecksum(region)).toBe(computeChecksum(region));
   });
@@ -553,7 +579,7 @@ describe('renderSystemRegion／computeChecksum：純函式，checksum 對輸入�
   it('內容不同 checksum 就不同', () => {
     const base = {
       title: '週會', actionItems: [], openQuestions: [], topics: [], topicTags: [],
-      relatedSection: '關聯計算尚未完成。',
+      relatedSection: '關聯計算尚未完成。', seamReport: null, needsReview: [],
     };
     const r1 = renderSystemRegion({ ...base, decisions: asDecisions(['a']) });
     const r2 = renderSystemRegion({ ...base, decisions: asDecisions(['b']) });
@@ -563,10 +589,23 @@ describe('renderSystemRegion／computeChecksum：純函式，checksum 對輸入�
   it('未決事項不同 checksum 也不同（新增段，不能被漏算）', () => {
     const base = {
       title: '週會', decisions: asDecisions(['a']), actionItems: [], topics: [], topicTags: [],
-      relatedSection: '關聯計算尚未完成。',
+      relatedSection: '關聯計算尚未完成。', seamReport: null, needsReview: [],
     };
     const r1 = renderSystemRegion({ ...base, openQuestions: [] });
     const r2 = renderSystemRegion({ ...base, openQuestions: [{ text: '要不要外包', evidence: null }] });
+    expect(computeChecksum(r1)).not.toBe(computeChecksum(r2));
+  });
+
+  it('轉錄破洞不同 checksum 也不同（完整性提示要被 checksum 保護，不然人改了提示不會觸發 conflict）', () => {
+    const base = {
+      title: '週會', decisions: asDecisions(['a']), actionItems: [], openQuestions: [], topics: [],
+      topicTags: [], relatedSection: '關聯計算尚未完成。', needsReview: [],
+    };
+    const r1 = renderSystemRegion({ ...base, seamReport: null });
+    const r2 = renderSystemRegion({
+      ...base,
+      seamReport: [{ sliceIndex: 2, verdict: 'gap', similarity: 0.1, droppedSegments: 0 }],
+    });
     expect(computeChecksum(r1)).not.toBe(computeChecksum(r2));
   });
 });

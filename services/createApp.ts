@@ -341,12 +341,20 @@ export function createApp(deps: AppDeps): express.Express {
   app.get('/api/people', (req, res) => {
     try {
       const people = peopleStore.listPeople().filter((p) => p.active);
+      // 搜尋要能搜到英文名（別名裡的 alias／display_names／match_keys），不只中文正名：
+      // 一次查完這批人的所有別名再分組，避免每個人各自查一次
+      const aliasesByEmployee = new Map<string, string[]>();
+      for (const a of peopleStore.listAliasesForEmployees(people.map((p) => p.employee_id))) {
+        const list = aliasesByEmployee.get(a.employee_id);
+        if (list) list.push(a.alias); else aliasesByEmployee.set(a.employee_id, [a.alias]);
+      }
       res.json({
         people: people.map((p) => ({
           employeeId: p.employee_id,
           displayName: p.display_name,
           title: p.title,
           department: p.department,
+          aliases: aliasesByEmployee.get(p.employee_id) ?? [],
         })),
       });
     } catch (err) {

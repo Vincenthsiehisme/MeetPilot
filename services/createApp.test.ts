@@ -200,7 +200,24 @@ describe('GET /api/people', () => {
       displayName: '測試員工',
       title: null,
       department: null,
+      aliases: [],
     });
+  });
+
+  it('帶出每個人的別名（含英文名），搜尋英文名靠這個欄位', async () => {
+    peopleStore.importRoster(
+      [{ employeeId: 'p-2', displayName: '陳大明', title: null, email: 'p2@liontravel.com', department: null, aliases: ['David Chen', 'Dave'] }],
+      T0,
+    );
+    await start();
+
+    const res = await fetch(`${url}/api/people`);
+    const body = await res.json() as any;
+
+    const p2 = body.people.find((p: any) => p.employeeId === 'p-2');
+    expect(p2.aliases.sort()).toEqual(['Dave', 'David Chen']);
+    const p1 = body.people.find((p: any) => p.employeeId === TEST_EMPLOYEE_ID);
+    expect(p1.aliases).toEqual([]); // 沒有別名的人回空陣列，不是 undefined
   });
 });
 
@@ -906,7 +923,7 @@ describe('W5：PATCH 逐字稿／分析之後同步重投影', () => {
 
   it('PATCH /transcript 成功之後 vault 檔反映新的逐字稿長度', async () => {
     readyMeeting();
-    const vaultProjector = createVaultProjector({ store, vaultDir, now: () => T0 });
+    const vaultProjector = createVaultProjector({ store, vaultDir, nameResolver, now: () => T0 });
     vaultProjector.project('m-1'); // 先投影一次，模擬轉錄鏈跑完之後的既有狀態
     await start({ vaultProjector });
 
@@ -922,7 +939,7 @@ describe('W5：PATCH 逐字稿／分析之後同步重投影', () => {
 
   it('PATCH /analysis 成功之後 vault 檔反映新的結論與標題', async () => {
     readyMeeting();
-    const vaultProjector = createVaultProjector({ store, vaultDir, now: () => T0 });
+    const vaultProjector = createVaultProjector({ store, vaultDir, nameResolver, now: () => T0 });
     vaultProjector.project('m-1');
     await start({ vaultProjector });
 
@@ -947,7 +964,7 @@ describe('W5：PATCH 逐字稿／分析之後同步重投影', () => {
 
   it('PATCH 失敗（驗證錯誤）不會觸發重投影，vault 檔維持原樣', async () => {
     readyMeeting();
-    const vaultProjector = createVaultProjector({ store, vaultDir, now: () => T0 });
+    const vaultProjector = createVaultProjector({ store, vaultDir, nameResolver, now: () => T0 });
     vaultProjector.project('m-1');
     await start({ vaultProjector });
     const before = vaultFileContent();
