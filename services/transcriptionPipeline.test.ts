@@ -10,6 +10,7 @@ import { MeetingStore, createMeetingStore } from './meetingStore';
 import { SLICE_OVERLAP_SECONDS } from './transcriptMerge';
 import { createTopicExtractor } from './topicExtractor';
 import { PeopleStore, createPeopleStore } from './peopleStore';
+import { NameResolver, createNameResolver } from './nameResolver';
 import {
   SLICE_DURATION_SECONDS,
   TranscriptionPipelineDeps,
@@ -329,6 +330,120 @@ describe('與會者提示接進轉錄與分析呼叫（人名校正 N3）', () =
     await pipeline.run('m-1');
 
     expect(seen.every(names => names?.length === 0)).toBe(true);
+  });
+});
+
+describe('NameResolver 接進 analyze（人名校正 N4）', () => {
+  let peopleStore: PeopleStore;
+  let nameResolver: NameResolver;
+
+  beforeEach(() => {
+    peopleStore = createPeopleStore(db);
+    nameResolver = createNameResolver(db, peopleStore, store);
+    peopleStore.importRoster(
+      [{ employeeId: 'p-1', displayName: '陳國煌', title: null, email: 'p1@liontravel.com', department: null, aliases: ['Philchen'] }],
+      T0,
+    );
+  });
+
+  it('analyzeTranscript 收到的是已解析視圖，不是原始逐字稿', async () => {
+    store.createMeeting({
+      meeting_id: 'm-1', created_at: T0, source_file_name: 'a.m4a', source_file_size: 10, participant_ids: ['p-1'],
+    });
+    let seenTranscript: TranscriptSegment[] = [];
+    const pipeline = pipelineWith({
+      store,
+      peopleStore,
+      nameResolver,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(30),
+      gemini: fakeGemini({
+        transcribeSlice: async () => [{ start: 0, end: 30, text: 'Philchen 報告進度', speaker: 'S' }],
+        analyzeTranscript: async ({ transcript }) => {
+          seenTranscript = transcript;
+          return analysisOutput;
+        },
+      }),
+      now: () => T0 + 1,
+    });
+
+    await pipeline.run('m-1');
+
+    expect(seenTranscript[0].text).toBe('陳國煌 報告進度');
+    // raw 逐字稿不受影響，畫面上看到的仍是原始聽寫
+    expect(store.getTranscript('m-1')!.segments[0].text).toBe('Philchen 報告進度');
+  });
+
+  it('decided_by／assignee 逐字對得上與會者時，存下來的分析帶對應員編', async () => {
+    store.createMeeting({
+      meeting_id: 'm-1', created_at: T0, source_file_name: 'a.m4a', source_file_size: 10, participant_ids: ['p-1'],
+    });
+    const pipeline = pipelineWith({
+      store,
+      peopleStore,
+      nameResolver,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(30),
+      gemini: fakeGemini({
+        transcribeSlice: async () => [{ start: 0, end: 30, text: '討論預算分配', speaker: 'S' }],
+        analyzeTranscript: async () => ({
+          ...analysisOutput,
+          decisions: [{ text: '採用方案 A', segment_from: 1, segment_to: 1, decided_by: '陳國煌' }],
+        }),
+      }),
+      now: () => T0 + 1,
+    });
+
+    await pipeline.run('m-1');
+
+    const analysis = store.getAnalysis('m-1')!;
+    expect(analysis.decisions[0].decided_by_employee_id).toBe('p-1');
+  });
+
+  it('NameResolver 比對失敗時不阻塞這場會，改用原始逐字稿分析並照樣進 READY', async () => {
+    store.createMeeting({
+      meeting_id: 'm-1', created_at: T0, source_file_name: 'a.m4a', source_file_size: 10, participant_ids: ['p-1'],
+    });
+    const brokenResolver: NameResolver = {
+      resolveTranscript: () => { throw new Error('比對邏輯壞了'); },
+      resolveAnalysisEmployeeIds: () => { throw new Error('反查邏輯壞了'); },
+    };
+    let seenTranscript: TranscriptSegment[] = [];
+    const pipeline = pipelineWith({
+      store,
+      peopleStore,
+      nameResolver: brokenResolver,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(30),
+      gemini: fakeGemini({
+        transcribeSlice: async () => [{ start: 0, end: 30, text: 'Philchen 報告進度', speaker: 'S' }],
+        analyzeTranscript: async ({ transcript }) => {
+          seenTranscript = transcript;
+          return analysisOutput;
+        },
+      }),
+      now: () => T0 + 1,
+    });
+
+    await pipeline.run('m-1');
+
+    expect(seenTranscript[0].text).toBe('Philchen 報告進度'); // 退回原始逐字稿
+    expect(store.getMeeting('m-1')!.status).toBe('READY');
+  });
+
+  it('沒帶 nameResolver 時既有行為不受影響（既有測試靠這條，optional 是真的 optional）', async () => {
+    newMeeting();
+    const pipeline = pipelineWith({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(30),
+      gemini: fakeGemini(),
+      now: () => T0 + 1,
+    });
+
+    await pipeline.run('m-1');
+
+    expect(store.getMeeting('m-1')!.status).toBe('READY');
   });
 });
 

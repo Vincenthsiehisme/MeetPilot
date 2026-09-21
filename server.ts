@@ -6,6 +6,7 @@ import { createLlmLogger, resolveLlmLogPath } from './services/llmTelemetry';
 import { openMeetingDb, resolveDbPath } from './services/meetingDb';
 import { createMeetingStore } from './services/meetingStore';
 import { createPeopleStore } from './services/peopleStore';
+import { createNameResolver } from './services/nameResolver';
 import { createGeminiServerClient } from './services/geminiServerClient';
 import { createAudioFileStore, resolveAudioDir } from './services/audioFileStore';
 import { createAudioSlicer, resolveFfmpegPaths } from './services/audioSlicer';
@@ -33,6 +34,9 @@ const meetingStore = createMeetingStore(meetingDb);
 // 人員名單（人名校正 N1／N2）。同一個 DB 檔案，跟 meetingStore 共用交易與備份邊界，
 // 名單怎麼進來是 scripts/importRoster.ts 的事，這裡只負責讀
 const peopleStore = createPeopleStore(meetingDb);
+// 人名校正第 2 層（人名校正 N4）。同一個 DB 檔案，`name_mentions` 表跟其他資料共用
+// 交易與備份邊界，理由同 peopleStore
+const nameResolver = createNameResolver(meetingDb, peopleStore, meetingStore);
 
 // 轉錄鏈的相依物件。音檔目錄同樣在啟動時就建：目錄不可寫要在這裡爆，
 // 不要等到使用者上傳第一個音檔才發現寫不進去
@@ -61,6 +65,7 @@ console.log(`[MeetPilot] 會議 markdown 投影到 ${vaultDir}`);
 const transcriptionPipeline = createTranscriptionPipeline({
   store: meetingStore,
   peopleStore,
+  nameResolver,
   seamRepair,
   audioStore,
   slicer: createAudioSlicer({ ffmpegPath: ffmpegPaths.ffmpeg, ffprobePath: ffmpegPaths.ffprobe }),

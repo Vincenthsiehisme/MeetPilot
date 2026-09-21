@@ -230,6 +230,31 @@ const MIGRATIONS: readonly string[] = [
 
   CREATE INDEX idx_meeting_participants_employee ON meeting_participants(employee_id);
   `,
+  // 人名校正 N4（SDD 1.3.2 第 2 層，`NameResolver`）。
+  //
+  // 可重建：從逐字稿與當時的 `person_aliases` 重算（SDD 1.5），所以 `NameResolver` 每次
+  // 重跑一場會的比對時整批刪掉舊列重寫，這張表不需要保留歷史版本。
+  //
+  // `employee_id` 允許 NULL：`needs_review`（衝突）時查不出是哪一個人；`employee_id` 不掛
+  // CASCADE 理由同 `meeting_participants`——people 目前沒有刪除操作。
+  //
+  // `C-ANALYSIS` v3 → v4（`decided_by_employee_id`／`assignee_employee_id`）不需要對應的
+  // migration：那兩個新欄位加在既有的 `decisions`／`action_items` JSON blob 裡，`analyses`
+  // 表本身沒有新增欄位，`contract_version` 不動（見 analysisContract.ts 檔頭與 SDD 1.3.2）。
+  `
+  CREATE TABLE name_mentions (
+    mention_id TEXT PRIMARY KEY,
+    meeting_id TEXT NOT NULL REFERENCES meetings(meeting_id) ON DELETE CASCADE,
+    segment_index INTEGER NOT NULL,
+    original_text TEXT NOT NULL,
+    employee_id TEXT REFERENCES people(employee_id),
+    method TEXT NOT NULL CHECK (method IN ('exact', 'short_alias_review', 'conflict_review')),
+    confidence REAL NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+
+  CREATE INDEX idx_name_mentions_meeting ON name_mentions(meeting_id);
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
