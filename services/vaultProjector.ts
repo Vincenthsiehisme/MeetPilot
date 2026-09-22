@@ -62,17 +62,21 @@ const CONFLICT_INFIX = '.conflict-';
 const MANUAL_SYNTAX_VERSION = 1;
 
 /**
- * 標題取 overview 前 30 個字元，移除路徑與 wikilink 會壞掉的字元、控制字元與前後空白
+ * 標題最多取前 30 個字元，移除路徑與 wikilink 會壞掉的字元、控制字元與前後空白
  * （SDD 1.3.1〈檔名與身分〉）。`[` `]` 不在 SDD 列的字集裡，但留著會讓 `[[<標題>]]` 這個
  * wikilink 本身斷掉，所以一併移除；換行與其他控制字元同理——一個標題裡的換行會讓 `# <標題>`
  * 這個 heading 與 `[[<標題>]]` 這個 wikilink 都變成非法 markdown（code review 2026-09-18）。
+ *
+ * 輸入是 `meeting.title`（有的話）或 `analysis.overview`（沒有 title 時的退回值，見呼叫端）。
+ * 兩者都可能超過 30 字，所以這裡仍然截：`meeting.title` 上限是 100 字（`meetingTitle.ts`），
+ * `analysis.overview` 是一整句話，截了才不會讓檔名長到不像標題（2026-09-21 使用者回報太長）。
  *
  * 用 `Array.from` 而不是 `.slice(0, 30)`：後者按 UTF-16 code unit 切，遇到 surrogate pair
  * （例如某些 emoji）可能切在字元中間，留下一個孤立的 surrogate，變成檔名裡一個無法呈現的字元。
  * `Array.from` 按 code point 迭代，30 個 code point 不會切壞任何一個字元。
  */
-export const sanitizeTitle = (overview: string): string =>
-  Array.from(overview).slice(0, 30).join('')
+export const sanitizeTitle = (text: string): string =>
+  Array.from(text).slice(0, 30).join('')
     .replace(/[/\\:*?"<>|[\]]/g, '').replace(/\p{Cc}/gu, '')
     .trim() || '未命名會議';
 
@@ -494,7 +498,9 @@ export const createVaultProjector = (deps: VaultProjectorDeps) => {
     if (!analysis) return { status: 'skipped', reason: 'no-analysis' };
 
     const index = scanVaultIndex(vaultDir);
-    const title = sanitizeTitle(analysis.overview);
+    // 有 meeting.title（PR #9 的會議標題功能）就用它：本來就短、不是句子中間硬切下來的。
+    // 沒有的話（title 功能之前建立的舊會議、或標題抽取失敗）退回 overview（2026-09-21 裁決）
+    const title = sanitizeTitle(meeting.title ?? analysis.overview);
 
     const transcript = store.getTranscript(meetingId);
     const durationMinutes = computeDurationMinutes(transcript?.segments ?? []);
@@ -529,7 +535,7 @@ export const createVaultProjector = (deps: VaultProjectorDeps) => {
         const existingOtherPath = index.get(otherId);
         const displayName = existingOtherPath
           ? basename(existingOtherPath, '.md')
-          : buildFileStem(otherMeeting.created_at, otherAnalysis.overview);
+          : buildFileStem(otherMeeting.created_at, otherMeeting.title ?? otherAnalysis.overview);
         related.push({
           displayName,
           confidence: link.confidence,

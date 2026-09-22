@@ -421,7 +421,7 @@ const App: React.FC = () => {
     setConfirmConfig({
       isOpen: true,
       title: '刪除這場會議',
-      message: '確定要從伺服器永久刪除這場會議嗎？逐字稿、分析與音檔都會一起刪掉，無法復原。',
+      message: '確定要從任務清單刪除這場會議嗎？這個動作無法復原：伺服器上的逐字稿、分析與音檔都會一起刪掉；vault 裡的會議記錄副本不受影響。',
       isDestructive: true,
       onConfirm: async () => {
         closeConfirm();
@@ -446,7 +446,7 @@ const App: React.FC = () => {
     setConfirmConfig({
       isOpen: true,
       title: '清除已結束的會議',
-      message: `確定要從伺服器刪除這 ${finished.length} 場已結束或失敗的會議嗎？逐字稿、分析與音檔都會一起刪掉，無法復原。`,
+      message: `確定要從任務清單刪除這 ${finished.length} 場已結束或失敗的會議嗎？這個動作無法復原：伺服器上的逐字稿、分析與音檔都會一起刪掉；vault 裡的會議記錄副本不受影響。`,
       isDestructive: true,
       onConfirm: async () => {
         closeConfirm();

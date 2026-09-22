@@ -46,6 +46,8 @@ afterEach(() => {
 interface ReadyMeetingInput {
   id?: string;
   overview: string;
+  /** 有帶就走 meeting.title 優先於 overview 那條路徑，不帶維持既有測試的 overview-only 行為 */
+  title?: string;
   /** 純文字的簡便寫法：每則升成 { text, evidence: null, decided_by: null }。
    * 要測 evidence／decided_by 本身的測試直接用 decisionObjects */
   decisions?: string[];
@@ -60,6 +62,7 @@ interface ReadyMeetingInput {
 function makeReadyMeeting(input: ReadyMeetingInput): string {
   const id = input.id ?? 'm-1';
   store.createMeeting({ meeting_id: id, created_at: T0, source_file_name: 'a.m4a', source_file_size: 10 });
+  if (input.title !== undefined) store.setTitle(id, input.title, T0);
   store.setStatus(id, 'TRANSCRIBING', T0);
   store.saveTranscript(
     id,
@@ -221,6 +224,19 @@ describe('project：AC-1 檔名與 frontmatter、找檔靠 id 不靠檔名', () 
     expect(raw).toMatch(/^manual_syntax_version: 1$/m);
     expect(raw).toMatch(/^auto_checksum: sha256:[0-9a-f]{64}$/m);
     expect(raw).toContain('duration_minutes: 10'); // 600 秒
+  });
+
+  it('有 meeting.title 時檔名與 heading 用 title，不用 overview 那句完整敘述（2026-09-21）', () => {
+    const id = makeReadyMeeting({
+      title: 'Q4 供應商報價會議',
+      overview: '本次會議針對高雄演唱會套裝行程進行跨部門討論，聚焦於飯店與票券的採購與分潤',
+    });
+    const result = projector.project(id);
+    expect(result.status).toBe('written');
+
+    const files = listMdFiles(vaultDir);
+    expect(files).toEqual(['2023-11-14 2213 Q4 供應商報價會議.md']);
+    expect(readOnlyFile(vaultDir)).toContain('# Q4 供應商報價會議');
   });
 
   it('重複投影同一場會不會多產生檔案，靠 meetpilot_id 找到同一份', () => {
@@ -385,6 +401,20 @@ describe('project：AC-3 三種關聯狀態分得開', () => {
     expect(raw).toContain('判定理由：同一件事');
     // 子彈清單格式（v0.6）：標籤一行，決議各自一個縮排子彈
     expect(raw).toContain('  - 那場會的結論：\n    - 調降報價 5%');
+  });
+
+  it('連到還沒被投影的會議時，wikilink 預先用對方的 meeting.title 算檔名，不是 overview（2026-09-21）', () => {
+    const a = makeReadyMeeting({ id: 'm-a', overview: '新會議 M' });
+    const b = makeReadyMeeting({
+      id: 'm-b',
+      title: '歷史會議 H 標題',
+      overview: '一段很長、跟標題完全不同的分析敘述句，用來確認預先算檔名時不會誤用它',
+    });
+    linkMeetings(a, b);
+
+    const result = projector.project(a); // 只投影 a，b 還沒有自己的檔案
+    expect(result.status).toBe('written');
+    expect(readOnlyFile(vaultDir)).toContain(`- [[${buildFileName(T0, '歷史會議 H 標題').replace(/\.md$/, '')}]]`);
   });
 
   it('link_failed：帶原因與重試指令', () => {
