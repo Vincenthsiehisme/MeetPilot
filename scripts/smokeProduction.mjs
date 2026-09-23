@@ -24,6 +24,11 @@ const env = {
   MEETPILOT_AUDIO_DIR: join(work, 'audio'),
   MEETPILOT_VAULT: join(work, 'vault'),
   MEETPILOT_LLM_LOG: 'off',
+  // 本機 .env 或呼叫端設了 Basic Auth 的話，/api/health 會回 401，健康的 bundle 被判成失敗。
+  // 設成空字串才擋得住：--env-file 不覆寫已經存在的變數（空字串也算存在），
+  // 而 resolveListenConfig 把空字串當成沒設
+  MEETPILOT_BASIC_AUTH_USER: '',
+  MEETPILOT_BASIC_AUTH_PASSWORD: '',
 };
 
 // Windows 上 npm 是 npm.cmd，要經 shell 才叫得起來；detached 讓 POSIX 上能整個 process group 一起收掉
