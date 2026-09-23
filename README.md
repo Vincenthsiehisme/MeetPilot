@@ -35,6 +35,11 @@ CLI。這仍然是 CLI 邏輯的重用，不是新增的 API 端點或前端介�
 那支錄音送進轉錄。錄音在語音備忘錄裡，關掉分頁、重新整理或 server 重啟都不會中斷。只支援 macOS，
 而且只接受從這台 Mac 本機來的請求（`HOST` 開到區網時，別台電腦不能遠端打開這台的麥克風）。
 
+**不要用同一台 Mac 上的反向代理（nginx、Caddy 等）對外開放 MeetPilot。** 「本機請求」看的是連線來源位址，
+經同機代理轉進來的外部請求來源一律是 `127.0.0.1`，會被當成本機，錄音路由就擋不住遠端。而且那種部署下
+`HOST` 還是本機位址，server 不會要求 Basic Auth，整個 API 都沒有認證。要讓別台電腦連進來，就把 `HOST`
+設成對外位址並設 Basic Auth（見〈環境變數〉），這時錄音路由照樣只收本機。
+
 語音備忘錄沒有 AppleScript 也沒有 URL scheme，只開放「捷徑」App 的動作，而且沒有任何動作會交出
 錄音檔。所以要先在「捷徑」App 建三個捷徑，**名稱要一字不差**，server 用 `shortcuts run <名稱>` 呼叫：
 
@@ -367,7 +372,7 @@ POST /api/meetings/import   { jobs: Job[], blobIds: string[] }
 
 見 `.env.example`。`MEETPILOT_AUDIO_DIR` 是上傳音檔的落地位置；`MEETPILOT_FFMPEG` 與
 `MEETPILOT_FFPROBE` 指定那兩支執行檔的路徑，不設就走 PATH。`MEETPILOT_DB` 是 SQLite 的位置，路徑不可寫時 server 直接起不來；
-資料庫的 schema 版本比程式碼新時也拒絕開啟，不用舊程式碼往裡面寫。`npm run dev` 與 `npm start` 用 Node 的 `--env-file-if-exists=.env` 讀 `.env`，沒有那個檔就只吃 shell 環境變數。`HOST` 不是本機位址時必須設 `MEETPILOT_BASIC_AUTH_USER` 與 `MEETPILOT_BASIC_AUTH_PASSWORD`，server 才會啟動。`/api/*` 每個 IP 每分鐘最多 `MEETPILOT_API_RATE_LIMIT` 次（預設 60）。放在反向代理後面時所有使用者會共用同一個 IP 的額度，Express 沒設 `trust proxy`，這是刻意的：設了又沒限定代理位址，`X-Forwarded-For` 就能繞過限流。
+資料庫的 schema 版本比程式碼新時也拒絕開啟，不用舊程式碼往裡面寫。`npm run dev` 與 `npm start` 用 Node 的 `--env-file-if-exists=.env` 讀 `.env`，沒有那個檔就只吃 shell 環境變數。`HOST` 不是本機位址時必須設 `MEETPILOT_BASIC_AUTH_USER` 與 `MEETPILOT_BASIC_AUTH_PASSWORD`，server 才會啟動。`/api/*` 每個 IP 每分鐘最多 `MEETPILOT_API_RATE_LIMIT` 次（預設 60）。放在反向代理後面時所有使用者會共用同一個 IP 的額度，Express 沒設 `trust proxy`，這是刻意的：設了又沒限定代理位址，`X-Forwarded-For` 就能繞過限流。同機反向代理另有兩個問題：`HOST` 是本機位址所以不要求 Basic Auth，而且語音備忘錄錄音的「只收本機請求」會失效，見〈用語音備忘錄錄音〉。
 
 `MEETPILOT_LINKING=off` 關掉跨會議關聯（預設開啟），關掉時會議停在 `READY`。
 

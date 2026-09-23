@@ -44,6 +44,10 @@ const IPV4_LOOPBACK = /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
  * 用在會動到這台機器本身的路由：語音備忘錄錄音會打開這台筆電的麥克風，`HOST` 開到區網時
  * 別台電腦不該能遠端啟動它（vault plan「MeetPilot · 網頁錄音」AC-6）。沒設 `trust proxy`，
  * 所以 `X-Forwarded-For` 騙不過這裡。拿不到位址（undefined）一律當成不是本機。
+ *
+ * 已知限制：放在同一台機器的反向代理後面時，所有轉進來的請求來源都是 loopback，這裡會全部放行。
+ * 使用者 2026-09-23 裁定不改程式、寫進 README〈用語音備忘錄錄音〉與 AGENTS.md（對外一律用 HOST
+ * 加 Basic Auth）。不要改成看 X-Forwarded-For／Origin／Host：沒設 trust proxy 時那些都能偽造。
  */
 export function isLoopbackAddress(address: string | undefined): boolean {
   if (address === undefined) return false;
