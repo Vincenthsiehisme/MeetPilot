@@ -45,6 +45,20 @@ npx tsx scripts/importRoster.ts <csv-path>
 跑一次上面同一套匯入邏輯，不用每次重建資料庫都手動下指令；不設就維持原本行為，仍要手動執行
 CLI。這仍然是 CLI 邏輯的重用，不是新增的 API 端點或前端介面。
 
+### 把名單發到 gateway（多位記錄人）
+
+多位記錄人各自跑 MeetPilot 時，名單改由 gateway（`meetpilot-gateway`，部署在 Vercel）發給每台 app，
+admin 在自己的電腦發布一次：
+
+```bash
+BLOB_READ_WRITE_TOKEN=<token> npx tsx scripts/publishRoster.ts <csv-path>
+```
+
+先用跟 CLI 匯入同一套 `parseRosterCsv` 整份驗過，有任何一列錯就整批不發；通過才上傳到 gateway
+私有 Blob store 的 `roster/people.json`（`{ version: 1, rows }`，形狀在 `services/rosterDocument.ts`）。
+名單是 PII，只放 Blob，不進任何 git repo。token 在 Vercel 的 Blob store 頁面，只在這次指令的環境
+變數裡帶，不要寫進 `.env`。app 端從 gateway 拿名單的那一段屬於之後的桌面 app 工作，還沒做。
+
 ### 用語音備忘錄錄音
 
 畫面上的「開始錄音」會叫**跑 server 的這台 Mac** 上的語音備忘錄開始錄，按「停止錄音」後自動取回
