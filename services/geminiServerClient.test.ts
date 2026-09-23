@@ -643,3 +643,61 @@ describe('meetingId 記進 telemetry，事後才查得出單場會議花了多�
     expect(logged.map(l => l.meetingId)).toEqual(['meeting-4']);
   });
 });
+
+describe('MEETPILOT_GEMINI_MAX_CONCURRENCY（AC-6，兩條 queue 共用的全域併發上限）', () => {
+  afterEach(() => {
+    delete process.env.MEETPILOT_GEMINI_MAX_CONCURRENCY;
+  });
+
+  it('不是正整數時建 client 就拋錯，不靜默退成無限制', () => {
+    process.env.MEETPILOT_GEMINI_MAX_CONCURRENCY = '0';
+    expect(() => client()).toThrow(/MEETPILOT_GEMINI_MAX_CONCURRENCY/);
+
+    process.env.MEETPILOT_GEMINI_MAX_CONCURRENCY = '不是數字';
+    expect(() => client()).toThrow(/MEETPILOT_GEMINI_MAX_CONCURRENCY/);
+  });
+
+  it('沒設時預設 2：兩個呼叫可以同時在飛，不用等對方結束', async () => {
+    let resolveFirst: (value: unknown) => void = () => {};
+    let resolveSecond: (value: unknown) => void = () => {};
+    generateContent
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve; }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveSecond = resolve; }));
+
+    const c = client();
+    const first = c.transcribeSlice({ base64Data: 'AAAA' });
+    const second = c.transcribeSlice({ base64Data: 'BBBB' });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // 兩個都已經真的打進 generateContent，不是第二個卡在等第一個
+    expect(generateContent).toHaveBeenCalledTimes(2);
+
+    resolveFirst({ text: '{"segments":[]}' });
+    resolveSecond({ text: '{"segments":[]}' });
+    await Promise.all([first, second]);
+  });
+
+  it('設成 1 時，第二個呼叫要等第一個結束才真的打進 generateContent', async () => {
+    process.env.MEETPILOT_GEMINI_MAX_CONCURRENCY = '1';
+    let resolveFirst: (value: unknown) => void = () => {};
+    generateContent
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve; }))
+      .mockResolvedValueOnce({ text: '{"segments":[]}' });
+
+    const c = client();
+    const first = c.transcribeSlice({ base64Data: 'AAAA' });
+    const second = c.transcribeSlice({ base64Data: 'BBBB' });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // 第二個還卡在信號量外面，generateContent 只被叫過一次
+    expect(generateContent).toHaveBeenCalledTimes(1);
+
+    resolveFirst({ text: '{"segments":[]}' });
+    await first;
+    await second;
+
+    expect(generateContent).toHaveBeenCalledTimes(2);
+  });
+});

@@ -38,6 +38,44 @@ export interface TranscriptRecord {
 }
 
 /**
+ * 「目前顯示的逐字稿」：有 `transcript_edits` 就是最新那版，沒有就退回 raw
+ * （vault plan「MeetPilot · 逐字稿版本分層與來源標記」）。`source_edit_version` 為 null
+ * 代表這份不是某一版編輯（raw 或 unknown）。
+ *
+ * `unknown` 是這次升級前就存在的 `transcripts` 列（`legacy_unconfirmed_raw = 1`）：那時
+ * PATCH 直接覆寫 `segments`，raw／edited 沒有分開，沒辦法回頭判斷哪些其實是人改過的，
+ * 標成 raw 是騙自己，標 unknown 才是「判不出來」的老實紀錄（Codex adversarial review 抓到）。
+ */
+export interface CurrentTranscript extends TranscriptRecord {
+  source_kind: 'raw' | 'edited' | 'unknown';
+  source_edit_version: number | null;
+}
+
+/** 轉錄逐片實際打中的模型（含橋接補洞），`transcripts.slice_models` 的形狀 */
+export interface SliceModelEntry {
+  sliceIndex: number;
+  model: string;
+  attempt: number;
+  kind: 'slice' | 'repair';
+}
+
+/**
+ * 一次分析呼叫的來源與出處，寫進 `analyses` 的五個 provenance 欄位。
+ * 只有真的跑過一次分析（`saveAnalysis`）才有，人工編輯（`replaceAnalysis`）不產生新的
+ * provenance——那不是新的一次模型呼叫，沿用上一次分析的來源紀錄。
+ */
+export interface AnalysisProvenance {
+  source_kind: 'raw' | 'edited' | 'unknown';
+  source_edit_version: number | null;
+  /** 實際送進分析模型的已解析文字快照；沒有 nameResolver 時為 null */
+  resolved_segments_snapshot: TranscriptSegment[] | null;
+  /** fallback 後實際打中的模型 id，不是設定的首選 */
+  model: string;
+  /** `prompts/meeting-record-spec.md` 呼叫當下的內容雜湊 */
+  prompt_version: string;
+}
+
+/**
  * PATCH 逐字稿用的部分更新。
  *
  * 「沒給這個欄位」與「明確給 null」是兩件事：前者保持原值，後者是清掉潤稿。
@@ -261,10 +299,44 @@ export const createMeetingStore = (db: DatabaseSync) => {
       polished_content = excluded.polished_content,
       created_at = excluded.created_at
   `);
-  const insertAnalysis = db.prepare(`
-    INSERT OR REPLACE INTO analyses
-      (meeting_id, contract_version, overview, topics, decisions, action_items, open_questions, created_at)
+  // 人工編輯會議記錄（replaceAnalysis）只改內容，不產生新的 provenance——upsert 只碰這八欄，
+  // 刻意不列 source_kind／source_edit_version／resolved_segments_snapshot／model／prompt_version，
+  // 沿用上一次真的跑分析時留下的值。跟 insertTranscript 保留 seam_report 同一個手法：
+  // 用 `INSERT OR REPLACE` 的話這幾欄會被砍成 NULL，等於人工編輯把來源紀錄洗掉
+  const insertAnalysisContent = db.prepare(`
+    INSERT INTO analyses (meeting_id, contract_version, overview, topics, decisions, action_items, open_questions, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(meeting_id) DO UPDATE SET
+      contract_version = excluded.contract_version,
+      overview = excluded.overview,
+      topics = excluded.topics,
+      decisions = excluded.decisions,
+      action_items = excluded.action_items,
+      open_questions = excluded.open_questions,
+      created_at = excluded.created_at
+  `);
+  // 真的跑一次分析（saveAnalysis）才會有 provenance，這裡把五欄一起覆寫
+  const insertAnalysisWithProvenance = db.prepare(`
+    INSERT INTO analyses (meeting_id, contract_version, overview, topics, decisions, action_items, open_questions,
+                          created_at, source_kind, source_edit_version, resolved_segments_snapshot, model, prompt_version)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(meeting_id) DO UPDATE SET
+      contract_version = excluded.contract_version,
+      overview = excluded.overview,
+      topics = excluded.topics,
+      decisions = excluded.decisions,
+      action_items = excluded.action_items,
+      open_questions = excluded.open_questions,
+      created_at = excluded.created_at,
+      source_kind = excluded.source_kind,
+      source_edit_version = excluded.source_edit_version,
+      resolved_segments_snapshot = excluded.resolved_segments_snapshot,
+      model = excluded.model,
+      prompt_version = excluded.prompt_version
+  `);
+  const insertTranscriptEdit = db.prepare(`
+    INSERT INTO transcript_edits (edit_id, meeting_id, edit_version, segments, polished_content, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
   `);
   const insertTag = db.prepare('INSERT OR IGNORE INTO meeting_tags (meeting_id, tag) VALUES (?, ?)');
   const insertParticipant = db.prepare(
@@ -298,6 +370,40 @@ export const createMeetingStore = (db: DatabaseSync) => {
   const readTranscript = (id: string): TranscriptRecord | null => {
     const row = db.prepare('SELECT segments, polished_content FROM transcripts WHERE meeting_id = ?').get(id) as
       { segments: string; polished_content: string | null } | undefined;
+    if (!row) return null;
+    return { segments: JSON.parse(row.segments) as TranscriptSegment[], polished_content: row.polished_content };
+  };
+
+  /** raw 是不是這次升級前就存在、無法確認有沒有被人改過的舊資料（見 CurrentTranscript 的說明） */
+  const isLegacyUnconfirmedRaw = (id: string): boolean => {
+    const row = db.prepare('SELECT legacy_unconfirmed_raw FROM transcripts WHERE meeting_id = ?').get(id) as
+      { legacy_unconfirmed_raw: number } | undefined;
+    return row?.legacy_unconfirmed_raw === 1;
+  };
+
+  /** 這場會目前最新的一筆人工編輯，沒有編輯過就是 null */
+  const readLatestTranscriptEdit = (id: string): (TranscriptRecord & { edit_version: number }) | null => {
+    const row = db.prepare(
+      'SELECT edit_version, segments, polished_content FROM transcript_edits '
+      + 'WHERE meeting_id = ? ORDER BY edit_version DESC LIMIT 1',
+    ).get(id) as { edit_version: number; segments: string; polished_content: string | null } | undefined;
+    if (!row) return null;
+    return {
+      edit_version: row.edit_version,
+      segments: JSON.parse(row.segments) as TranscriptSegment[],
+      polished_content: row.polished_content,
+    };
+  };
+
+  /**
+   * 讀**指定**的那一版編輯，不是「目前最新」。給分析 job 的 payload pinning 用
+   * （vault plan「MeetPilot · 轉錄分析佇列架構升級」AC）：job enqueue 當下釘死的版本，
+   * 執行時要讀到那個時間點的內容，不能因為之後又有新編輯就悄悄變成讀最新的。
+   */
+  const readTranscriptEditAtVersion = (id: string, editVersion: number): TranscriptRecord | null => {
+    const row = db.prepare(
+      'SELECT segments, polished_content FROM transcript_edits WHERE meeting_id = ? AND edit_version = ?',
+    ).get(id, editVersion) as { segments: string; polished_content: string | null } | undefined;
     if (!row) return null;
     return { segments: JSON.parse(row.segments) as TranscriptSegment[], polished_content: row.polished_content };
   };
@@ -340,8 +446,26 @@ export const createMeetingStore = (db: DatabaseSync) => {
     );
   };
 
-  const writeAnalysis = (id: string, analysis: AnalysisV3, createdAt: number) => {
-    insertAnalysis.run(
+  const writeAnalysis = (
+    id: string,
+    analysis: AnalysisV3,
+    createdAt: number,
+    provenance?: AnalysisProvenance,
+  ) => {
+    if (!provenance) {
+      insertAnalysisContent.run(
+        id,
+        analysis.contract_version,
+        analysis.overview,
+        JSON.stringify(analysis.topics),
+        JSON.stringify(analysis.decisions),
+        JSON.stringify(analysis.action_items),
+        JSON.stringify(analysis.open_questions),
+        createdAt,
+      );
+      return;
+    }
+    insertAnalysisWithProvenance.run(
       id,
       analysis.contract_version,
       analysis.overview,
@@ -350,6 +474,11 @@ export const createMeetingStore = (db: DatabaseSync) => {
       JSON.stringify(analysis.action_items),
       JSON.stringify(analysis.open_questions),
       createdAt,
+      provenance.source_kind,
+      provenance.source_edit_version,
+      provenance.resolved_segments_snapshot === null ? null : JSON.stringify(provenance.resolved_segments_snapshot),
+      provenance.model,
+      provenance.prompt_version,
     );
   };
 
@@ -519,6 +648,11 @@ export const createMeetingStore = (db: DatabaseSync) => {
       db.exec('BEGIN');
       try {
         db.prepare('DELETE FROM transcripts WHERE meeting_id = ?').run(id);
+        // transcript_edits 也要清：這一輪 raw 都要整個重來，指著舊 raw 的人工編輯版本
+        // 留著沒有意義，還會讓 getCurrentTranscript 在新一輪轉錄跑完前繼續回舊內容。
+        // 只在 CREATED 狀態發生（見上方註解），代表被清的一定是還沒完成的轉錄嘗試，
+        // 不違反「完成的 raw 不被覆寫」這條不可變承諾
+        db.prepare('DELETE FROM transcript_edits WHERE meeting_id = ?').run(id);
         // 分析也要一起刪，不能只刪逐字稿。留著的話，上傳新音檔到新一輪分析跑完之間，
         // `GET /api/meetings/:id` 會回一份屬於**舊音檔**的結論，而畫面上沒有任何東西說得出
         // 「這份分析跟你剛上傳的檔沒有關係」。中途失敗更糟：留下「新的部分逐字稿 ＋ 上一輪的
@@ -536,18 +670,26 @@ export const createMeetingStore = (db: DatabaseSync) => {
     },
 
     /**
-     * 人工編輯逐字稿。只寫有給的欄位，沒給的沿用原值（語意見 TranscriptPatch）。
+     * 人工編輯逐字稿。只寫有給的欄位，沒給的沿用「目前顯示的版本」（既有編輯或 raw，
+     * 語意見 TranscriptPatch）。
      *
-     * 還沒有逐字稿的會拋錯：那代表這場還沒轉錄完，編輯一份不存在的東西會把
+     * 從這次起**不再覆寫 raw**（vault plan「MeetPilot · 逐字稿版本分層與來源標記」）：
+     * `transcripts.segments` 是模型原始轉譯輸出，改成對 `transcript_edits` insert 新列，
+     * `edit_version` 該會議內單調遞增。raw 不動代表換模型重新生成、稽核有沒有臆測，
+     * 永遠找得到最初的版本。
+     *
+     * 還沒有 raw 逐字稿的會拋錯：那代表這場還沒轉錄完，編輯一份不存在的東西會把
      * 「轉錄結果」與「人工輸入」混成同一筆，之後分不出哪些字是模型產的。
      *
-     * transcripts 與 meetings.updated_at 同一個交易：畫面靠 updated_at 排序與判斷新舊，
+     * transcript_edits 與 meetings.updated_at 同一個交易：畫面靠 updated_at 排序與判斷新舊，
      * 內容改了而 updated_at 沒動的話，那次編輯在列表上看起來沒發生過。
      */
     updateTranscript: (id: string, patch: TranscriptPatch, updatedAt: number): TranscriptRecord => {
       requireMeeting(id);
-      const existing = readTranscript(id);
-      if (!existing) throw new Error(`Meeting ${id} 還沒有逐字稿，沒有東西可以編輯`);
+      const raw = readTranscript(id);
+      if (!raw) throw new Error(`Meeting ${id} 還沒有逐字稿，沒有東西可以編輯`);
+      const latestEdit = readLatestTranscriptEdit(id);
+      const existing: TranscriptRecord = latestEdit ?? raw;
 
       const segments = 'segments' in patch ? patch.segments : existing.segments;
       if (!segments || segments.length === 0) {
@@ -556,10 +698,16 @@ export const createMeetingStore = (db: DatabaseSync) => {
       }
       const polishedContent = 'polished_content' in patch ? patch.polished_content ?? null : existing.polished_content;
       const next: TranscriptRecord = { segments, polished_content: polishedContent };
+      const nextVersion = (latestEdit?.edit_version ?? 0) + 1;
 
       db.exec('BEGIN');
       try {
-        writeTranscript(id, next, updatedAt);
+        insertTranscriptEdit.run(
+          randomUUID(), id, nextVersion, JSON.stringify(next.segments), next.polished_content, updatedAt,
+        );
+        // segment_index 是相對「這次分析讀的那個版本」算的（見 analyze() 的
+        // getCurrentTranscript），版本一換舊的 name_mentions 就對不到段落，整批清掉，
+        // 下一次分析會對新版本重新比對
         db.prepare('DELETE FROM name_mentions WHERE meeting_id = ?').run(id);
         db.prepare('UPDATE meetings SET updated_at = ? WHERE meeting_id = ?').run(updatedAt, id);
         db.exec('COMMIT');
@@ -602,17 +750,84 @@ export const createMeetingStore = (db: DatabaseSync) => {
       writeTranscript(id, transcript, createdAt);
     },
 
-    saveAnalysis: (id: string, analysis: AnalysisV3, createdAt: number): void => {
+    /**
+     * `provenance` 只有真的跑一次分析（`transcriptionPipeline.analyze()`）才會給；
+     * 省略時等同舊行為（不動來源欄位），測試夾具與遷移匯入路徑大多走這條。
+     */
+    saveAnalysis: (id: string, analysis: AnalysisV3, createdAt: number, provenance?: AnalysisProvenance): void => {
       requireMeeting(id);
       if (isAnalysisV3SemanticallyEmpty(analysis)) {
         // 與 saveTranscript 同一條標準（SDD 1.5）：五個欄位全空卻寫成成功，
         // 在畫面上跟「這場會沒什麼結論」長得一樣，而且不會有任何錯誤
         throw new Error(`Meeting ${id} 的分析五個欄位都是空的，不寫入`);
       }
-      writeAnalysis(id, analysis, createdAt);
+      writeAnalysis(id, analysis, createdAt, provenance);
+    },
+
+    /** 這次分析讀哪個模型／prompt 版本／transcript 版本，沒跑過新版 provenance 的舊資料是 null */
+    getAnalysisProvenance: (id: string): AnalysisProvenance | null => {
+      const row = db.prepare(
+        'SELECT source_kind, source_edit_version, resolved_segments_snapshot, model, prompt_version '
+        + 'FROM analyses WHERE meeting_id = ?',
+      ).get(id) as {
+        source_kind: 'raw' | 'edited' | 'unknown' | null; source_edit_version: number | null;
+        resolved_segments_snapshot: string | null; model: string | null; prompt_version: string | null;
+      } | undefined;
+      if (!row || row.source_kind === null || row.model === null || row.prompt_version === null) return null;
+      return {
+        source_kind: row.source_kind,
+        source_edit_version: row.source_edit_version,
+        resolved_segments_snapshot: row.resolved_segments_snapshot === null
+          ? null : JSON.parse(row.resolved_segments_snapshot) as TranscriptSegment[],
+        model: row.model,
+        prompt_version: row.prompt_version,
+      };
     },
 
     getTranscript: readTranscript,
+
+    /** 目前顯示的逐字稿：有人工編輯就是最新那版，沒有就是 raw（見 CurrentTranscript） */
+    getCurrentTranscript: (id: string): CurrentTranscript | null => {
+      const latestEdit = readLatestTranscriptEdit(id);
+      if (latestEdit) {
+        return {
+          segments: latestEdit.segments,
+          polished_content: latestEdit.polished_content,
+          source_kind: 'edited',
+          source_edit_version: latestEdit.edit_version,
+        };
+      }
+      const raw = readTranscript(id);
+      if (!raw) return null;
+      return { ...raw, source_kind: isLegacyUnconfirmedRaw(id) ? 'unknown' : 'raw', source_edit_version: null };
+    },
+
+    /**
+     * 讀指定版本的編輯（不是「目前最新」），給分析 job 的 payload pinning 用：job enqueue
+     * 當下釘死的版本，執行時要讀到那個時間點的內容，不能因為之後又有新編輯就悄悄換成最新的
+     * （Codex adversarial review 抓到：原本完全沒接這條，job 一律讀即時的 getCurrentTranscript）。
+     */
+    getTranscriptEditVersion: (id: string, editVersion: number): TranscriptRecord | null =>
+      readTranscriptEditAtVersion(id, editVersion),
+
+    /**
+     * 轉錄逐片實際打中的模型（含橋接補洞）。跟 seam_report 同一個寫法：整批覆寫，
+     * `transcribe()` 每片寫一次進度時一併帶最新累積的陣列，中途失敗不會遺失已記錄的部分
+     */
+    saveSliceModels: (id: string, models: SliceModelEntry[]): void => {
+      const changed = db.prepare('UPDATE transcripts SET slice_models = ? WHERE meeting_id = ?')
+        .run(JSON.stringify(models), id);
+      if (changed.changes === 0) {
+        throw new Error(`Meeting ${id} 還沒有逐字稿，寫不了轉錄模型紀錄`);
+      }
+    },
+
+    getSliceModels: (id: string): SliceModelEntry[] | null => {
+      const row = db.prepare('SELECT slice_models FROM transcripts WHERE meeting_id = ?').get(id) as
+        { slice_models: string | null } | undefined;
+      if (!row?.slice_models) return null;
+      return JSON.parse(row.slice_models) as SliceModelEntry[];
+    },
 
     getSeamReport: readSeamReport,
 

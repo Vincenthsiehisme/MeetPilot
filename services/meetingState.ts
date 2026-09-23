@@ -12,6 +12,7 @@
 export type MeetingStatus =
   | 'CREATED'
   | 'TRANSCRIBING'
+  | 'TRANSCRIBED'
   | 'ANALYZING'
   | 'READY'
   | 'LINKING'
@@ -20,7 +21,7 @@ export type MeetingStatus =
   | 'FAILED';
 
 export const MEETING_STATUSES: readonly MeetingStatus[] = [
-  'CREATED', 'TRANSCRIBING', 'ANALYZING', 'READY', 'LINKING', 'LINKED', 'LINK_FAILED', 'FAILED',
+  'CREATED', 'TRANSCRIBING', 'TRANSCRIBED', 'ANALYZING', 'READY', 'LINKING', 'LINKED', 'LINK_FAILED', 'FAILED',
 ];
 
 export const isMeetingStatus = (value: unknown): value is MeetingStatus =>
@@ -28,10 +29,22 @@ export const isMeetingStatus = (value: unknown): value is MeetingStatus =>
 
 // SDD 1.4 的轉移表。任一段不可重試的錯誤都可以進 FAILED，所以 FAILED 不列在每一列裡，
 // 由 canTransition 統一處理；FAILED 自己則可以退回 CREATED 重跑整條（音檔還在的情況）。
+//
+// TRANSCRIBED 是轉錄與分析拆成兩條獨立 queue 之後才有意義的停留點（vault plan
+// 「MeetPilot · 轉錄分析佇列架構升級」）：轉錄完成、分析 job 還沒跑完之間。刻意不加
+// `*_QUEUED` 這兩個狀態——「排隊中還是還沒排」現在 job table 查得到（`jobs.status`），
+// 重複記在 meetings.status 是同一件事存兩份，跟這裡把 READY／LINKED 刻意分開的理由
+// （同一件事不能在資料層分不清楚）方向相反。
+//
+// ANALYZING → TRANSCRIBED 是新增的邊：分析 job 重試用盡時退回 TRANSCRIBED 而不是
+// FAILED，不連坐已經成功的轉錄結果（跟 topicLinker／關聯失敗不阻塞 READY 可見性同一個
+// 精神）——逐字稿還在、還能看、還能手動重跑分析。轉錄本身失敗維持退回 FAILED：沒有可用
+// 的 raw，沒東西可留。
 const ALLOWED: Record<MeetingStatus, readonly MeetingStatus[]> = {
   CREATED: ['TRANSCRIBING'],
-  TRANSCRIBING: ['ANALYZING'],
-  ANALYZING: ['READY'],
+  TRANSCRIBING: ['TRANSCRIBED'],
+  TRANSCRIBED: ['ANALYZING'],
+  ANALYZING: ['READY', 'TRANSCRIBED'],
   READY: ['LINKING'],
   LINKING: ['LINKED', 'LINK_FAILED'],
   // 關聯可以全量重算，所以 LINKED 與 LINK_FAILED 都能再回到 LINKING

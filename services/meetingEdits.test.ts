@@ -50,6 +50,7 @@ const readyMeeting = (id = 'm-1') => {
   store.saveTranscript(id, { segments: [{ start: 0, end: 3, text: '開場', speaker: 'S' }], polished_content: '潤過的' }, T0);
   store.saveAnalysis(id, { ...analysis, action_items: analysis.action_items.map(a => ({ ...a, source_meeting_id: id })) }, T0);
   store.setStatus(id, 'TRANSCRIBING', T0);
+  store.setStatus(id, 'TRANSCRIBED', T0);
   store.setStatus(id, 'ANALYZING', T0);
   store.setStatus(id, 'READY', T0);
   present.add(id);
@@ -64,7 +65,10 @@ const moveTo = (status: 'TRANSCRIBING' | 'ANALYZING' | 'LINKING', id = 'm-1') =>
   store.setStatus(id, 'FAILED', T0 + 1, '先退回去');
   store.setStatus(id, 'CREATED', T0 + 2);
   store.setStatus(id, 'TRANSCRIBING', T0 + 3);
-  if (status === 'ANALYZING') store.setStatus(id, 'ANALYZING', T0 + 4);
+  if (status === 'ANALYZING') {
+    store.setStatus(id, 'TRANSCRIBED', T0 + 4);
+    store.setStatus(id, 'ANALYZING', T0 + 4);
+  }
 };
 
 beforeEach(() => {
@@ -150,7 +154,9 @@ describe('PATCH /api/meetings/:id/transcript', () => {
 
     expect(outcome.status).toBe(200);
     expect(outcome.body).toEqual({ transcript: { segments, polished_content: '潤過的' } });
-    expect(store.getTranscript('m-1')).toEqual({ segments, polished_content: '潤過的' });
+    expect(store.getCurrentTranscript('m-1')).toEqual({
+      segments, polished_content: '潤過的', source_kind: 'edited', source_edit_version: 1,
+    });
   });
 
   it('只給 polished_content 時逐字稿保持原值', () => {
@@ -159,8 +165,8 @@ describe('PATCH /api/meetings/:id/transcript', () => {
     const outcome = patchTranscriptRequest({ store }, 'm-1', { polished_content: '新的潤稿' }, T1);
 
     expect(outcome.status).toBe(200);
-    expect(store.getTranscript('m-1')?.segments).toEqual([{ start: 0, end: 3, text: '開場', speaker: 'S' }]);
-    expect(store.getTranscript('m-1')?.polished_content).toBe('新的潤稿');
+    expect(store.getCurrentTranscript('m-1')?.segments).toEqual([{ start: 0, end: 3, text: '開場', speaker: 'S' }]);
+    expect(store.getCurrentTranscript('m-1')?.polished_content).toBe('新的潤稿');
   });
 
   it('polished_content 給 null 是清掉潤稿，沒給這個欄位是保留（兩者不能併成同一件事）', () => {
@@ -170,8 +176,33 @@ describe('PATCH /api/meetings/:id/transcript', () => {
     patchTranscriptRequest({ store }, 'm-clear', { polished_content: null }, T1);
     patchTranscriptRequest({ store }, 'm-keep', { segments }, T1);
 
-    expect(store.getTranscript('m-clear')?.polished_content).toBeNull();
-    expect(store.getTranscript('m-keep')?.polished_content).toBe('潤過的');
+    expect(store.getCurrentTranscript('m-clear')?.polished_content).toBeNull();
+    expect(store.getCurrentTranscript('m-keep')?.polished_content).toBe('潤過的');
+  });
+
+  it('編輯不覆寫 raw：PATCH 之後 getTranscript 仍然是模型原始轉譯結果', () => {
+    // 這是逐字稿三層分工的核心保證（vault plan「MeetPilot · 逐字稿版本分層與來源標記」）：
+    // raw 只有重新上傳音檔（建新 meeting）才會變，人工編輯一律走 transcript_edits
+    readyMeeting();
+    const rawBefore = store.getTranscript('m-1');
+
+    patchTranscriptRequest({ store }, 'm-1', { segments, polished_content: '新的潤稿' }, T1);
+
+    expect(store.getTranscript('m-1')).toEqual(rawBefore);
+    expect(store.getCurrentTranscript('m-1')).toEqual({
+      segments, polished_content: '新的潤稿', source_kind: 'edited', source_edit_version: 1,
+    });
+  });
+
+  it('連續兩次編輯，edit_version 遞增，第二次的基底是上一次編輯後的內容不是 raw', () => {
+    readyMeeting();
+
+    patchTranscriptRequest({ store }, 'm-1', { polished_content: '第一次潤稿' }, T1);
+    const second = patchTranscriptRequest({ store }, 'm-1', { segments }, T1 + 1);
+
+    // 第二次只給 segments，polished_content 該沿用「上一次編輯」的值，不是 raw 的 '潤過的'
+    expect(second.body).toEqual({ transcript: { segments, polished_content: '第一次潤稿' } });
+    expect(store.getCurrentTranscript('m-1')?.source_edit_version).toBe(2);
   });
 
   it('更新 updated_at，但不動 status', () => {
@@ -243,6 +274,22 @@ describe('PATCH /api/meetings/:id/transcript', () => {
 
     expect(outcome.status).toBe(404);
     expect((outcome.body as { error: string }).error).toContain('還沒有逐字稿');
+  });
+
+  it('FAILED（轉錄沒有完成）時回 409，不准編輯部分逐字稿——續傳補的內容會被悄悄蓋掉', () => {
+    // Codex adversarial review 抓到：FAILED 不在 BUSY_STATUSES 裡，之前可以編輯這種只有
+    // 部分內容的 raw；retry 續傳完成後新轉出來的段落接在 raw 後面，但 getCurrentTranscript
+    // 永遠整份拿最新那筆編輯蓋過 raw，續傳補上的尾巴會消失且沒有任何錯誤
+    store.createMeeting({ meeting_id: 'm-partial', created_at: T0 });
+    store.saveTranscript('m-partial', { segments: [{ start: 0, end: 3, text: '只轉了一半' }], polished_content: null }, T0);
+    store.setStatus('m-partial', 'TRANSCRIBING', T0 + 1);
+    store.setStatus('m-partial', 'FAILED', T0 + 2, 'Gemini 逾時');
+
+    const outcome = patchTranscriptRequest({ store }, 'm-partial', { segments }, T1);
+
+    expect(outcome.status).toBe(409);
+    expect((outcome.body as { error: string }).error).toContain('轉錄失敗尚未完成');
+    expect(store.getCurrentTranscript('m-partial')?.source_kind).toBe('raw'); // 沒有留下任何編輯
   });
 });
 

@@ -63,6 +63,7 @@ const fakeGemini = (options: FakeOptions = {}): GeminiServerClient => ({
 const readyMeeting = (id: string, tagTitles: readonly string[]): void => {
   store.createMeeting({ meeting_id: id, created_at: T0, source_file_name: `${id}.m4a`, source_file_size: 1 });
   store.setStatus(id, 'TRANSCRIBING', T0);
+  store.setStatus(id, 'TRANSCRIBED', T0);
   store.setStatus(id, 'ANALYZING', T0);
   store.setStatus(id, 'READY', T0);
   if (tagTitles.length === 0) return;

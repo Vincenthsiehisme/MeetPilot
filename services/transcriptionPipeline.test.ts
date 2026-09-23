@@ -5,6 +5,7 @@ import { AnalysisModelOutput } from './analysisContract';
 import { AudioFileStore } from './audioFileStore';
 import { AudioSlicer } from './audioSlicer';
 import { GeminiServerClient } from './geminiServerClient';
+import { createJobStore } from './jobStore';
 import { openMeetingDb } from './meetingDb';
 import { MeetingStore, createMeetingStore } from './meetingStore';
 import { SLICE_OVERLAP_SECONDS } from './transcriptMerge';
@@ -14,9 +15,9 @@ import { NameResolver, createNameResolver } from './nameResolver';
 import {
   SLICE_DURATION_SECONDS,
   TranscriptionPipelineDeps,
+  backfillInterruptedMeetings,
   buildPreviousContext,
   createTranscriptionPipeline,
-  requeueInterruptedMeetings,
   resolveParticipantNames,
 } from './transcriptionPipeline';
 
@@ -164,7 +165,7 @@ describe('run：整場跑完', () => {
 
     await pipeline.run('m-1');
 
-    expect(statuses).toEqual(['TRANSCRIBING', 'ANALYZING', 'READY']);
+    expect(statuses).toEqual(['TRANSCRIBING', 'TRANSCRIBED', 'ANALYZING', 'READY']);
     expect(store.getMeeting('m-1')?.status).toBe('READY');
     expect(present.has('m-1')).toBe(false);
     // 刪檔發生在 READY 之後：轉錄成功就刪的話，分析失敗的那場會再也重跑不了
@@ -475,6 +476,180 @@ describe('NameResolver 接進 analyze（人名校正 N4）', () => {
     await pipeline.run('m-1');
 
     expect(store.getMeeting('m-1')!.status).toBe('READY');
+  });
+});
+
+describe('provenance：逐字稿版本分層與來源標記', () => {
+  it('轉錄逐片實際打中的模型落地成 slice_models', async () => {
+    newMeeting();
+    const pipeline = pipelineWith({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(THREE_SLICE_DURATION),
+      gemini: fakeGemini({
+        transcribeSlice: async ({ offsetSeconds = 0, onModelUsed }) => {
+          // 前兩片假裝首選模型可用，第三片假裝退到了 fallback，跟真實世界的混模型情況對齊
+          onModelUsed?.(offsetSeconds === 1200 ? 'gemini-3.1-flash-lite' : 'gemini-3.8-flash', 1);
+          return [{ start: offsetSeconds, end: offsetSeconds + 30, text: `第 ${offsetSeconds} 秒`, speaker: 'S' }];
+        },
+      }),
+      now: () => T0 + 1,
+    });
+
+    await pipeline.run('m-1');
+
+    const models = store.getSliceModels('m-1');
+    expect(models).toEqual([
+      { sliceIndex: 0, model: 'gemini-3.8-flash', attempt: 1, kind: 'slice' },
+      { sliceIndex: 1, model: 'gemini-3.8-flash', attempt: 1, kind: 'slice' },
+      { sliceIndex: 2, model: 'gemini-3.1-flash-lite', attempt: 1, kind: 'slice' },
+    ]);
+  });
+
+  it('分析成功落地 provenance：raw 逐字稿、實際模型、prompt 版本', async () => {
+    newMeeting();
+    const pipeline = pipelineWith({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(30),
+      gemini: fakeGemini({
+        transcribeSlice: async () => [{ start: 0, end: 30, text: '開場', speaker: 'S' }],
+        analyzeTranscript: async ({ onProvenance }) => {
+          onProvenance?.({ model: 'gemini-3.8-flash', promptVersion: 'abc123' });
+          return analysisOutput;
+        },
+      }),
+      now: () => T0 + 1,
+    });
+
+    await pipeline.run('m-1');
+
+    expect(store.getAnalysisProvenance('m-1')).toEqual({
+      source_kind: 'raw',
+      source_edit_version: null,
+      // 沒帶 nameResolver：不對 name_mentions 做版本化，快照留 null（見 meetingStore 的
+      // AnalysisProvenance 設計）
+      resolved_segments_snapshot: null,
+      model: 'gemini-3.8-flash',
+      prompt_version: 'abc123',
+    });
+  });
+
+  it('假 client 不回報 provenance 時，saveAnalysis 沿用舊行為（不寫壞成帶 null 的假紀錄）', async () => {
+    newMeeting();
+    const pipeline = pipelineWith({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(30),
+      gemini: fakeGemini(),
+      now: () => T0 + 1,
+    });
+
+    await pipeline.run('m-1');
+
+    expect(store.getAnalysis('m-1')).not.toBeNull();
+    expect(store.getAnalysisProvenance('m-1')).toBeNull();
+  });
+
+  it('分析讀的是目前顯示的版本（人工編輯過就是編輯後的），provenance 記成 edited 與正確的 edit_version', async () => {
+    newMeeting();
+    store.saveTranscript('m-1', { segments: [{ start: 0, end: 3, text: '原始開場', speaker: 'S' }], polished_content: null }, T0);
+    store.setStatus('m-1', 'TRANSCRIBING', T0 + 1);
+    // 模擬「轉錄完成、停在 TRANSCRIBED 時使用者訂正過逐字稿」：直接在 store 層造一筆編輯，
+    // 不經過 HTTP 層的 BUSY_STATUSES 檢查（那一層在 meetingEdits.ts，這裡只驗 store／pipeline 的接線）
+    store.updateTranscript('m-1', { segments: [{ start: 0, end: 3, text: '訂正後的開場', speaker: 'S' }] }, T0 + 2);
+
+    let seenTranscript: TranscriptSegment[] = [];
+    const pipeline = pipelineWith({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(30),
+      gemini: fakeGemini({
+        transcribeSlice: async () => [{ start: 0, end: 3, text: '原始開場', speaker: 'S' }],
+        analyzeTranscript: async ({ transcript, onProvenance }) => {
+          seenTranscript = transcript;
+          onProvenance?.({ model: 'gemini-3.8-flash', promptVersion: 'abc123' });
+          return analysisOutput;
+        },
+      }),
+      now: () => T0 + 3,
+    });
+
+    await pipeline.run('m-1');
+
+    expect(seenTranscript[0].text).toBe('訂正後的開場');
+    expect(store.getTranscript('m-1')!.segments[0].text).toBe('原始開場'); // raw 不受影響
+    const provenance = store.getAnalysisProvenance('m-1')!;
+    expect(provenance.source_kind).toBe('edited');
+    expect(provenance.source_edit_version).toBe(1);
+  });
+
+  it('分析 job 的 payload 釘住 enqueue 當下的版本，執行時就算又多了新編輯也不會偷偷換版本（Codex adversarial review 抓到）', async () => {
+    newMeeting();
+    store.saveTranscript('m-1', { segments: [{ start: 0, end: 3, text: '原始開場', speaker: 'S' }], polished_content: null }, T0);
+    store.setStatus('m-1', 'TRANSCRIBING', T0 + 1);
+    store.setStatus('m-1', 'TRANSCRIBED', T0 + 1);
+    // enqueue 當下：第一版編輯存在，payload 釘住 edit_version=1
+    store.updateTranscript('m-1', { segments: [{ start: 0, end: 3, text: '第一版訂正', speaker: 'S' }] }, T0 + 2);
+    const pinnedPayload = { source_kind: 'edited' as const, source_edit_version: 1 };
+    // 排隊排到一半，使用者又編輯了一次（enqueue 之後才發生）
+    store.updateTranscript('m-1', { segments: [{ start: 0, end: 3, text: '第二版訂正（enqueue 之後才發生）', speaker: 'S' }] }, T0 + 3);
+
+    let seenTranscript: TranscriptSegment[] = [];
+    const pipeline = pipelineWith({
+      store, audioStore: fakeAudioStore(new Set(['m-1'])), slicer: fakeSlicer(30),
+      gemini: fakeGemini({
+        analyzeTranscript: async ({ transcript, onProvenance }) => {
+          seenTranscript = transcript;
+          onProvenance?.({ model: 'gemini-3.8-flash', promptVersion: 'abc123' });
+          return analysisOutput;
+        },
+      }),
+      now: () => T0 + 4,
+    });
+
+    await pipeline.runAnalysisPhase('m-1', pinnedPayload);
+
+    // 讀到的是 enqueue 當下釘住的第一版，不是執行當下已經存在的第二版
+    expect(seenTranscript[0].text).toBe('第一版訂正');
+    const provenance = store.getAnalysisProvenance('m-1')!;
+    expect(provenance.source_edit_version).toBe(1);
+  });
+
+  it('沒有 payload（run() 那種舊呼叫端）時沿用即時讀取，行為不變', async () => {
+    newMeeting();
+    store.saveTranscript('m-1', { segments: [{ start: 0, end: 3, text: '原始開場', speaker: 'S' }], polished_content: null }, T0);
+    store.setStatus('m-1', 'TRANSCRIBING', T0 + 1);
+    store.setStatus('m-1', 'TRANSCRIBED', T0 + 1);
+    store.updateTranscript('m-1', { segments: [{ start: 0, end: 3, text: '最新版本', speaker: 'S' }] }, T0 + 2);
+
+    let seenTranscript: TranscriptSegment[] = [];
+    const pipeline = pipelineWith({
+      store, audioStore: fakeAudioStore(new Set(['m-1'])), slicer: fakeSlicer(30),
+      gemini: fakeGemini({
+        analyzeTranscript: async ({ transcript }) => { seenTranscript = transcript; return analysisOutput; },
+      }),
+      now: () => T0 + 3,
+    });
+
+    await pipeline.runAnalysisPhase('m-1'); // 沒帶 payload
+
+    expect(seenTranscript[0].text).toBe('最新版本');
+  });
+
+  it('payload 釘住的 edit_version 已經不存在時直接拋錯，不悄悄退回別的版本', async () => {
+    newMeeting();
+    store.saveTranscript('m-1', { segments: [{ start: 0, end: 3, text: '原始開場', speaker: 'S' }], polished_content: null }, T0);
+    store.setStatus('m-1', 'TRANSCRIBING', T0 + 1);
+    store.setStatus('m-1', 'TRANSCRIBED', T0 + 1);
+    const pipeline = pipelineWith({
+      store, audioStore: fakeAudioStore(new Set(['m-1'])), slicer: fakeSlicer(30), gemini: fakeGemini(),
+      now: () => T0 + 2,
+    });
+
+    // edit_version=1 從來沒存在過（沒有任何 updateTranscript 呼叫過）
+    await expect(pipeline.runAnalysisPhase('m-1', { source_kind: 'edited', source_edit_version: 1 }))
+      .rejects.toThrow(/找不到 edit_version 1/);
   });
 });
 
@@ -794,7 +969,68 @@ describe('run：失敗', () => {
     expect(store.getTranscript('m-1')?.segments).toHaveLength(1);
   });
 
-  it('分析失敗時一樣 FAILED 且音檔還在，逐字稿留著', async () => {
+  it('直接呼叫 runTranscriptionPhase 失敗時不自動轉 FAILED，meeting 留在 TRANSCRIBING 可以重試', async () => {
+    // 給 job-based worker 用的介面（vault plan「MeetPilot · 轉錄分析佇列架構升級」）：
+    // job 重試次數還沒用盡時，meeting 要留在可重入的狀態，不能被單次失敗就轉成終態 FAILED
+    newMeeting();
+    let attempts = 0;
+    const pipeline = pipelineWith({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(SLICE_DURATION_SECONDS),
+      gemini: fakeGemini({
+        transcribeSlice: async ({ offsetSeconds = 0 }) => {
+          attempts += 1;
+          if (attempts === 1) throw new Error('第一次轉錄失敗');
+          return [{ start: offsetSeconds, end: offsetSeconds + 30, text: '內容', speaker: 'S' }];
+        },
+      }),
+      now: () => T0 + 1,
+    });
+
+    await expect(pipeline.runTranscriptionPhase('m-1')).rejects.toThrow('第一次轉錄失敗');
+    expect(store.getMeeting('m-1')?.status).toBe('TRANSCRIBING');
+    expect(store.getMeeting('m-1')?.error).toBeNull();
+
+    // 重試：直接再呼叫一次，不用重新走 run()
+    await pipeline.runTranscriptionPhase('m-1');
+    expect(store.getMeeting('m-1')?.status).toBe('TRANSCRIBED');
+    expect(attempts).toBe(2);
+  });
+
+  it('markTranscriptionFailed 給 worker 在 job 重試次數用盡時呼叫，把 meeting 轉成真正的 FAILED', () => {
+    newMeeting();
+    store.setStatus('m-1', 'TRANSCRIBING', T0 + 1);
+    const pipeline = pipelineWith({
+      store, audioStore: fakeAudioStore(new Set(['m-1'])), slicer: fakeSlicer(30), gemini: fakeGemini(),
+    });
+
+    pipeline.markTranscriptionFailed('m-1', '重試三次都失敗');
+
+    const meeting = store.getMeeting('m-1');
+    expect(meeting?.status).toBe('FAILED');
+    expect(meeting?.error).toBe('重試三次都失敗');
+  });
+
+  it('run() 呼叫在已完成的會（READY）上只拋錯，不會把它改寫成 FAILED', async () => {
+    // 這條釘住一個真的踩過的迴歸：run() 的失敗處理不能連呼叫端傳錯狀態都一起接住，
+    // 那會把一場已經 READY 的會覆寫成 FAILED
+    newMeeting();
+    const pipeline = pipelineWith({
+      store, audioStore: fakeAudioStore(new Set(['m-1'])), slicer: fakeSlicer(30), gemini: fakeGemini(),
+      now: () => T0 + 1,
+    });
+    await pipeline.run('m-1');
+    expect(store.getMeeting('m-1')?.status).toBe('READY');
+
+    await expect(pipeline.run('m-1')).rejects.toThrow(/目前是 READY/);
+    expect(store.getMeeting('m-1')?.status).toBe('READY');
+  });
+
+  it('分析失敗時退回 TRANSCRIBED（不是 FAILED），音檔還在、逐字稿留著，可以重跑分析', async () => {
+    // vault plan「MeetPilot · 轉錄分析佇列架構升級」的狀態機：分析失敗不連坐已經成功的
+    // 轉錄結果，退回 TRANSCRIBED 而不是全場 FAILED。error 訊息不記在 meetings.error——
+    // TRANSCRIBED 不是 FAILED／LINK_FAILED，setStatus 只在那兩個狀態保留 error 欄位
     newMeeting();
     const present = new Set(['m-1']);
     const pipeline = pipelineWith({
@@ -806,13 +1042,41 @@ describe('run：失敗', () => {
     });
 
     await expect(pipeline.run('m-1')).rejects.toThrow('分析逾時');
-    expect(statuses).toEqual(['TRANSCRIBING', 'ANALYZING', 'FAILED']);
-    expect(store.getMeeting('m-1')?.error).toBe('分析逾時');
+    expect(statuses).toEqual(['TRANSCRIBING', 'TRANSCRIBED', 'ANALYZING', 'TRANSCRIBED']);
+    expect(store.getMeeting('m-1')?.status).toBe('TRANSCRIBED');
+    expect(store.getMeeting('m-1')?.error).toBeNull();
     expect(present.has('m-1')).toBe(true);
     expect(store.getTranscript('m-1')?.segments).toHaveLength(1);
   });
 
-  it('每一片都沒轉出內容時擋在分析前面，不送空逐字稿去生一份憑空的摘要', async () => {
+  it('分析失敗退回 TRANSCRIBED 之後，重跑分析階段不用重新轉錄就能成功', async () => {
+    newMeeting();
+    let attempts = 0;
+    const pipeline = pipelineWith({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(SLICE_DURATION_SECONDS),
+      gemini: fakeGemini({
+        analyzeTranscript: async () => {
+          attempts += 1;
+          if (attempts === 1) throw new Error('第一次分析逾時');
+          return analysisOutput;
+        },
+      }),
+      now: () => T0 + 1,
+    });
+
+    await expect(pipeline.run('m-1')).rejects.toThrow('第一次分析逾時');
+    expect(store.getMeeting('m-1')?.status).toBe('TRANSCRIBED');
+
+    // 只重跑分析階段，不經過 runTranscriptionPhase：這正是拆兩條 queue 之後想要的效果
+    await pipeline.runAnalysisPhase('m-1');
+
+    expect(store.getMeeting('m-1')?.status).toBe('READY');
+    expect(attempts).toBe(2);
+  });
+
+  it('每一片都沒轉出內容時擋在分析前面，不送空逐字稿去生一份憑空的摘要，退回 TRANSCRIBED', async () => {
     newMeeting();
     const analyzeTranscript = vi.fn(async () => analysisOutput);
     const pipeline = pipelineWith({
@@ -825,7 +1089,7 @@ describe('run：失敗', () => {
 
     await expect(pipeline.run('m-1')).rejects.toThrow(/每一片都沒有轉出內容/);
     expect(analyzeTranscript).not.toHaveBeenCalled();
-    expect(store.getMeeting('m-1')?.status).toBe('FAILED');
+    expect(store.getMeeting('m-1')?.status).toBe('TRANSCRIBED');
   });
 
   it('音檔不在時直接 FAILED，不會去呼叫 ffprobe', async () => {
@@ -871,6 +1135,7 @@ describe('run：失敗', () => {
   it('已經跑完的會不給重跑，不覆蓋既有結果', async () => {
     newMeeting();
     store.setStatus('m-1', 'TRANSCRIBING', T0 + 1);
+    store.setStatus('m-1', 'TRANSCRIBED', T0 + 2);
     store.setStatus('m-1', 'ANALYZING', T0 + 2);
     store.setStatus('m-1', 'READY', T0 + 3);
     const pipeline = pipelineWith({
@@ -919,47 +1184,56 @@ describe('run：續傳', () => {
     expect(offsets).toEqual([1200]);
     expect(sliced).toEqual([1200]);
     // 續傳不重走 CREATED → TRANSCRIBING，它已經在 TRANSCRIBING 了
-    expect(statuses).toEqual(['ANALYZING', 'READY']);
+    expect(statuses).toEqual(['TRANSCRIBED', 'ANALYZING', 'READY']);
     expect(store.getTranscript('m-1')?.segments).toHaveLength(2);
     expect(store.getMeeting('m-1')?.processed_slices).toBe(3);
   });
 });
 
-describe('requeueInterruptedMeetings', () => {
-  it('TRANSCRIBING 且音檔還在的重新入列', () => {
+describe('backfillInterruptedMeetings', () => {
+  const jobsFor = () => createJobStore(db);
+
+  it('TRANSCRIBING 且音檔還在、沒有 active job 時補一筆轉錄 job', () => {
     newMeeting('m-1');
     store.setStatus('m-1', 'TRANSCRIBING', T0 + 1);
-    const enqueued: string[] = [];
+    const jobs = jobsFor();
 
-    const report = requeueInterruptedMeetings({
-      store,
-      audioStore: fakeAudioStore(new Set(['m-1'])),
-      enqueue: (id) => enqueued.push(id),
-      now: () => T0 + 2,
+    const report = backfillInterruptedMeetings({
+      store, jobs, audioStore: fakeAudioStore(new Set(['m-1'])), now: () => T0 + 2,
     });
 
-    expect(enqueued).toEqual(['m-1']);
-    expect(report.requeued).toEqual(['m-1']);
+    expect(report.transcriptionRequeued).toEqual(['m-1']);
+    expect(jobs.hasActive('m-1', 'transcription')).toBe(true);
     expect(store.getMeeting('m-1')?.status).toBe('TRANSCRIBING');
   });
 
   it('TRANSCRIBING 但音檔不在的轉 FAILED 帶原因，不留在 TRANSCRIBING 假裝還在跑', () => {
     newMeeting('m-1');
     store.setStatus('m-1', 'TRANSCRIBING', T0 + 1);
-    const enqueued: string[] = [];
+    const jobs = jobsFor();
 
-    const report = requeueInterruptedMeetings({
-      store,
-      audioStore: fakeAudioStore(new Set()),
-      enqueue: (id) => enqueued.push(id),
-      now: () => T0 + 2,
+    const report = backfillInterruptedMeetings({
+      store, jobs, audioStore: fakeAudioStore(new Set()), now: () => T0 + 2,
     });
 
-    expect(enqueued).toEqual([]);
+    expect(report.transcriptionRequeued).toEqual([]);
     expect(report.failed).toHaveLength(1);
     const meeting = store.getMeeting('m-1');
     expect(meeting?.status).toBe('FAILED');
     expect(meeting?.error).toMatch(/音檔已經不在/);
+  });
+
+  it('已經有 active 轉錄 job 的不重複補（避免跟正常流程搶著 enqueue 同一場會兩次）', () => {
+    newMeeting('m-1');
+    store.setStatus('m-1', 'TRANSCRIBING', T0 + 1);
+    const jobs = jobsFor();
+    jobs.enqueue('m-1', 'transcription', null, T0 + 1);
+
+    const report = backfillInterruptedMeetings({
+      store, jobs, audioStore: fakeAudioStore(new Set(['m-1'])), now: () => T0 + 2,
+    });
+
+    expect(report.transcriptionRequeued).toEqual([]); // 沒有補第二筆
   });
 
   it('CREATED ＋ 音檔在 ＋ 游標不為 0 時只入列，不清游標：那可能是 retry 之後還在排隊的會', () => {
@@ -971,52 +1245,24 @@ describe('requeueInterruptedMeetings', () => {
     store.saveTranscriptProgress(
       'm-1', { segments: [{ start: 0, end: 10, text: '人工修正過的內容' }], polished_content: '潤稿' }, 12, 20, T0 + 1,
     );
-    const enqueued: string[] = [];
+    const jobs = jobsFor();
 
-    requeueInterruptedMeetings({
-      store,
-      audioStore: fakeAudioStore(new Set(['m-1'])),
-      enqueue: (id) => enqueued.push(id),
-      now: () => T0 + 2,
-    });
+    backfillInterruptedMeetings({ store, jobs, audioStore: fakeAudioStore(new Set(['m-1'])), now: () => T0 + 2 });
 
-    expect(enqueued).toEqual(['m-1']);
+    expect(jobs.hasActive('m-1', 'transcription')).toBe(true);
     expect(store.getMeeting('m-1')?.processed_slices).toBe(12);
     expect(store.getTranscript('m-1')?.segments[0].text).toBe('人工修正過的內容');
   });
 
-  it('TRANSCRIBING ＋ 音檔在時不歸零：那是真正的續傳，游標要留著', () => {
-    newMeeting('m-1');
-    store.setStatus('m-1', 'TRANSCRIBING', T0 + 1);
-    store.saveTranscriptProgress(
-      'm-1', { segments: [{ start: 0, end: 10, text: '第一片' }], polished_content: null }, 1, 3, T0 + 2,
-    );
-    const enqueued: string[] = [];
-
-    requeueInterruptedMeetings({
-      store,
-      audioStore: fakeAudioStore(new Set(['m-1'])),
-      enqueue: (id) => enqueued.push(id),
-      now: () => T0 + 3,
-    });
-
-    expect(enqueued).toEqual(['m-1']);
-    expect(store.getMeeting('m-1')?.processed_slices).toBe(1);
-    expect(store.getTranscript('m-1')?.segments).toHaveLength(1);
-  });
-
   it('CREATED 但音檔不在時留在 CREATED，不轉 FAILED：轉了就是死路，PUT 與 retry 都會被擋', () => {
     newMeeting('m-1');
-    const enqueued: string[] = [];
+    const jobs = jobsFor();
 
-    const report = requeueInterruptedMeetings({
-      store,
-      audioStore: fakeAudioStore(new Set()),
-      enqueue: (id) => enqueued.push(id),
-      now: () => T0 + 2,
+    const report = backfillInterruptedMeetings({
+      store, jobs, audioStore: fakeAudioStore(new Set()), now: () => T0 + 2,
     });
 
-    expect(enqueued).toEqual([]);
+    expect(report.transcriptionRequeued).toEqual([]);
     expect(report.failed).toEqual([]);
     expect(report.waitingForAudio).toEqual(['m-1']);
     expect(store.getMeeting('m-1')?.status).toBe('CREATED');
@@ -1025,35 +1271,122 @@ describe('requeueInterruptedMeetings', () => {
 
   it('CREATED 且音檔還在的也要續傳：上傳完成但還沒開跑就重啟的那幾場', () => {
     newMeeting('m-1');
-    const enqueued: string[] = [];
+    const jobs = jobsFor();
 
-    requeueInterruptedMeetings({
-      store,
-      audioStore: fakeAudioStore(new Set(['m-1'])),
-      enqueue: (id) => enqueued.push(id),
-      now: () => T0 + 2,
+    backfillInterruptedMeetings({ store, jobs, audioStore: fakeAudioStore(new Set(['m-1'])), now: () => T0 + 2 });
+
+    expect(jobs.hasActive('m-1', 'transcription')).toBe(true);
+  });
+
+  it('ANALYZING 停在半路的補一筆分析 job，並把 meeting 退回 TRANSCRIBED（讓 job 真的跑得動）', () => {
+    // Codex adversarial review 抓到的真缺口：原本只 enqueue job，沒退回 TRANSCRIBED，
+    // runAnalysisPhase 的前置條件過不了，這種舊資料永遠救不回來
+    newMeeting('m-1');
+    store.saveTranscript('m-1', { segments: [{ start: 0, end: 3, text: '開場', speaker: 'S' }], polished_content: null }, T0);
+    store.setStatus('m-1', 'TRANSCRIBING', T0 + 1);
+    store.setStatus('m-1', 'TRANSCRIBED', T0 + 1);
+    store.setStatus('m-1', 'ANALYZING', T0 + 2);
+    const jobs = jobsFor();
+
+    const report = backfillInterruptedMeetings({
+      store, jobs, audioStore: fakeAudioStore(new Set(['m-1'])), now: () => T0 + 3,
     });
 
-    expect(enqueued).toEqual(['m-1']);
+    expect(report.analysisRequeued).toEqual(['m-1']);
+    expect(store.getMeeting('m-1')?.status).toBe('TRANSCRIBED');
+    const job = jobs.claim('analysis', 'w', 60_000, T0 + 4);
+    expect(job?.payload).toEqual({ source_kind: 'raw', source_edit_version: null });
+  });
+
+  it('backfill 補回來的分析 job 真的執行得完，不會因為前置條件卡死', async () => {
+    newMeeting('m-1');
+    store.saveTranscript('m-1', { segments: [{ start: 0, end: 3, text: '開場', speaker: 'S' }], polished_content: null }, T0);
+    store.setStatus('m-1', 'TRANSCRIBING', T0 + 1);
+    store.setStatus('m-1', 'TRANSCRIBED', T0 + 1);
+    store.setStatus('m-1', 'ANALYZING', T0 + 2);
+    const jobs = jobsFor();
+    backfillInterruptedMeetings({ store, jobs, audioStore: fakeAudioStore(new Set(['m-1'])), now: () => T0 + 3 });
+
+    const job = jobs.claim('analysis', 'w', 60_000, T0 + 4)!;
+    const pipeline = pipelineWith({
+      store, audioStore: fakeAudioStore(new Set(['m-1'])), slicer: fakeSlicer(30), gemini: fakeGemini(),
+      now: () => T0 + 5,
+    });
+
+    await pipeline.runAnalysisPhase('m-1', job.payload);
+
+    expect(store.getMeeting('m-1')?.status).toBe('READY');
+  });
+
+  it('TRANSCRIBED（分析失敗退回來的）也補一筆分析 job，讀到編輯過的版本就帶 edited payload', () => {
+    newMeeting('m-1');
+    store.saveTranscript('m-1', { segments: [{ start: 0, end: 3, text: '開場', speaker: 'S' }], polished_content: null }, T0);
+    store.setStatus('m-1', 'TRANSCRIBING', T0 + 1);
+    store.setStatus('m-1', 'TRANSCRIBED', T0 + 1);
+    store.updateTranscript('m-1', { segments: [{ start: 0, end: 3, text: '訂正過的開場', speaker: 'S' }] }, T0 + 2);
+    const jobs = jobsFor();
+
+    const report = backfillInterruptedMeetings({
+      store, jobs, audioStore: fakeAudioStore(new Set(['m-1'])), now: () => T0 + 3,
+    });
+
+    expect(report.analysisRequeued).toEqual(['m-1']);
+    const job = jobs.claim('analysis', 'w', 60_000, T0 + 4);
+    expect(job?.payload).toEqual({ source_kind: 'edited', source_edit_version: 1 });
+  });
+
+  it('已經用盡重試轉 failed 的分析 job 不會被 backfill 復活（Codex adversarial review 抓到）', () => {
+    // 這是跟上面「已經有 active job 不重複補」同一類保護，但故意驗最容易漏掉的那個情境：
+    // job 不是 active（是 failed），如果 backfill 只看 hasActive 會誤判成「沒有 job」
+    // 然後每次重啟都重新 enqueue 一個 attempt=0 的新 job，繞過 max_attempts 這個煞車
+    newMeeting('m-1');
+    store.saveTranscript('m-1', { segments: [{ start: 0, end: 3, text: '開場', speaker: 'S' }], polished_content: null }, T0);
+    store.setStatus('m-1', 'TRANSCRIBING', T0 + 1);
+    store.setStatus('m-1', 'TRANSCRIBED', T0 + 1);
+    const jobs = jobsFor();
+    const jobId = jobs.enqueue('m-1', 'analysis', { source_kind: 'raw', source_edit_version: null }, T0 + 1, 1)!;
+    jobs.claim('analysis', 'w', 60_000, T0 + 2);
+    expect(jobs.markFailed(jobId, '模擬用盡重試', T0 + 3)).toBe('failed'); // max_attempts=1，一次就用盡
+
+    const report = backfillInterruptedMeetings({
+      store, jobs, audioStore: fakeAudioStore(new Set(['m-1'])), now: () => T0 + 4,
+    });
+
+    expect(report.analysisRequeued).toEqual([]);
+    expect(jobs.hasActive('m-1', 'analysis')).toBe(false); // 沒有偷偷生出新的 active job
+  });
+
+  it('已經有 active 分析 job 的不重複補', () => {
+    newMeeting('m-1');
+    store.saveTranscript('m-1', { segments: [{ start: 0, end: 3, text: '開場', speaker: 'S' }], polished_content: null }, T0);
+    store.setStatus('m-1', 'TRANSCRIBING', T0 + 1);
+    store.setStatus('m-1', 'TRANSCRIBED', T0 + 1);
+    const jobs = jobsFor();
+    jobs.enqueue('m-1', 'analysis', { source_kind: 'raw', source_edit_version: null }, T0 + 1);
+
+    const report = backfillInterruptedMeetings({
+      store, jobs, audioStore: fakeAudioStore(new Set(['m-1'])), now: () => T0 + 3,
+    });
+
+    expect(report.analysisRequeued).toEqual([]);
   });
 
   it('已經跑完或還沒開始的狀態一律不碰', () => {
     newMeeting('m-ready');
     store.setStatus('m-ready', 'TRANSCRIBING', T0 + 1);
+    store.setStatus('m-ready', 'TRANSCRIBED', T0 + 2);
     store.setStatus('m-ready', 'ANALYZING', T0 + 2);
     store.setStatus('m-ready', 'READY', T0 + 3);
     newMeeting('m-failed');
     store.setStatus('m-failed', 'FAILED', T0 + 1, '上次就失敗了');
-    const enqueued: string[] = [];
+    const jobs = jobsFor();
 
-    const report = requeueInterruptedMeetings({
-      store,
-      audioStore: fakeAudioStore(new Set(['m-ready', 'm-failed'])),
-      enqueue: (id) => enqueued.push(id),
-      now: () => T0 + 4,
+    const report = backfillInterruptedMeetings({
+      store, jobs, audioStore: fakeAudioStore(new Set(['m-ready', 'm-failed'])), now: () => T0 + 4,
     });
 
-    expect(enqueued).toEqual([]);
+    expect(report.transcriptionRequeued).toEqual([]);
+    expect(report.analysisRequeued).toEqual([]);
     expect(report.failed).toEqual([]);
     expect(store.getMeeting('m-ready')?.status).toBe('READY');
     expect(store.getMeeting('m-failed')?.error).toBe('上次就失敗了');
@@ -1070,13 +1403,14 @@ describe('requeueInterruptedMeetings', () => {
       transcript: null, analysis: null, tags: [],
     }]);
 
-    const realStore = createAudioFileStoreStub();
-    const report = requeueInterruptedMeetings({
-      store, audioStore: realStore, enqueue: () => { throw new Error('不該入列'); }, now: () => T0 + 1,
+    const jobs = jobsFor();
+    const report = backfillInterruptedMeetings({
+      store, jobs, audioStore: createAudioFileStoreStub(), now: () => T0 + 1,
     });
 
     expect(report.failed[0].reason).toMatch(/無法判斷音檔位置/);
     expect(store.getMeeting('job/怪 id')?.status).toBe('FAILED');
+    expect(jobs.hasActive('job/怪 id', 'transcription')).toBe(false);
   });
 });
 
@@ -1103,7 +1437,7 @@ describe('題目標籤（W3）', () => {
     }));
 
     expect(statusWhenExtracting).toEqual(['ANALYZING']);
-    expect(statuses).toEqual(['TRANSCRIBING', 'ANALYZING', 'READY']);
+    expect(statuses).toEqual(['TRANSCRIBING', 'TRANSCRIBED', 'ANALYZING', 'READY']);
     expect(store.getMeeting('m-1')?.topic_extraction_status).toBe('ok');
     expect(store.getTopicTags('m-1').map(t => t.title)).toEqual(['POC 時程']);
   });
@@ -1113,7 +1447,7 @@ describe('題目標籤（W3）', () => {
       extractTopicTags: async () => { throw new Error('模型輸出被截斷'); },
     }));
 
-    expect(statuses).toEqual(['TRANSCRIBING', 'ANALYZING', 'READY']);
+    expect(statuses).toEqual(['TRANSCRIBING', 'TRANSCRIBED', 'ANALYZING', 'READY']);
     const meeting = store.getMeeting('m-1');
     expect(meeting?.status).toBe('READY');
     expect(meeting?.topic_extraction_status).toBe('failed');
@@ -1208,7 +1542,7 @@ describe('run：關聯接在 READY 之後（W4）', () => {
 
     // READY 的意思正是「還沒算關聯」；寫成 LINK_FAILED 會讓畫面出現一個不存在的錯誤，
     // 也會讓 6.1 的關聯成功率指標被人為關閉污染
-    expect(statuses).toEqual(['TRANSCRIBING', 'ANALYZING', 'READY']);
+    expect(statuses).toEqual(['TRANSCRIBING', 'TRANSCRIBED', 'ANALYZING', 'READY']);
     expect(store.getMeeting('m-1')?.error).toBeNull();
   });
 });

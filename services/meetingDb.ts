@@ -255,6 +255,110 @@ const MIGRATIONS: readonly string[] = [
 
   CREATE INDEX idx_name_mentions_meeting ON name_mentions(meeting_id);
   `,
+  // 逐字稿三層（raw／resolved／edited）與轉錄分析佇列拆解的共用地基
+  // （vault plan「MeetPilot · 逐字稿版本分層與來源標記」「MeetPilot · 轉錄分析佇列架構升級」）。
+  //
+  // `transcript_edits`：edited layer，append-only。取代直接覆寫 `transcripts.segments`——
+  // 那一欄從這次起是真正的 raw（模型原始轉譯輸出），`PATCH /transcript` 改成對這張表 insert
+  // 新列，`edit_version` 該會議內單調遞增。「目前顯示的逐字稿」＝這張表裡最大 edit_version
+  // 那列，沒有任何列就退回 raw。
+  //
+  // `transcripts.slice_models`：轉錄逐片可能各自 fallback 到不同模型
+  // （`generateContentWithFallback` 逐次呼叫各自判斷，不是整場會鎖一個），單一 model 欄位會
+  // 遺失這個真實會發生的事（2026-09-22 查 `logs/llm.jsonl`：11 場有轉錄紀錄的會議 6 場混用
+  // 兩個模型）。JSON 陣列，跟既有 `seam_report` 同一個「per-slice blob、
+  // `saveTranscriptProgress` 每片寫入時一併更新」慣例。
+  //
+  // `analyses` 新增來源欄位：`source_kind`／`source_edit_version` 記這次分析讀的是 raw 還是
+  // 哪一版 edited；`resolved_segments_snapshot` 存實際送進分析模型的已解析文字快照，不對
+  // `name_mentions` 做版本化——那張表會被人工 `confirmMention` 事後覆寫，沒辦法從「現在的
+  // 狀態」回推「當時模型讀到的內容」，只有快照可靠；`model`／`prompt_version` 記這次分析實際
+  // 打中哪個模型（fallback 後的值，不是設定的首選）與 `prompts/meeting-record-spec.md` 當下的
+  // 內容雜湊。全部允許 NULL：既有分析資料回填不出這些值，NULL 是「這筆早於這次升級」，不是
+  // 猜一個值出來（跟 `topic_extraction_status` 的 NULL＝「還沒抽過」同一個判準）。
+  //
+  // `jobs`：轉錄與分析拆成兩條持久化 queue 的 job table，取代純記憶體的 `TranscriptionQueue`。
+  // `payload` 給 analysis job 用，帶 `{source_kind, source_edit_version}`，enqueue 當下釘死，
+  // worker 執行時直接讀 job row 的值，不重新查「這場會目前最新版本是哪一版」。
+  // `idx_jobs_meeting_kind_active` 擋同一場會同一種 job 重複入列；claim 靠
+  // `UPDATE ... WHERE status='queued'` 的 compare-and-swap 判 `changes === 1`，不用另外加鎖。
+  `
+  CREATE TABLE transcript_edits (
+    edit_id TEXT PRIMARY KEY,
+    meeting_id TEXT NOT NULL REFERENCES meetings(meeting_id) ON DELETE CASCADE,
+    edit_version INTEGER NOT NULL,
+    segments TEXT NOT NULL,
+    polished_content TEXT,
+    created_at INTEGER NOT NULL,
+    UNIQUE (meeting_id, edit_version)
+  );
+
+  CREATE INDEX idx_transcript_edits_meeting ON transcript_edits(meeting_id);
+
+  ALTER TABLE transcripts ADD COLUMN slice_models TEXT;
+
+  ALTER TABLE analyses ADD COLUMN source_kind TEXT CHECK (source_kind IN ('raw', 'edited'));
+  ALTER TABLE analyses ADD COLUMN source_edit_version INTEGER;
+  ALTER TABLE analyses ADD COLUMN resolved_segments_snapshot TEXT;
+  ALTER TABLE analyses ADD COLUMN model TEXT;
+  ALTER TABLE analyses ADD COLUMN prompt_version TEXT;
+
+  CREATE TABLE jobs (
+    job_id TEXT PRIMARY KEY,
+    meeting_id TEXT NOT NULL REFERENCES meetings(meeting_id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN ('transcription', 'analysis')),
+    status TEXT NOT NULL CHECK (status IN ('queued', 'claimed', 'running', 'succeeded', 'failed')),
+    payload TEXT,
+    attempt INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 3,
+    claimed_by TEXT,
+    claimed_at INTEGER,
+    lease_expires_at INTEGER,
+    error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+
+  CREATE INDEX idx_jobs_kind_status ON jobs(kind, status);
+  CREATE INDEX idx_jobs_meeting ON jobs(meeting_id);
+  CREATE UNIQUE INDEX idx_jobs_meeting_kind_active ON jobs(meeting_id, kind)
+    WHERE status IN ('queued', 'claimed', 'running');
+  `,
+  // 補標記升級前（上一步 migration 之前）就存在的 transcripts 列（Codex adversarial review
+  // 抓到）。那時 PATCH 直接覆寫 `segments`，raw／edited 沒有分開，沒辦法回頭判斷哪些其實是
+  // 人改過的——provenance 因此不能宣稱這些是 raw，只能標 unknown，這是資料真實情況「判不出來」，
+  // 不是猜一個值出來。這一步之後才寫入的列，`legacy_unconfirmed_raw` 預設 0（真的是 raw），
+  // 因為那之後 PATCH 已經改走 `transcript_edits`，不會再覆寫這欄。
+  //
+  // analyses.source_kind 的 CHECK 只放行 raw／edited，要收 unknown 得整張表重建
+  // （SQLite 不能直接改既有 CHECK 約束）。目前 analyses 只有 meeting_id 當 PK、沒有其他索引、
+  // 沒有別的表用外鍵指向它，重建只是搬資料，不用管索引或級聯。
+  `
+  ALTER TABLE transcripts ADD COLUMN legacy_unconfirmed_raw INTEGER NOT NULL DEFAULT 0;
+  UPDATE transcripts SET legacy_unconfirmed_raw = 1;
+
+  CREATE TABLE analyses_v2 (
+    meeting_id TEXT PRIMARY KEY REFERENCES meetings(meeting_id) ON DELETE CASCADE,
+    contract_version INTEGER NOT NULL,
+    overview TEXT NOT NULL,
+    topics TEXT NOT NULL,
+    decisions TEXT NOT NULL,
+    action_items TEXT NOT NULL,
+    open_questions TEXT NOT NULL DEFAULT '[]',
+    created_at INTEGER NOT NULL,
+    source_kind TEXT CHECK (source_kind IN ('raw', 'edited', 'unknown')),
+    source_edit_version INTEGER,
+    resolved_segments_snapshot TEXT,
+    model TEXT,
+    prompt_version TEXT
+  );
+  INSERT INTO analyses_v2
+    SELECT meeting_id, contract_version, overview, topics, decisions, action_items, open_questions,
+           created_at, source_kind, source_edit_version, resolved_segments_snapshot, model, prompt_version
+    FROM analyses;
+  DROP TABLE analyses;
+  ALTER TABLE analyses_v2 RENAME TO analyses;
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

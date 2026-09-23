@@ -59,7 +59,7 @@ IndexedDB。側邊欄雙讀，兩區分開顯示：「伺服器上的會議」�
 POST   /api/meetings              建立 Meeting（CREATED）
 PUT    /api/meetings/:id/audio    上傳音檔，立刻回 202，轉錄在 server 背景跑（TRANSCRIBING）
 GET    /api/meetings/:id          每 3 秒查一次進度（processed_slices / total_slices / status / error）
-POST   /api/meetings/:id/retry    FAILED 的會重跑（音檔還在才行）
+POST   /api/meetings/:id/retry    FAILED 重跑轉錄（音檔還在才行），或 TRANSCRIBED 重跑分析（不用重新轉錄）
 POST   /api/meetings/:id/link     重算跨會議關聯（READY / LINKED / LINK_FAILED 才行，同步等它跑完）
 DELETE /api/meetings/:id          刪掉；正在跑的回 409，等它結束或失敗再刪
 PATCH  /api/meetings/:id/transcript   改逐字稿或存潤稿
@@ -76,26 +76,37 @@ PATCH  /api/meetings/:id/title        改標題；畫面上的名字與下載檔
 上傳的 body 是音檔本體（`Content-Type: application/octet-stream`），**不經 body parser、不做
 base64**：base64 會先把整個檔案變成一條字串留在記憶體裡還膨脹 33%，那正是舊版把分頁弄崩的方式。
 
-server 端一次只跑一場會（序列佇列），理由是 Gemini 的限流與每日額度，不是資源不夠。續傳游標是
-`meetings.processed_slices`。音檔在**分析成功之後**才刪，轉錄或分析失敗時保留供重試。
+轉錄與分析各自是一條持久化的 SQLite job queue（`services/jobStore.ts`／`services/jobWorker.ts`），
+不是同一條鏈：轉錄完成（`TRANSCRIBED`）之後自動排一個分析 job，但兩者各自有自己的並行量
+（`MEETPILOT_TRANSCRIPTION_CONCURRENCY`／`MEETPILOT_ANALYSIS_CONCURRENCY`，預設都是 1）、各自失敗
+各自重試，分析失敗不會連坐已經轉錄成功的逐字稿——退回 `TRANSCRIBED`，逐字稿還在，`POST retry`
+可以只重跑分析。續傳游標是 `meetings.processed_slices`。音檔在**分析成功之後**才刪，轉錄或分析
+失敗時保留供重試。
 
 `ANALYZING`（產出結論、待辦、未決事項）的規範正本在 `prompts/meeting-record-spec.md`，
 `analyzeTranscript` 啟動時讀進 systemInstruction，不在程式碼裡另外抄一份規則。
 
-重啟時會掃一次，三種處境分開處理：
+重啟時分兩步：
 
-| 重啟當下的狀態 | 處置 |
+1. **回收上一個 process 留下的 job**（`jobStore.reclaimAllActive`）：單一 process 前提下，
+   一個新啟動的 process 看到 job table 裡還停在 `claimed`／`running` 的列，那一定是上一個
+   process 死掉留下的，不用等 lease 到期，啟動當下就無條件回收，退回 `queued` 重試
+   （或用盡重試次數轉 `failed`）。
+2. **補齊沒有 active job 的在途會議**（`backfillInterruptedMeetings`）：涵蓋這次升級前留下的
+   舊資料，或 `PUT audio`／`POST retry` 先改狀態再 enqueue job 之間極短的競態窗口。
+
+| 掃到的狀態 | 處置 |
 |---|---|
-| `TRANSCRIBING`，音檔還在 | 從 `processed_slices` 續傳，已轉好的片段不重打 |
+| `TRANSCRIBING`，音檔還在，沒有 active 轉錄 job | 補一個轉錄 job，從 `processed_slices` 續傳，已轉好的片段不重打 |
 | `TRANSCRIBING`，音檔不在 | 轉 `FAILED` 並寫明原因。它確實斷在半路了，不留在 `TRANSCRIBING` 假裝還在跑 |
 | `CREATED`，音檔不在 | **維持 `CREATED` 等上傳。** 它根本還沒開始跑，狀態本來就對，缺的只是音檔；轉成 FAILED 會變成死路（`PUT` 與 `retry` 都只收 CREATED 或有音檔的會） |
-| `CREATED`，音檔在，游標是空的 | 重新入列從頭跑。這是「音檔上傳完了但還沒輪到它」 |
-| `CREATED`，音檔在，游標不為空 | 重新入列**從游標續跑**。這是「retry 之後還在排隊」，那個游標是刻意保留的——retry 的用意就是不要為了重跑分析而連帶重跑兩小時的轉錄 |
+| `CREATED`，音檔在，沒有 active 轉錄 job | 補一個轉錄 job；游標是空就從頭跑，游標不為空就是 retry 之後還在排隊，從游標**續跑**（保留游標是刻意的——retry 的用意就是不要為了重跑分析而連帶重跑兩小時的轉錄） |
+| `ANALYZING` 或 `TRANSCRIBED`，沒有 active 分析 job | 補一個分析 job，讀「目前顯示的版本」（`getCurrentTranscript`）決定 payload |
 
-沒上傳完的暫存檔（`<meeting_id>.audio.<uuid>.part`）也在這一步清掉。檔名帶 uuid 是因為同一場會
+沒上傳完的暫存檔（`<meeting_id>.audio.<uuid>.part`）也在啟動時清掉。檔名帶 uuid 是因為同一場會
 可能有兩個上傳同時在飛——雖然 server 端有 in-flight 鎖擋住第二個，唯一命名是跨 process 時的第二道防線。
 
-已經在佇列裡等待轉錄的會**不接受重新上傳音檔**，回 409。不擋的話上傳會在 pipeline 正在讀那個檔的時候
+已經在轉錄佇列裡的會**不接受重新上傳音檔**，回 409。不擋的話上傳會在 pipeline 正在讀那個檔的時候
 把它換掉，產出前半來自舊音檔、後半來自新音檔的逐字稿，而且沒有任何錯誤。上傳失敗時 server 會把這場會的
 音檔清乾淨，回到「等待上傳」——因為游標與逐字稿在收檔前就清了，留著舊音檔的組合更難解釋。
 
@@ -326,6 +337,8 @@ POST /api/meetings/import   { jobs: Job[], blobIds: string[] }
 off 開關；目錄不可寫時 server 直接起不來。細節見上面〈投影到 Obsidian vault〉。
 
 每次 Gemini 呼叫會在 `MEETPILOT_LLM_LOG`（預設 `logs/llm.jsonl`）追加一行 JSON，設成 `off` 關閉。一次嘗試一行，fallback 鏈退了幾個模型、重試幾次都各自有一行，所以它回答得了「首選模型多常不可用」「撞限流時實際等多久」「一場會議燒多少 token」。**只記 metadata，不記逐字稿、提問或模型回覆**；拿不到的 token 數記成 `null`，不是 `0`。啟動時就開檔，路徑不可寫會直接讓 server 起不來。
+
+`MEETPILOT_GEMINI_MAX_CONCURRENCY`（預設 2）是所有 Gemini 呼叫共用的全域併發上限，不管是轉錄還是分析發出的請求。目前處理仍是完全序列，這個值暫時不會改變任何行為。
 
 看最近十次呼叫：
 

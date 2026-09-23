@@ -15,7 +15,8 @@ import { buildAnalysisV3FromModelOutput } from './analysisContract';
 import { AudioFileStore } from './audioFileStore';
 import { AudioSlicer, planSlices } from './audioSlicer';
 import { GeminiServerClient } from './geminiServerClient';
-import { MeetingStore } from './meetingStore';
+import { AnalysisJobPayload, JobStore } from './jobStore';
+import { CurrentTranscript, MeetingStore, SliceModelEntry } from './meetingStore';
 import { checkMeetingTitle } from './meetingTitle';
 import { NameResolver } from './nameResolver';
 import { PeopleStore } from './peopleStore';
@@ -144,6 +145,9 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
     let transcript: TranscriptSegment[] = existing?.segments ?? [];
     // 續傳時沿用已經記下來的接縫：重跑的那幾片會覆寫自己那幾筆，跑過的不重算
     const seamReport: SeamReportEntry[] = store.getSeamReport(meetingId) ?? [];
+    // 續傳時沿用已經記下來的模型紀錄，理由同 seamReport（`transcripts.slice_models`，
+    // vault plan「MeetPilot · 逐字稿版本分層與來源標記」）
+    const sliceModels: SliceModelEntry[] = store.getSliceModels(meetingId) ?? [];
     // 額度跨接縫共用。續傳時重新給滿：這一輪是新的一次執行，沿用上一輪的殘額沒有意義
     let repairBudgetLeft = repairConfig.budget;
     // 整場會算一次就好：與會者名單在轉錄過程中不會變，不用每片重查
@@ -163,6 +167,7 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
         sliceDurationSeconds: slice.durationSeconds,
         participantNames,
         meetingId,
+        onModelUsed: (model, attempt) => sliceModels.push({ sliceIndex: slice.index, model, attempt, kind: 'slice' }),
       });
 
       const merged = mergeSliceTranscript(transcript, segments, slice.startSeconds, slice.index === 0);
@@ -187,6 +192,8 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
                 sliceDurationSeconds: durationSeconds,
                 participantNames,
                 meetingId,
+                onModelUsed: (model, attempt) =>
+                  sliceModels.push({ sliceIndex: slice.index, model, attempt, kind: 'repair' }),
               });
             },
           },
@@ -243,29 +250,66 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
       );
       // 每一片都寫：中途失敗時已經知道的接縫要留得下來，不要跟著整輪一起消失
       if (seamReport.length > 0) store.saveSeamReport(meetingId, seamReport);
+      // 同一個理由：模型紀錄也要每片都落地，不要等整場會轉完才一次寫
+      if (sliceModels.length > 0) store.saveSliceModels(meetingId, sliceModels);
     }
   };
 
-  const analyze = async (meetingId: string): Promise<void> => {
+  /**
+   * 分析 job 的 payload 沒給（`run()` 那種沒有 job 概念的舊呼叫端）就即時讀「目前顯示的版本」；
+   * 有給就讀 payload 釘住的那個版本，不管執行當下又多了幾次新編輯（Codex adversarial review
+   * 抓到：原本完全沒接這條，`server.ts` 把 payload 讀出來又丟掉，job 一律讀即時版本，
+   * 排隊排到一半又被人編輯的話，這次分析讀到的就不是使用者按下重跑當下看到的那份）。
+   *
+   * 版本消失（例如 edit_version 對不到任何列）**直接拋錯**，不要退回別的版本悄悄頂替——
+   * 那樣會讓 provenance 記錄一個假的來源，比整場失敗更難查。
+   */
+  const resolvePinnedTranscript = (
+    meetingId: string,
+    payload: AnalysisJobPayload | null | undefined,
+  ): CurrentTranscript | null => {
+    if (!payload) return store.getCurrentTranscript(meetingId);
+    if (payload.source_kind === 'edited') {
+      if (payload.source_edit_version === null) {
+        throw new Error(`Meeting ${meetingId} 的分析 job payload 標記 edited 卻沒有 source_edit_version，資料異常`);
+      }
+      const pinned = store.getTranscriptEditVersion(meetingId, payload.source_edit_version);
+      if (!pinned) {
+        throw new Error(
+          `Meeting ${meetingId} 找不到 edit_version ${payload.source_edit_version}`
+          + '（enqueue 當下釘住的版本），無法分析',
+        );
+      }
+      return { ...pinned, source_kind: 'edited', source_edit_version: payload.source_edit_version };
+    }
+    const raw = store.getTranscript(meetingId);
+    if (!raw) return null;
+    return { ...raw, source_kind: payload.source_kind, source_edit_version: null };
+  };
+
+  const analyze = async (meetingId: string, payload?: AnalysisJobPayload | null): Promise<void> => {
     const meeting = store.getMeeting(meetingId);
     if (!meeting) throw new Error(`找不到 Meeting ${meetingId}`);
 
-    const transcript = store.getTranscript(meetingId);
+    // 分析 job 釘住的版本（或沒有 job 概念時即時讀「目前顯示的版本」）；provenance 記的
+    // source_kind／source_edit_version 就是這個值，vault plan「MeetPilot · 逐字稿版本
+    // 分層與來源標記」
+    const transcript = resolvePinnedTranscript(meetingId, payload);
     if (!transcript || transcript.segments.length === 0) {
       // 每一片都轉完了卻一個字都沒有。硬送去分析會拿到一份憑空生出來的摘要，
       // 那比直接失敗難查得多
       throw new Error(`Meeting ${meetingId} 的每一片都沒有轉出內容，不進分析`);
     }
 
-    // 人名校正第 2 層（N4）：轉錄完成、分析之前的確定性比對。raw transcript.segments 不動，
-    // analyzeTranscript 讀的是已解析視圖；段落索引不變，所以下面算出處時仍用 raw segments。
-    // 比對邏輯本身失敗不阻塞這場會，退回用原始逐字稿分析（同 topicLinker 失敗不阻塞可見性）
+    // 人名校正第 2 層（N4）：轉錄完成、分析之前的確定性比對。目前顯示的版本本身不動，
+    // analyzeTranscript 讀的是已解析視圖；段落索引不變，所以下面算出處時仍用這個版本的 segments。
+    // 比對邏輯本身失敗不阻塞這場會，退回用目前版本分析（同 topicLinker 失敗不阻塞可見性）
     let resolvedSegments = transcript.segments;
     if (nameResolver) {
       try {
         resolvedSegments = nameResolver.resolveTranscript(meetingId, transcript.segments, now()).resolvedSegments;
       } catch (err) {
-        console.error(`[Transcription] Meeting ${meetingId} 人名比對失敗，這場會的分析改用原始逐字稿：`, err);
+        console.error(`[Transcription] Meeting ${meetingId} 人名比對失敗，這場會的分析改用目前版本：`, err);
       }
     }
 
@@ -279,12 +323,22 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
       console.error(`[Transcription] Meeting ${meetingId} 讀與會者名單失敗，分析呼叫不帶人名提示：`, err);
     }
 
+    // 由 analyzeTranscript 的 onProvenance 回填（見 geminiServerClient.ts）：實際打中哪個
+    // 模型（fallback 後的值）、規範檔呼叫當下的內容雜湊。理論上一定會被呼叫一次才拿到這兩個
+    // 值——留 null 只是型別上的起始值，真正拿不到時下面組 provenance 會直接反映出來
+    let modelUsed: string | null = null;
+    let promptVersionUsed: string | null = null;
+
     const output = await gemini.analyzeTranscript({
       transcript: resolvedSegments,
       meetingTags: store.getTags(meetingId),
       meetingContext: meeting.meeting_context ?? '',
       meetingId,
       participantNames,
+      onProvenance: ({ model, promptVersion }) => {
+        modelUsed = model;
+        promptVersionUsed = promptVersion;
+      },
     });
     let analysis = buildAnalysisV3FromModelOutput(output, transcript.segments, meetingId, now());
 
@@ -302,7 +356,19 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
       }
     }
 
-    store.saveAnalysis(meetingId, analysis, now());
+    // provenance 只有在 gemini client 真的回報了 model／promptVersion 時才記（真正的
+    // geminiServerClient 一定會回報，假 client 大多數測試沒接這個欄位——省略時 saveAnalysis
+    // 沿用舊行為，不寫壞成一筆帶 null model 的假 provenance）
+    const provenance = modelUsed !== null && promptVersionUsed !== null
+      ? {
+          source_kind: transcript.source_kind,
+          source_edit_version: transcript.source_edit_version,
+          resolved_segments_snapshot: nameResolver ? resolvedSegments : null,
+          model: modelUsed as string,
+          prompt_version: promptVersionUsed as string,
+        }
+      : undefined;
+    store.saveAnalysis(meetingId, analysis, now(), provenance);
 
     // 建議標題只在還沒有的時候填：使用者改過的名字不能被下一次分析洗掉。
     // 模型給的標題不合規則（空、超長、控制字元）時標題留 null 並記 log，不讓這場會 FAILED——
@@ -327,107 +393,232 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
     }
   };
 
-  return {
-    /**
-     * 跑完一場會。呼叫端是佇列，所以這裡不併發、不重入。
-     * 失敗時先把狀態寫成 FAILED 再往上拋：狀態要落地，但錯誤不吞。
-     */
-    run: async (meetingId: string): Promise<void> => {
+  /**
+   * 分析階段失敗退回 TRANSCRIBED，不是 FAILED（vault plan「MeetPilot · 轉錄分析佇列架構升級」
+   * 的狀態機：`ANALYZING → TRANSCRIBED`）。不連坐已經成功的轉錄結果——逐字稿還在、還能看、
+   * 還能手動重跑分析，跟 topicLinker／關聯失敗不阻塞可見性同一個精神。
+   *
+   * 不把 reason 傳給 setStatus：TRANSCRIBED 不是 FAILED／LINK_FAILED，`meetingStore.setStatus`
+   * 只在那兩個狀態才保留 error 欄位，傳了會直接拋錯。錯誤原因的落地位置是呼叫端自己
+   * （之後接 job table 時是 `jobs.error`），不是 `meetings.error`。
+   */
+  const markAnalysisFailed = (meetingId: string, cause: unknown): void => {
+    console.error(`[Transcription] Meeting ${meetingId} 分析失敗，退回 TRANSCRIBED（逐字稿保留，可重跑分析）：`, cause);
+    try {
       const meeting = store.getMeeting(meetingId);
-      if (!meeting) throw new Error(`找不到 Meeting ${meetingId}`);
-      // CREATED 是新上傳或重跑，TRANSCRIBING 是 server 重啟後的續傳。其餘狀態代表
-      // 這場會已經走過去了，重跑會把既有結果蓋掉
-      if (meeting.status !== 'CREATED' && meeting.status !== 'TRANSCRIBING') {
-        throw new Error(`Meeting ${meetingId} 目前是 ${meeting.status}，不是可以開始轉錄的狀態`);
+      // 只有還在 ANALYZING 才退：例外情況下（例如上一步已經手動改過狀態）不要硬轉一個
+      // 不合法的轉移，讓這裡也跟著拋錯，蓋掉原本真正的錯誤原因
+      if (meeting?.status === 'ANALYZING') store.setStatus(meetingId, 'TRANSCRIBED', now());
+    } catch (saveErr) {
+      console.error(`[Transcription] Meeting ${meetingId} 退回 TRANSCRIBED 時寫入失敗`, { cause, saveErr });
+    }
+  };
+
+  /**
+   * 呼叫端呼叫錯了（meeting 不存在、狀態不對）拋出的錯誤，不是「這次轉錄嘗試失敗」。
+   * 兩者要分得開：`run()` 抓到後者才會把 meeting 標成 FAILED，抓到前者只是把呼叫端的
+   * 錯誤原樣往上丟，不能因為呼叫端傳錯 id 就把一場已經 READY 的會覆寫成 FAILED。
+   */
+  const assertTranscriptionStartable = (meetingId: string): void => {
+    const meeting = store.getMeeting(meetingId);
+    if (!meeting) throw new Error(`找不到 Meeting ${meetingId}`);
+    // CREATED 是新上傳或重跑，TRANSCRIBING 是 server 重啟後的續傳。其餘狀態代表
+    // 這場會已經走過去了，重跑會把既有結果蓋掉
+    if (meeting.status !== 'CREATED' && meeting.status !== 'TRANSCRIBING') {
+      throw new Error(`Meeting ${meetingId} 目前是 ${meeting.status}，不是可以開始轉錄的狀態`);
+    }
+  };
+
+  /**
+   * 轉錄階段：CREATED／TRANSCRIBING → TRANSCRIBED。呼叫前必須先過
+   * `assertTranscriptionStartable`（`run()`／worker 各自在自己的錯誤處理範圍外先檢查）。
+   *
+   * **刻意不接住 `transcribe()` 失敗、不自動轉 FAILED**（跟 `runAnalysisPhase` 不同）：轉錄本身
+   * 可續傳（`processed_slices` 游標），job-based worker 重試時要讓 meeting 留在 TRANSCRIBING
+   * 才能再次呼叫這支從斷點接著跑，轉成 FAILED 是單向的終態，會擋死下一次重試的前置條件檢查。
+   * 「這場轉錄真的救不回來了」是呼叫端（`run()`、或 worker 在 job 重試次數用盡時）的判斷，
+   * 見 `markTranscriptionFailed`。
+   */
+  const runTranscriptionPhase = async (meetingId: string): Promise<void> => {
+    assertTranscriptionStartable(meetingId);
+    const meeting = store.getMeeting(meetingId)!;
+    if (meeting.status === 'CREATED') store.setStatus(meetingId, 'TRANSCRIBING', now());
+    await transcribe(meetingId);
+    store.setStatus(meetingId, 'TRANSCRIBED', now());
+  };
+
+  /**
+   * 分析階段：TRANSCRIBED → READY（→ LINKING）。失敗退回 TRANSCRIBED，見 markAnalysisFailed。
+   */
+  const runAnalysisPhase = async (meetingId: string, payload?: AnalysisJobPayload | null): Promise<void> => {
+    const meeting = store.getMeeting(meetingId);
+    if (!meeting) throw new Error(`找不到 Meeting ${meetingId}`);
+    if (meeting.status !== 'TRANSCRIBED') {
+      throw new Error(`Meeting ${meetingId} 目前是 ${meeting.status}，不是可以開始分析的狀態`);
+    }
+
+    try {
+      store.setStatus(meetingId, 'ANALYZING', now());
+      await analyze(meetingId, payload);
+
+      // 題目標籤在進 READY 之前抽（W3）。順序是刻意的：READY 是「這場會可以用了」，
+      // 而它可不可以參與關聯是使用者看得到的事實之一，不該在 READY 之後才補上。
+      // 這樣一來「READY 但 topic_extraction_status 是 null」只會發生在 W3 之前的舊資料上。
+      //
+      // extract 自己接住模型的錯誤（記成 failed），所以抽不到不會讓這場會變 FAILED——
+      // 分析已經成功了，把它標成失敗是謊報（Q2 裁決）
+      await topicExtractor.extract(meetingId);
+
+      store.setStatus(meetingId, 'READY', now());
+
+      // 音檔到這裡才刪。轉錄成功就刪的話，分析失敗的那場會再也重跑不了。
+      // 刪不掉（EPERM、EBUSY）只記 log 不改狀態：狀態已經是 READY、結論已經落地，
+      // 讓它被外層 catch 接住會把一場成功的會標成失敗，那是謊報。
+      // 留一個孤兒音檔比謊報失敗好，而且啟動掃描看得到它佔著空間
+      try {
+        audioStore.remove(meetingId);
+      } catch (removeErr) {
+        console.error(
+          `[Transcription] Meeting ${meetingId} 已經 READY，但音檔刪不掉（${audioStore.pathFor(meetingId)}），請手動清理：`,
+          removeErr,
+        );
       }
 
-      try {
-        if (meeting.status === 'CREATED') store.setStatus(meetingId, 'TRANSCRIBING', now());
-        await transcribe(meetingId);
-
-        store.setStatus(meetingId, 'ANALYZING', now());
-        await analyze(meetingId);
-
-        // 題目標籤在進 READY 之前抽（W3）。順序是刻意的：READY 是「這場會可以用了」，
-        // 而它可不可以參與關聯是使用者看得到的事實之一，不該在 READY 之後才補上。
-        // 這樣一來「READY 但 topic_extraction_status 是 null」只會發生在 W3 之前的舊資料上。
-        //
-        // extract 自己接住模型的錯誤（記成 failed），所以抽不到不會讓這場會變 FAILED——
-        // 分析已經成功了，把它標成失敗是謊報（Q2 裁決）
-        await topicExtractor.extract(meetingId);
-
-        store.setStatus(meetingId, 'READY', now());
-
-        // 音檔到這裡才刪。轉錄成功就刪的話，分析失敗的那場會再也重跑不了。
-        // 刪不掉（EPERM、EBUSY）只記 log 不改狀態：狀態已經是 READY、結論已經落地，
-        // 讓它被外層 catch 接住會把一場成功的會標成 FAILED，那是謊報。
-        // 留一個孤兒音檔比謊報失敗好，而且啟動掃描看得到它佔著空間
+      // 關聯排在最後，而且**不能讓它把這場會拖成失敗**（SDD 2.3：關聯失敗不阻塞可見性）。
+      // 逐字稿與結論已經落地、音檔已經刪掉，這時把整場會標成失敗是謊報，而且退回 TRANSCRIBED
+      // 重跑分析也於事無補——關聯不是分析的一部分。
+      //
+      // linker 自己把狀態推到 LINKED 或 LINK_FAILED，也自己接住模型的錯誤；這裡這層 try
+      // 接的是它沒預期到的（例如資料庫寫不進去），一樣只記 log 不往上拋
+      if (topicLinker) {
         try {
-          audioStore.remove(meetingId);
-        } catch (removeErr) {
-          console.error(
-            `[Transcription] Meeting ${meetingId} 已經 READY，但音檔刪不掉（${audioStore.pathFor(meetingId)}），請手動清理：`,
-            removeErr,
-          );
+          await topicLinker.link(meetingId);
+        } catch (linkErr) {
+          console.error(`[Transcription] Meeting ${meetingId} 的關聯計算拋出預期外的錯誤`, linkErr);
         }
+      }
 
-        // 關聯排在最後，而且**不能讓它把這場會拖成 FAILED**（SDD 2.3：關聯失敗不阻塞可見性）。
-        // 逐字稿與結論已經落地、音檔已經刪掉，這時把整場會標成失敗是謊報，而且 retry 會從
-        // 轉錄從頭跑一遍——音檔已經不在，那條路是死的。
-        //
-        // linker 自己把狀態推到 LINKED 或 LINK_FAILED，也自己接住模型的錯誤；這裡這層 try
-        // 接的是它沒預期到的（例如資料庫寫不進去），一樣只記 log 不往上拋
-        if (topicLinker) {
-          try {
-            await topicLinker.link(meetingId);
-          } catch (linkErr) {
-            console.error(`[Transcription] Meeting ${meetingId} 的關聯計算拋出預期外的錯誤`, linkErr);
-          }
-        }
+      // 投影排在關聯之後、跟關聯同一條「不能拖累可見性」的原則：結論與關聯（或關聯尚未完成的
+      // 事實）都已經落地，vault 寫不進去只記 log，不讓一場成功的會因為檔案系統的問題變成失敗
+      runProjection(vaultProjector, meetingId, '[Transcription]');
+    } catch (err) {
+      markAnalysisFailed(meetingId, err);
+      throw err;
+    }
+  };
 
-        // 投影排在關聯之後、跟關聯同一條「不能拖累可見性」的原則：結論與關聯（或關聯尚未完成的
-        // 事實）都已經落地，vault 寫不進去只記 log，不讓一場成功的會因為檔案系統的問題變成 FAILED
-        runProjection(vaultProjector, meetingId, '[Transcription]');
+  return {
+    /**
+     * 跑完一場會的轉錄與分析兩個階段。呼叫端是佇列，所以這裡不併發、不重入。
+     *
+     * 給還在用單一 `TranscriptionQueue`（記憶體、一次只跑一場、轉錄分析同一條鏈，沒有
+     * job 級重試概念）的既有呼叫端用：轉錄失敗這裡就當作沒有更多嘗試機會，直接轉 FAILED；
+     * 分析失敗退回 TRANSCRIBED（那支自己處理，見 `runAnalysisPhase`）。
+     *
+     * job-based worker（vault plan「MeetPilot · 轉錄分析佇列架構升級」）改呼叫
+     * `runTranscriptionPhase`／`runAnalysisPhase` 兩支獨立函式：轉錄失敗時 worker 自己決定
+     * 要不要退回 queued 重試，只有 job 重試次數用盡才呼叫 `markTranscriptionFailed`。
+     */
+    run: async (meetingId: string): Promise<void> => {
+      // 呼叫端傳錯 id／狀態不對：直接往上拋，不能因為叫錯就把一場已經 READY 的會
+      // 覆寫成 FAILED（跟下面 catch 住的「真的嘗試轉錄但失敗」是兩回事）
+      assertTranscriptionStartable(meetingId);
+      try {
+        await runTranscriptionPhase(meetingId);
       } catch (err) {
         markFailed(meetingId, err instanceof Error ? err.message : String(err), err);
         throw err;
       }
+      await runAnalysisPhase(meetingId);
     },
+    runTranscriptionPhase,
+    runAnalysisPhase,
+    /**
+     * 轉錄 job 的重試次數用盡時，worker 呼叫這支把 meeting 轉成真正的終態 FAILED。
+     * 跟 `run()` 內部的處理是同一支底層函式，行為完全一致，只是誰來決定「還要不要再試」
+     * 的權責移到 worker（見上面 `runTranscriptionPhase` 的檔頭說明）。
+     */
+    markTranscriptionFailed: (meetingId: string, reason: string): void => {
+      markFailed(meetingId, reason, new Error(reason));
+    },
+    /**
+     * 給 server 啟動時的復原流程用：job table 回收到一個中斷的分析 job（process 重啟時
+     * 正在跑或還沒跑完）時，meeting 可能還停在 `ANALYZING`——這支把它退回 `TRANSCRIBED`，
+     * 不管這個 job 之後會不會重試，都是正確的落點（同 `runAnalysisPhase` 自己失敗時的處理）。
+     */
+    markAnalysisFailed,
   };
 }
 
 export type TranscriptionPipeline = ReturnType<typeof createTranscriptionPipeline>;
 
 export interface ResumeScanReport {
-  requeued: string[];
+  /** 補了轉錄 job 的會 */
+  transcriptionRequeued: string[];
+  /** 補了分析 job 的會 */
+  analysisRequeued: string[];
   failed: { meetingId: string; reason: string }[];
   /** CREATED 但音檔不在：還沒開始跑，等使用者上傳，狀態維持 CREATED */
   waitingForAudio: string[];
 }
 
 /**
- * server 啟動時掃一次沒跑完的會（SDD 1.4）。
+ * server 啟動時掃一次「在途但沒有 active job 顧著」的會（vault plan「MeetPilot · 轉錄分析
+ * 佇列架構升級」）。取代原本的 `requeueInterruptedMeetings`。
  *
- * 佇列在記憶體裡，server 一重啟就空了。資料庫裡停在 TRANSCRIBING 的那幾場不會有人再碰它們，
- * 畫面上卻永遠顯示「轉錄中」——那是最難發現的一種壞法，因為它看起來正常。
+ * 為什麼還需要這支，`jobStore.reclaimAllActive()` 不夠：那支只能回收**已經有 job 列**、
+ * 停在 claimed／running 的工作。兩種情況它顧不到，這支補：① 這次升級前就留下的舊資料
+ * （job table 還不存在時卡住的會，根本沒有 job 列可回收）；② `PUT audio`／`POST retry`
+ * 先 `setStatus` 再 enqueue job 之間的極短競態窗口，process 剛好在中間死掉。
  *
- * 音檔還在就重新入列（從 processed_slices 續傳）。音檔不在時分兩種：TRANSCRIBING 是真的斷在
- * 半路，轉 FAILED 並寫下原因，不留在 TRANSCRIBING 假裝還在跑；CREATED 還沒開始跑，維持原狀等上傳。
+ * 呼叫順序：`server.ts` 要先呼叫 `jobStore.reclaimAllActive()`，這支才看得到正確的
+ * 「目前真的沒有 active job」狀態，不會誤判剛被回收、還沒被 backfill 掃到的那些。
+ *
+ * 音檔還在就補轉錄 job（從 processed_slices 續傳）。音檔不在時分兩種：TRANSCRIBING 是真的
+ * 斷在半路，轉 FAILED 並寫下原因；CREATED 還沒開始跑，維持原狀等上傳。ANALYZING／TRANSCRIBED
+ * 補分析 job，讀 `getCurrentTranscript()` 決定 payload（跟正常 enqueue 分析 job 同一個規則）。
  */
-export function requeueInterruptedMeetings(options: {
+export function backfillInterruptedMeetings(options: {
   store: MeetingStore;
+  jobs: Pick<JobStore, 'hasActive' | 'hasAny' | 'enqueue'>;
   audioStore: AudioFileStore;
-  enqueue: (meetingId: string) => void;
   now?: () => number;
 }): ResumeScanReport {
-  const { store, audioStore, enqueue } = options;
+  const { store, jobs, audioStore } = options;
   const now = options.now ?? (() => Date.now());
-  const report: ResumeScanReport = { requeued: [], failed: [], waitingForAudio: [] };
+  const report: ResumeScanReport = {
+    transcriptionRequeued: [], analysisRequeued: [], failed: [], waitingForAudio: [],
+  };
 
   for (const meeting of store.listMeetings()) {
-    if (meeting.status !== 'TRANSCRIBING' && meeting.status !== 'CREATED') continue;
-
     const meetingId = meeting.meeting_id;
+
+    if (meeting.status === 'ANALYZING' || meeting.status === 'TRANSCRIBED') {
+      // 用 hasAny 不是 hasActive：已經有過 job（含用盡重試轉 failed 的）代表這場會的分析
+      // 生命週期已經交給既有機制在管，不介入，不然每次重啟都會繞過 max_attempts 把使用者
+      // 還沒決定要不要 retry 的失敗 job 復活，重打一次 Gemini（Codex adversarial review 抓到）
+      if (jobs.hasAny(meetingId, 'analysis')) continue;
+
+      // 走到這裡代表這場會從來沒有分析 job——只會是升級前（job table 還不存在時）就卡在
+      // ANALYZING 的舊資料。runAnalysisPhase 的前置條件是 TRANSCRIBED，不先退回去的話 job
+      // 一執行就會因為前置條件不符而失敗，而且退不回來（Codex adversarial review 抓到）
+      if (meeting.status === 'ANALYZING') {
+        store.setStatus(meetingId, 'TRANSCRIBED', now());
+      }
+
+      const transcript = store.getCurrentTranscript(meetingId);
+      jobs.enqueue(
+        meetingId, 'analysis',
+        { source_kind: transcript?.source_kind ?? 'raw', source_edit_version: transcript?.source_edit_version ?? null },
+        now(),
+      );
+      report.analysisRequeued.push(meetingId);
+      continue;
+    }
+
+    if (meeting.status !== 'TRANSCRIBING' && meeting.status !== 'CREATED') continue;
+    if (jobs.hasActive(meetingId, 'transcription')) continue;
+
     let reason: string | null = null;
     try {
       if (audioStore.exists(meetingId)) {
@@ -435,8 +626,8 @@ export function requeueInterruptedMeetings(options: {
         // （游標已經在收檔前清掉了，見 createApp 的 PUT audio），另一種是 retry 之後
         // 佇列還忙、輪不到它的那場會——後者的游標是**刻意保留**的，清掉等於讓 retry 退化成
         // 整場重轉，連使用者 retry 前人工修過的逐字稿也一起消失
-        enqueue(meetingId);
-        report.requeued.push(meetingId);
+        jobs.enqueue(meetingId, 'transcription', null, now());
+        report.transcriptionRequeued.push(meetingId);
         continue;
       }
       reason = `server 重啟時音檔已經不在（${audioStore.pathFor(meetingId)}），無法續傳，請重新上傳這場會的音檔`;
