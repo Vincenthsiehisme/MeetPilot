@@ -2,9 +2,11 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CommandResult, CommandRunner } from './audioSlicer';
+import { CommandResult, CommandRunner, spawnCommandRunner } from './audioSlicer';
 import {
+  RECORDER_TIMEOUTS_MS,
   RECORDING_CHECK,
+  RecorderTimeoutError,
   VOICE_MEMO_SHORTCUTS,
   checkFetchedRecording,
   createVoiceMemoRecorder,
@@ -180,5 +182,66 @@ describe('createVoiceMemoRecorder', () => {
       const recorder = recorderWith(async () => ok(JSON.stringify({ format: { duration: '5' } })));
       expect(await recorder.probe('/tmp/a.part')).toEqual({ durationSeconds: 5, creationTimeMs: null });
     });
+  });
+});
+
+describe('捷徑呼叫的逾時（2026-09-23 實測 shortcuts run 會間歇性卡住）', () => {
+  // 永遠不回來的 runner，記下自己有沒有被中止
+  const hanging = (aborted: string[]): CommandRunner => (executable, args, signal) =>
+    new Promise<CommandResult>((_, reject) => {
+      signal?.addEventListener('abort', () => {
+        aborted.push(String(args[1] ?? args[0]));
+        reject(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' }));
+      });
+    });
+
+  const recorderWith = (runner: CommandRunner) => createVoiceMemoRecorder({
+    shortcutsPath: 'shortcuts',
+    ffprobePath: 'ffprobe',
+    platform: 'darwin',
+    runner,
+    timeouts: { list: 20, start: 20, stop: 20, fetch: 20, probe: 20 },
+  });
+
+  it('開始卡住：逾時錯誤講出是哪個捷徑、提示可能晚一點才開始，而且真的中止了子程序', async () => {
+    const aborted: string[] = [];
+    const error = await recorderWith(hanging(aborted)).start().catch(e => e);
+    expect(error).toBeInstanceOf(RecorderTimeoutError);
+    expect(error.message).toContain(`執行捷徑「${VOICE_MEMO_SHORTCUTS.start}」超過`);
+    expect(error.message).toContain('晚一點才開始錄');
+    expect(aborted).toEqual([VOICE_MEMO_SHORTCUTS.start]);
+  });
+
+  it('停止、取檔、讀長度卡住一樣會逾時，不會永遠掛著', async () => {
+    const recorder = recorderWith(hanging([]));
+    await expect(recorder.stop()).rejects.toBeInstanceOf(RecorderTimeoutError);
+    await expect(recorder.fetchLatestTo('/tmp/never')).rejects.toBeInstanceOf(RecorderTimeoutError);
+    await expect(recorder.probe('/tmp/never')).rejects.toBeInstanceOf(RecorderTimeoutError);
+  });
+
+  it('列捷徑卡住時回「不可用」並講原因，不讓錄音按鍵的判斷掛著', async () => {
+    const result = await recorderWith(hanging([])).checkAvailability();
+    expect(result.available).toBe(false);
+    if (result.available === false) expect(result.reason).toContain('列出捷徑超過');
+  });
+
+  it('逾時上限是寫死的決策：值改了要有人知道', () => {
+    expect(RECORDER_TIMEOUTS_MS).toEqual({ list: 10_000, start: 20_000, stop: 20_000, fetch: 15_000, probe: 30_000 });
+  });
+});
+
+describe('spawnCommandRunner 的中止（真的 spawn）', () => {
+  it('abort 之後子程序被砍掉、Promise 以錯誤結束，不等它自己跑完', async () => {
+    const controller = new AbortController();
+    const started = Date.now();
+    const running = spawnCommandRunner('sleep', ['5'], controller.signal);
+    setTimeout(() => controller.abort(), 50);
+    await expect(running).rejects.toThrow();
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+
+  it('沒給 signal 時照舊跑完（ffmpeg 那邊不受影響）', async () => {
+    const result = await spawnCommandRunner('sh', ['-c', 'printf ok']);
+    expect(result).toEqual({ code: 0, stdout: Buffer.from('ok'), stderr: '' });
   });
 });

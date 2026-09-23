@@ -16,7 +16,7 @@ import { NameResolver, createNameResolver } from './nameResolver';
 import { MATCH_KEY_VERSION } from './topicTag';
 import { TopicLinker } from './topicLinker';
 import { createVaultProjector, VaultProjector } from './vaultProjector';
-import { RecordingInfo, VoiceMemoRecorder } from './voiceMemoRecorder';
+import { RecorderTimeoutError, RecordingInfo, VoiceMemoRecorder } from './voiceMemoRecorder';
 
 /**
  * 路由層測試：跑的是 server.ts 真的用的那個 app（同一支 createApp、同一組 middleware 順序）。
@@ -1281,6 +1281,49 @@ describe('語音備忘錄錄音的路由（vault plan「MeetPilot · 網頁錄�
       expect(store.getMeeting(id)?.status).toBe('RECORDING');
       expect(store.getRecording(id)?.stopped_at).toBeNull();
       expect(recorderCalls).not.toContain('fetch');
+    });
+
+    it('停止捷徑逾時：留在 RECORDING、講清楚，而且不會把整台 server 的錄音操作鎖住（2026-09-23 實測捷徑會卡住）', async () => {
+      let stopTimesOut = true;
+      const recorder = fakeRecorder();
+      await startWith({
+        voiceMemoRecorder: {
+          ...recorder,
+          stop: async () => {
+            recorderCalls.push('stop');
+            if (stopTimesOut) throw new RecorderTimeoutError('執行捷徑「MeetPilot 停止錄音」超過 20 秒沒有回應，已經中止');
+          },
+        },
+      });
+      const id = await createRecordingMeeting();
+      await post(`/api/meetings/${id}/recording/start`);
+
+      const first = await post(`/api/meetings/${id}/recording/stop`);
+      expect(first.status).toBe(502);
+      expect(first.body.error).toContain('沒有回應');
+      expect(first.body.error).toContain('再按一次停止');
+      expect(store.getMeeting(id)?.status).toBe('RECORDING');
+
+      // 鎖有放開：馬上再按一次停止照常處理，不是 409「正在處理另一個開始或停止」
+      stopTimesOut = false;
+      const second = await post(`/api/meetings/${id}/recording/stop`);
+      expect(second.status).toBe(202);
+    });
+
+    it('開始捷徑逾時：退回 CREATED，訊息說「沒有回應」而不是「確定沒開始」', async () => {
+      const recorder = fakeRecorder();
+      await startWith({
+        voiceMemoRecorder: {
+          ...recorder,
+          start: async () => { throw new RecorderTimeoutError('執行捷徑「MeetPilot 開始錄音」超過 20 秒沒有回應，已經中止。語音備忘錄有可能晚一點才開始錄'); },
+        },
+      });
+      const id = await createRecordingMeeting();
+      const { status, body } = await post(`/api/meetings/${id}/recording/start`);
+      expect(status).toBe(502);
+      expect(body.error.startsWith('叫語音備忘錄開始錄音沒有回應')).toBe(true);
+      expect(body.error).toContain('晚一點才開始錄');
+      expect(store.getMeeting(id)?.status).toBe('CREATED');
     });
 
     it('上一次停了但沒取到檔就斷線：這次不再叫停止，用記下的停止時間直接取檔', async () => {

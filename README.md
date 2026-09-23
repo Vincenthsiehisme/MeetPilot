@@ -61,6 +61,11 @@ server 行程自己讀不到（`Operation not permitted`），授權是捷徑 Ap
 10 秒（`services/voiceMemoRecorder.ts` 的 `RECORDING_CHECK`）。對不上（例如 iPhone 的錄音經 iCloud
 同步進同一個資料夾，變成最新一支）就不送轉錄，會議退回「等待音檔」，從語音備忘錄把那支錄音拖進來就會接著跑。
 
+`shortcuts run` 實測會間歇性卡住不回來（2026-09-23 連三次，之後又自己恢復），所以每個捷徑呼叫都有逾時上限
+（`services/voiceMemoRecorder.ts` 的 `RECORDER_TIMEOUTS_MS`：開始、停止 20 秒，取檔 15 秒）。逾時會中止那次呼叫並講出
+是哪個捷徑：停止逾時時這場會維持「錄音中」，再按一次停止即可；開始逾時時結果不明，語音備忘錄有可能晚一點才開始錄，
+畫面會提示你看一眼語音備忘錄。卡住的呼叫不會把整台 server 的錄音操作鎖住。
+
 還沒驗證的：筆電闔上或睡眠時語音備忘錄會不會繼續錄。
 
 ## 驗證

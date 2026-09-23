@@ -67,7 +67,16 @@ export interface CommandResult {
   stderr: string;
 }
 
-export type CommandRunner = (executable: string, args: readonly string[]) => Promise<CommandResult>;
+/**
+ * `signal` 是選填的中止訊號：給了而且被 abort，子程序會被 SIGKILL 砍掉、Promise 以錯誤結束。
+ * ffmpeg 這邊不給（切片的長度跟會議長度成正比，沒有合理的上限）；語音備忘錄的捷徑呼叫會給，
+ * 因為 `shortcuts run` 實測會間歇性卡住不回來（voiceMemoRecorder.ts 的 RECORDER_TIMEOUTS_MS）
+ */
+export type CommandRunner = (
+  executable: string,
+  args: readonly string[],
+  signal?: AbortSignal,
+) => Promise<CommandResult>;
 
 // stderr 只留尾端：ffmpeg 正常跑也會印一大段 banner 與 stream 資訊，真正的錯誤在最後幾行。
 // 全部留著會把錯誤訊息灌成幾十 KB，反而看不到重點
@@ -80,9 +89,10 @@ const tail = (text: string, length: number): string => {
 };
 
 /** 真的去 spawn 的 runner。正式啟動用這支，測試注入假的 */
-export const spawnCommandRunner: CommandRunner = (executable, args) =>
+export const spawnCommandRunner: CommandRunner = (executable, args, signal) =>
   new Promise<CommandResult>((resolve, reject) => {
-    const child = spawn(executable, [...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+    // 被 abort 時 Node 會砍掉子程序並觸發 error 事件（AbortError），走下面同一條 reject
+    const child = spawn(executable, [...args], { stdio: ['ignore', 'pipe', 'pipe'], signal, killSignal: 'SIGKILL' });
     const chunks: Buffer[] = [];
     let stderr = '';
 
