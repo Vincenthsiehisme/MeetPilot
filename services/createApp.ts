@@ -27,7 +27,7 @@ import { deleteMeetingRequest, isBusy, patchAnalysisRequest, patchTitleRequest, 
 import { checkMeetingTitle } from './meetingTitle';
 import { TopicLinker } from './topicLinker';
 import { runProjection, VaultProjector } from './vaultProjector';
-import { RecordingInfo, VoiceMemoRecorder, checkFetchedRecording } from './voiceMemoRecorder';
+import { RecorderTimeoutError, RecordingInfo, VoiceMemoRecorder, checkFetchedRecording } from './voiceMemoRecorder';
 
 /**
  * `createApp` 對「有東西可以入列轉錄」的最小需求，不綁死是舊的記憶體 `TranscriptionQueue`
@@ -563,7 +563,9 @@ export function createApp(deps: AppDeps): express.Express {
         } catch (err) {
           meetingStore.abortRecording(meetingId, Date.now());
           const reason = err instanceof Error ? err.message : String(err);
-          return res.status(502).json({ error: `語音備忘錄沒有開始錄音：${reason}` });
+          // 逾時是「結果不明」不是「確定失敗」：卡住的那次可能晚一點才被派出去，不能說成沒開始
+          const headline = err instanceof RecorderTimeoutError ? '叫語音備忘錄開始錄音沒有回應' : '語音備忘錄沒有開始錄音';
+          return res.status(502).json({ error: `${headline}：${reason}` });
         }
       } finally {
         recorderBusy = null;

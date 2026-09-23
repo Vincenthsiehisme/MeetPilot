@@ -28,6 +28,34 @@ export const VOICE_MEMO_SHORTCUTS = {
   fetch: 'MeetPilot 取檔',
 } as const;
 
+/**
+ * 每一種呼叫的逾時上限（毫秒）。
+ *
+ * 2026-09-23 實測 `shortcuts run` 會間歇性卡住不回來：19:07～19:15 連三次（一次 26 秒後才被派出去
+ * 又被取消、兩次連 log 都沒有），19:17 又正常；正常時停止 0.3 秒、取檔 0.2 秒（2.5 MB 的 5 分鐘錄音）。
+ * 不設上限的話，停止請求會永遠掛著，而 createApp 的 recorderBusy 會把整台 server 的錄音操作鎖到重啟。
+ *
+ * 數字是我判的，比正常耗時寬兩個數量級：取檔會被 createApp 重試最多 4 次，所以它的上限最短，
+ * 最壞情況約一分鐘就放棄並退回「等待音檔」。
+ */
+export const RECORDER_TIMEOUTS_MS = {
+  list: 10_000,
+  start: 20_000,
+  stop: 20_000,
+  fetch: 15_000,
+  probe: 30_000,
+} as const;
+
+export type RecorderTimeouts = { [K in keyof typeof RECORDER_TIMEOUTS_MS]: number };
+
+/** 逾時的錯誤。呼叫端（例如開始錄音）要靠它判斷「結果不明」，跟「確定失敗」分開講 */
+export class RecorderTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RecorderTimeoutError';
+  }
+}
+
 export type RecorderAvailability =
   | { available: true }
   | { available: false; reason: string };
@@ -115,6 +143,8 @@ export interface VoiceMemoRecorderOptions {
   /** 注入 process.platform，測試才驗得到「不是 macOS」那條 */
   platform: NodeJS.Platform;
   runner?: CommandRunner;
+  /** 預設 RECORDER_TIMEOUTS_MS；測試縮短它才不用真的等 */
+  timeouts?: Partial<RecorderTimeouts>;
 }
 
 // 明寫的型別守衛，不靠自動 narrowing：這個 repo 的 tsconfig 沒開 strict（同 audioSlicer.ts）
@@ -131,16 +161,39 @@ const SETUP_HINT = '三個捷徑的建法見 README〈用語音備忘錄錄音�
 
 export function createVoiceMemoRecorder(options: VoiceMemoRecorderOptions) {
   const runner = options.runner ?? spawnCommandRunner;
+  const timeouts: RecorderTimeouts = { ...RECORDER_TIMEOUTS_MS, ...options.timeouts };
 
-  const run = async (executable: string, args: readonly string[], what: string): Promise<CommandResult> => {
+  const run = async (
+    executable: string,
+    args: readonly string[],
+    what: string,
+    timeoutMs: number,
+    timeoutHint = '',
+  ): Promise<CommandResult> => {
     let result: CommandResult;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        // 順序要先 reject 再 abort：反過來的話 runner 會在 abort 的同步流程裡先以 AbortError 結束，
+        // race 拿到的就是那個看不出是哪個捷徑的錯誤（測試抓到）
+        reject(new RecorderTimeoutError(`${what}超過 ${Math.round(timeoutMs / 1000)} 秒沒有回應，已經中止${timeoutHint}`));
+        controller.abort();
+      }, timeoutMs);
+    });
+    // 逾時之後 runner 會以 AbortError 結束。不用另外 .catch：Promise.race 對每個輸入都掛了處理函式，
+    // 晚到的 rejection 已經有人接，不會變成 unhandled rejection（變異測試驗過拿掉 .catch 照樣綠）
+    const running = runner(executable, args, controller.signal);
     try {
-      result = await runner(executable, args);
+      result = await Promise.race([running, timedOut]);
     } catch (err) {
+      if (err instanceof RecorderTimeoutError) throw err;
       if (isSpawnNotFound(err)) {
         throw new Error(`找不到 ${executable}，${what}做不了。語音備忘錄錄音只支援 macOS（需要內建的 shortcuts 指令）`);
       }
       throw err;
+    } finally {
+      clearTimeout(timer);
     }
     if (result.code !== 0) {
       throw new Error(`${what}失敗（${executable} 結束碼 ${result.code}）：${tail(result.stderr) || '沒有錯誤輸出'}`);
@@ -148,8 +201,13 @@ export function createVoiceMemoRecorder(options: VoiceMemoRecorderOptions) {
     return result;
   };
 
-  const runShortcut = async (name: string, extraArgs: readonly string[] = []): Promise<void> => {
-    await run(options.shortcutsPath, ['run', name, ...extraArgs], `執行捷徑「${name}」`);
+  const runShortcut = async (
+    name: string,
+    timeoutMs: number,
+    extraArgs: readonly string[] = [],
+    timeoutHint = '',
+  ): Promise<void> => {
+    await run(options.shortcutsPath, ['run', name, ...extraArgs], `執行捷徑「${name}」`, timeoutMs, timeoutHint);
   };
 
   return {
@@ -163,7 +221,7 @@ export function createVoiceMemoRecorder(options: VoiceMemoRecorderOptions) {
       }
       let listed: CommandResult;
       try {
-        listed = await run(options.shortcutsPath, ['list'], '列出捷徑');
+        listed = await run(options.shortcutsPath, ['list'], '列出捷徑', timeouts.list);
       } catch (err) {
         return { available: false, reason: err instanceof Error ? err.message : String(err) };
       }
@@ -178,9 +236,15 @@ export function createVoiceMemoRecorder(options: VoiceMemoRecorderOptions) {
       return { available: true };
     },
 
-    start: (): Promise<void> => runShortcut(VOICE_MEMO_SHORTCUTS.start),
+    // 開始逾時是「結果不明」：卡住的那次有可能晚一點才被派出去（實測看過等 26 秒才派），
+    // 所以提示使用者自己看一眼語音備忘錄，不能說成「確定沒開始」
+    start: (): Promise<void> => runShortcut(
+      VOICE_MEMO_SHORTCUTS.start, timeouts.start, [],
+      '。語音備忘錄有可能晚一點才開始錄，請看一下它有沒有在錄，有的話直接在語音備忘錄按停止',
+    ),
 
-    stop: (): Promise<void> => runShortcut(VOICE_MEMO_SHORTCUTS.stop),
+    // 停止逾時的提示由 createApp 的停止路由補（它對所有停止失敗都講同一句），這裡不重複
+    stop: (): Promise<void> => runShortcut(VOICE_MEMO_SHORTCUTS.stop, timeouts.stop),
 
     /**
      * 叫取檔捷徑把最新的一支錄音寫到 destPath。destPath 的檔名不能帶不認得的副檔名：
@@ -191,7 +255,7 @@ export function createVoiceMemoRecorder(options: VoiceMemoRecorderOptions) {
      * 會把人指去查音檔格式，而問題其實在捷徑沒挑到檔。
      */
     fetchLatestTo: async (destPath: string): Promise<void> => {
-      await runShortcut(VOICE_MEMO_SHORTCUTS.fetch, ['--output-path', destPath]);
+      await runShortcut(VOICE_MEMO_SHORTCUTS.fetch, timeouts.fetch, ['--output-path', destPath]);
       if (!existsSync(destPath) || statSync(destPath).size === 0) {
         throw new Error(
           `捷徑「${VOICE_MEMO_SHORTCUTS.fetch}」執行完了，但沒有交出任何檔案。`
@@ -211,6 +275,7 @@ export function createVoiceMemoRecorder(options: VoiceMemoRecorderOptions) {
         options.ffprobePath,
         ['-v', 'error', '-show_entries', 'format=duration:format_tags=creation_time', '-of', 'json', filePath],
         'ffprobe 讀取錄音檔資訊',
+        timeouts.probe,
       );
       let parsed: { format?: { duration?: unknown; tags?: { creation_time?: unknown } } };
       try {
