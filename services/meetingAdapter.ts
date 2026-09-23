@@ -31,7 +31,7 @@ interface StatusView {
 }
 
 /**
- * 八個 MeetingStatus 逐一列出，沒有 default 分支。
+ * 每個 MeetingStatus 逐一列出，沒有 default 分支。
  *
  * 寫成 Record<MeetingStatus, ...> 是為了讓「server 多出一個狀態、前端漏了」在 `tsc` 就壞掉；
  * default 分支會把不認得的狀態吞成某個看起來正常的值，那種壞法不會有人發現。
@@ -46,6 +46,14 @@ const STATUS_VIEW: Record<MeetingStatus, StatusView> = {
     stageStatuses: [StepStatus.IDLE, StepStatus.IDLE, StepStatus.IDLE],
     currentStep: 0,
     note: '會議已建立，等待音檔上傳',
+  },
+  // 語音備忘錄正在錄（vault plan「MeetPilot · 網頁錄音」）。算在「音檔」那一階段：還沒有音檔可轉，
+  // 但這場會確實在進行中，標成 PENDING 會跟「建立了等上傳」長得一樣
+  RECORDING: {
+    jobStatus: JobStatus.RUNNING,
+    stageStatuses: [StepStatus.PROCESSING, StepStatus.IDLE, StepStatus.IDLE],
+    currentStep: 0,
+    note: '語音備忘錄錄音中，按「停止錄音」後會自動取回音檔開始轉錄',
   },
   TRANSCRIBING: {
     jobStatus: JobStatus.RUNNING,
@@ -138,7 +146,7 @@ const buildErrorText = (meeting: Meeting, view: StatusView): string | undefined 
   return meeting.error === null ? undefined : meeting.error;
 };
 
-export const meetingToJob = (meeting: Meeting): Job => {
+export const meetingToJob = (meeting: MeetingView): Job => {
   const view = STATUS_VIEW[meeting.status];
   // server 送來前端不認得的狀態時直接壞掉。猜一個最接近的值會讓畫面一直顯示錯的進度，
   // 而沒有人會發現那是猜的。
@@ -160,11 +168,12 @@ export const meetingToJob = (meeting: Meeting): Job => {
     processedSlices: meeting.processed_slices ?? undefined,
     totalSlices: meeting.total_slices ?? undefined,
     meetingContext: meeting.meeting_context ?? undefined,
+    recordingStartedAt: meeting.recording_started_at ?? undefined,
     steps: buildSteps(meeting, view),
   };
 };
 
-export const meetingsToJobs = (meetings: Meeting[]): Job[] => meetings.map(meetingToJob);
+export const meetingsToJobs = (meetings: MeetingView[]): Job[] => meetings.map(meetingToJob);
 
 /**
  * 本機 IndexedDB 裡的舊 Job：`analysis` 是寫入當時的 v1（`GeminiOutput`）形狀——前端搬到
@@ -271,6 +280,10 @@ export const editBlockedReason = (status: MeetingStatus): string | null =>
 export const isMeetingInProgress = (meeting: MeetingView): boolean => {
   if (meeting.status === 'CREATED') return meeting.has_audio;
   if (meeting.status === 'TRANSCRIBED') return true;
+  // RECORDING 跟 TRANSCRIBED 一樣不在 BUSY_STATUSES 裡（server 沒在寫這場會的逐字稿），
+  // 但它還沒結束：polling 要繼續，另一個分頁按了停止之後這裡才看得到；批次清除也不能清掉
+  // 一場還在錄的會（刪掉的話語音備忘錄會一直錄下去，沒有任何畫面停得了它）
+  if (meeting.status === 'RECORDING') return true;
   return isMeetingBusy(meeting.status);
 };
 

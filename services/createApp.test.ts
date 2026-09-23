@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
 import { createServer, Server } from 'node:http';
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { Readable } from 'node:stream';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AudioFileStore, createAudioFileStore } from './audioFileStore';
@@ -15,6 +16,7 @@ import { NameResolver, createNameResolver } from './nameResolver';
 import { MATCH_KEY_VERSION } from './topicTag';
 import { TopicLinker } from './topicLinker';
 import { createVaultProjector, VaultProjector } from './vaultProjector';
+import { RecordingInfo, VoiceMemoRecorder } from './voiceMemoRecorder';
 
 /**
  * 路由層測試：跑的是 server.ts 真的用的那個 app（同一支 createApp、同一組 middleware 順序）。
@@ -73,6 +75,8 @@ const fakeAnalysisQueue = (queued: string[] = []): { enqueue(id: string): void; 
   has: (id: string) => queued.includes(id),
 });
 
+type FakeRecorder = Pick<VoiceMemoRecorder, 'checkAvailability' | 'start' | 'stop' | 'fetchLatestTo' | 'probe'>;
+
 const startWith = async (options: {
   listenConfig?: Partial<ListenConfig>;
   queue?: FakeTranscriptionQueue;
@@ -80,6 +84,9 @@ const startWith = async (options: {
   audioStore?: AudioFileStore;
   topicLinker?: TopicLinker | null;
   vaultProjector?: VaultProjector | null;
+  voiceMemoRecorder?: FakeRecorder | null;
+  isLocalRequest?: () => boolean;
+  recordingFetchPolicy?: { attempts: number; delayMs: number };
 } = {}) => {
   const app = createApp({
     listenConfig: {
@@ -104,6 +111,10 @@ const startWith = async (options: {
     topicLinker: options.topicLinker ?? null,
     // 預設不給 projector：既有的測試不該因為 W5 多出一條檔案 I/O 而改變行為
     vaultProjector: options.vaultProjector ?? null,
+    // 預設不接語音備忘錄：既有的測試不該因為錄音多出任何外部指令
+    voiceMemoRecorder: options.voiceMemoRecorder ?? null,
+    isLocalRequest: options.isLocalRequest,
+    recordingFetchPolicy: options.recordingFetchPolicy ?? { attempts: 2, delayMs: 0 },
   });
   server = createServer(app);
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -1072,5 +1083,252 @@ describe('PATCH /api/meetings/:id/title', () => {
   it('找不到的會回 404', async () => {
     await start();
     expect((await patchTitle('nope', { title: '週會' })).status).toBe(404);
+  });
+});
+
+describe('語音備忘錄錄音的路由（vault plan「MeetPilot · 網頁錄音」）', () => {
+  interface RecorderScript {
+    startFails?: boolean;
+    stopFails?: boolean;
+    /** 第幾次取檔（從 1 算）要失敗；沒列的都成功 */
+    fetchFailsOn?: number[];
+    /** 讀取回檔案時回什麼。預設回一支對得上這場會起訖時間的錄音 */
+    probe?: () => RecordingInfo;
+    availability?: Awaited<ReturnType<FakeRecorder['checkAvailability']>>;
+  }
+
+  let recorderCalls: string[];
+
+  const fakeRecorder = (script: RecorderScript = {}): FakeRecorder => {
+    let fetches = 0;
+    return {
+      checkAvailability: async () => { recorderCalls.push('availability'); return script.availability ?? { available: true }; },
+      start: async () => {
+        recorderCalls.push('start');
+        if (script.startFails) throw new Error('執行捷徑「MeetPilot 開始錄音」失敗（shortcuts 結束碼 1）');
+      },
+      stop: async () => {
+        recorderCalls.push('stop');
+        if (script.stopFails) throw new Error('執行捷徑「MeetPilot 停止錄音」失敗（shortcuts 結束碼 1）');
+      },
+      fetchLatestTo: async (destPath: string) => {
+        fetches += 1;
+        recorderCalls.push('fetch');
+        if (script.fetchFailsOn?.includes(fetches)) throw new Error('捷徑「MeetPilot 取檔」執行完了，但沒有交出任何檔案');
+        writeFileSync(destPath, Buffer.from('voice-memo-audio'));
+      },
+      probe: async () => {
+        recorderCalls.push('probe');
+        return script.probe ? script.probe() : { durationSeconds: 0.5, creationTimeMs: Date.now() };
+      },
+    };
+  };
+
+  const post = async (path: string) => {
+    const res = await fetch(`${url}${path}`, { method: 'POST' });
+    return { status: res.status, body: await res.json() as any };
+  };
+
+  const createRecordingMeeting = async (): Promise<string> => {
+    const { body } = await createMeeting({ fileName: '語音備忘錄錄音', fileSize: 0, participantIds: [TEST_EMPLOYEE_ID] });
+    return body.meeting.meeting_id;
+  };
+
+  beforeEach(() => {
+    recorderCalls = [];
+  });
+
+  describe('GET /api/recording/availability', () => {
+    it('本機請求照 recorder 的判斷回', async () => {
+      await startWith({ voiceMemoRecorder: fakeRecorder({ availability: { available: false, reason: '找不到捷徑' } }) });
+      const res = await fetch(`${url}/api/recording/availability`);
+      expect(await res.json()).toEqual({ available: false, reason: '找不到捷徑' });
+    });
+
+    it('別台電腦來的請求一律不可用並講原因，不去跑 shortcuts', async () => {
+      await startWith({ voiceMemoRecorder: fakeRecorder(), isLocalRequest: () => false });
+      const body = await (await fetch(`${url}/api/recording/availability`)).json() as any;
+      expect(body.available).toBe(false);
+      expect(body.reason).toContain('只能在那台電腦上操作');
+      expect(recorderCalls).toEqual([]);
+    });
+
+    it('沒接語音備忘錄的 server 講清楚沒接', async () => {
+      await startWith();
+      const body = await (await fetch(`${url}/api/recording/availability`)).json() as any;
+      expect(body).toEqual({ available: false, reason: '這台 server 沒有接語音備忘錄錄音' });
+    });
+  });
+
+  describe('開始錄音', () => {
+    it('狀態進 RECORDING、回應帶開始時間，語音備忘錄被叫一次', async () => {
+      await startWith({ voiceMemoRecorder: fakeRecorder() });
+      const id = await createRecordingMeeting();
+      const before = Date.now();
+      const { status, body } = await post(`/api/meetings/${id}/recording/start`);
+      expect(status).toBe(200);
+      expect(body.meeting.status).toBe('RECORDING');
+      expect(body.meeting.recording_started_at).toBeGreaterThanOrEqual(before);
+      expect(recorderCalls).toEqual(['start']);
+      // 清單也帶開始時間：重開頁面時計時要從這裡接回來（AC-4）
+      const list = await (await fetch(`${url}/api/meetings`)).json() as any;
+      expect(list.meetings[0].recording_started_at).toBe(body.meeting.recording_started_at);
+    });
+
+    it('語音備忘錄沒被叫起來：退回 CREATED、不留起訖紀錄，錯誤講是哪個捷徑', async () => {
+      await startWith({ voiceMemoRecorder: fakeRecorder({ startFails: true }) });
+      const id = await createRecordingMeeting();
+      const { status, body } = await post(`/api/meetings/${id}/recording/start`);
+      expect(status).toBe(502);
+      expect(body.error).toContain('MeetPilot 開始錄音');
+      expect(store.getMeeting(id)?.status).toBe('CREATED');
+      expect(store.getRecording(id)).toBeNull();
+    });
+
+    it('已經有一場在錄，第二場不能開始，也不去叫語音備忘錄', async () => {
+      await startWith({ voiceMemoRecorder: fakeRecorder() });
+      const first = await createRecordingMeeting();
+      const second = await createRecordingMeeting();
+      await post(`/api/meetings/${first}/recording/start`);
+      const { status, body } = await post(`/api/meetings/${second}/recording/start`);
+      expect(status).toBe(409);
+      expect(body.error).toContain(first);
+      expect(recorderCalls).toEqual(['start']);
+      expect(store.getMeeting(second)?.status).toBe('CREATED');
+    });
+
+    it('已經有音檔的會不能開始錄（停止時收檔會清掉它的成果）', async () => {
+      await startWith({ voiceMemoRecorder: fakeRecorder() });
+      const id = await createRecordingMeeting();
+      await audioStore.saveFrom(id, Readable.from([Buffer.from('existing')]));
+      const { status } = await post(`/api/meetings/${id}/recording/start`);
+      expect(status).toBe(409);
+      expect(recorderCalls).toEqual([]);
+    });
+
+    it('別台電腦來的請求回 403，不碰麥克風（AC-6）', async () => {
+      await startWith({ voiceMemoRecorder: fakeRecorder(), isLocalRequest: () => false });
+      const id = await createRecordingMeeting();
+      const { status, body } = await post(`/api/meetings/${id}/recording/start`);
+      expect(status).toBe(403);
+      expect(body.error).toContain('只能在那台電腦上操作');
+      expect(recorderCalls).toEqual([]);
+      expect(store.getMeeting(id)?.status).toBe('CREATED');
+    });
+
+    it('沒接語音備忘錄的 server 回 503', async () => {
+      await startWith();
+      const id = await createRecordingMeeting();
+      expect((await post(`/api/meetings/${id}/recording/start`)).status).toBe(503);
+    });
+  });
+
+  describe('停止錄音', () => {
+    it('停止、取檔、收檔、進轉錄：音檔落地、大小補上、暫存檔清掉', async () => {
+      await startWith({ voiceMemoRecorder: fakeRecorder() });
+      const id = await createRecordingMeeting();
+      await post(`/api/meetings/${id}/recording/start`);
+      const { status, body } = await post(`/api/meetings/${id}/recording/stop`);
+
+      expect(status).toBe(202);
+      expect(body.meeting.status).toBe('TRANSCRIBING');
+      expect(body.meeting.has_audio).toBe(true);
+      expect(body.meeting.recording_started_at).toBeNull();
+      expect(recorderCalls).toEqual(['start', 'stop', 'fetch', 'probe']);
+      expect(enqueued).toEqual([id]);
+      expect(readFileSync(audioStore.pathFor(id), 'utf8')).toBe('voice-memo-audio');
+      expect(store.getMeeting(id)?.source_file_size).toBe(Buffer.byteLength('voice-memo-audio'));
+      expect(store.getRecording(id)?.stopped_at).not.toBeNull();
+      expect(readdirSync(audioDir).filter(name => name.endsWith('.part') || name.endsWith('_part'))).toEqual([]);
+    });
+
+    it('第一次取檔失敗（檔案還沒寫完）會再取一次', async () => {
+      await startWith({ voiceMemoRecorder: fakeRecorder({ fetchFailsOn: [1] }) });
+      const id = await createRecordingMeeting();
+      await post(`/api/meetings/${id}/recording/start`);
+      const { status } = await post(`/api/meetings/${id}/recording/stop`);
+      expect(status).toBe(202);
+      expect(recorderCalls.filter(c => c === 'fetch')).toHaveLength(2);
+    });
+
+    it('取回的不是這場會的錄音：不送轉錄、退回 CREATED 等補音檔，原因與退路都講', async () => {
+      await startWith({
+        voiceMemoRecorder: fakeRecorder({ probe: () => ({ durationSeconds: 3600, creationTimeMs: Date.now() - 86_400_000 }) }),
+        recordingFetchPolicy: { attempts: 3, delayMs: 0 },
+      });
+      const id = await createRecordingMeeting();
+      await post(`/api/meetings/${id}/recording/start`);
+      const { status, body } = await post(`/api/meetings/${id}/recording/stop`);
+
+      expect(status).toBe(422);
+      expect(body.error).toContain('不在這場會的錄音期間');
+      expect(body.error).toContain('補上音檔');
+      expect(store.getMeeting(id)?.status).toBe('CREATED');
+      expect(audioStore.exists(id)).toBe(false);
+      expect(enqueued).toEqual([]);
+      // 照重試次數取了三次，不是取一次就放棄
+      expect(recorderCalls.filter(c => c === 'fetch')).toHaveLength(3);
+      expect(readdirSync(audioDir).filter(name => name.endsWith('.part') || name.endsWith('_part'))).toEqual([]);
+    });
+
+    it('語音備忘錄停不下來：留在 RECORDING，停止按鍵還在，可以再按一次', async () => {
+      await startWith({ voiceMemoRecorder: fakeRecorder({ stopFails: true }) });
+      const id = await createRecordingMeeting();
+      await post(`/api/meetings/${id}/recording/start`);
+      const { status, body } = await post(`/api/meetings/${id}/recording/stop`);
+      expect(status).toBe(502);
+      expect(body.error).toContain('再按一次停止');
+      expect(store.getMeeting(id)?.status).toBe('RECORDING');
+      expect(store.getRecording(id)?.stopped_at).toBeNull();
+      expect(recorderCalls).not.toContain('fetch');
+    });
+
+    it('上一次停了但沒取到檔就斷線：這次不再叫停止，用記下的停止時間直接取檔', async () => {
+      await startWith({ voiceMemoRecorder: fakeRecorder() });
+      const id = await createRecordingMeeting();
+      await post(`/api/meetings/${id}/recording/start`);
+      store.markRecordingStopped(id, Date.now());
+      recorderCalls = [];
+      const { status } = await post(`/api/meetings/${id}/recording/stop`);
+      expect(status).toBe(202);
+      expect(recorderCalls).toEqual(['fetch', 'probe']);
+    });
+
+    it('不在錄音中的會回 409', async () => {
+      await startWith({ voiceMemoRecorder: fakeRecorder() });
+      const id = await createRecordingMeeting();
+      expect((await post(`/api/meetings/${id}/recording/stop`)).status).toBe(409);
+      expect(recorderCalls).toEqual([]);
+    });
+
+    it('別台電腦來的請求回 403', async () => {
+      await startWith({ voiceMemoRecorder: fakeRecorder(), isLocalRequest: () => false });
+      const id = await createRecordingMeeting();
+      store.startRecording(id, Date.now());
+      expect((await post(`/api/meetings/${id}/recording/stop`)).status).toBe(403);
+      expect(recorderCalls).toEqual([]);
+    });
+  });
+
+  describe('刪除錄音中的會', () => {
+    it('先叫語音備忘錄停止再刪，不留一支沒人停得了的錄音', async () => {
+      await startWith({ voiceMemoRecorder: fakeRecorder() });
+      const id = await createRecordingMeeting();
+      await post(`/api/meetings/${id}/recording/start`);
+      const res = await fetch(`${url}/api/meetings/${id}`, { method: 'DELETE' });
+      expect(res.status).toBe(200);
+      expect(recorderCalls).toEqual(['start', 'stop']);
+      expect(store.getMeeting(id)).toBeNull();
+    });
+
+    it('停不下來就不刪', async () => {
+      await startWith({ voiceMemoRecorder: fakeRecorder({ stopFails: true }) });
+      const id = await createRecordingMeeting();
+      await post(`/api/meetings/${id}/recording/start`);
+      const res = await fetch(`${url}/api/meetings/${id}`, { method: 'DELETE' });
+      expect(res.status).toBe(502);
+      expect(((await res.json()) as any).error).toContain('沒有刪除');
+      expect(store.getMeeting(id)?.status).toBe('RECORDING');
+    });
   });
 });

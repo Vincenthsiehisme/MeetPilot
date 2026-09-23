@@ -42,6 +42,8 @@ const makeMeeting = (overrides: Partial<MeetingView> = {}): MeetingView => ({
   topic_extraction_error: null,
   // 預設有音檔：絕大多數測試不在意這個欄位，在意的那幾條自己覆寫
   has_audio: true,
+  // 預設不在錄音：只有 RECORDING 的測試自己覆寫
+  recording_started_at: null,
   title: null,
   status: 'CREATED',
   created_at: 1000,
@@ -74,10 +76,12 @@ interface Expectation {
   currentStep: number;
 }
 
-// 八個狀態逐一寫死。用 Record<MeetingStatus, ...> 是刻意的：server 之後多一個狀態，
+// 每個狀態逐一寫死。用 Record<MeetingStatus, ...> 是刻意的：server 之後多一個狀態，
 // 這張表沒補就在 tsc 壞掉，不會安靜地走進某個看起來正常的分支。
 const EXPECTED: Record<MeetingStatus, Expectation> = {
   CREATED: { jobStatus: JobStatus.PENDING, stageStatuses: [StepStatus.IDLE, StepStatus.IDLE, StepStatus.IDLE], currentStep: 0 },
+  // 錄音中算在「音檔」那一階段、而且是進行中；標成 PENDING 會跟「建立了等上傳」分不開
+  RECORDING: { jobStatus: JobStatus.RUNNING, stageStatuses: [StepStatus.PROCESSING, StepStatus.IDLE, StepStatus.IDLE], currentStep: 0 },
   TRANSCRIBING: { jobStatus: JobStatus.RUNNING, stageStatuses: [StepStatus.PROCESSING, StepStatus.IDLE, StepStatus.IDLE], currentStep: 0 },
   TRANSCRIBED: { jobStatus: JobStatus.RUNNING, stageStatuses: [StepStatus.SUCCESS, StepStatus.IDLE, StepStatus.IDLE], currentStep: 1 },
   ANALYZING: { jobStatus: JobStatus.RUNNING, stageStatuses: [StepStatus.SUCCESS, StepStatus.PROCESSING, StepStatus.IDLE], currentStep: 1 },
@@ -92,7 +96,7 @@ const EXPECTED: Record<MeetingStatus, Expectation> = {
 describe('meetingToJob 的狀態對應', () => {
   it('這張表涵蓋 meetingState 宣告的每一個狀態', () => {
     expect(Object.keys(EXPECTED).sort()).toEqual([...MEETING_STATUSES].sort());
-    expect(MEETING_STATUSES).toHaveLength(9);
+    expect(MEETING_STATUSES).toHaveLength(10);
   });
 
   for (const status of MEETING_STATUSES) {
@@ -143,6 +147,12 @@ describe('meetingToJob 的狀態對應', () => {
     expect(job.fileSize).toBe(0);
     expect(job.meetingContext).toBeUndefined();
     expect(job.error).toBeUndefined();
+  });
+
+  it('錄音開始時間只在 server 給了才帶進 Job，計時從 server 接回來', () => {
+    const recording = meetingToJob(makeMeeting({ status: 'RECORDING', recording_started_at: 1_700_000_000_000 }));
+    expect(recording.recordingStartedAt).toBe(1_700_000_000_000);
+    expect(meetingToJob(makeMeeting({ status: 'LINKED' })).recordingStartedAt).toBeUndefined();
   });
 
   it('檔名與標題都沒有時退回 meeting_id，畫面上還認得出是哪一場', () => {
@@ -269,6 +279,14 @@ describe('polling 的停止條件與批次清除的名單（W3）', () => {
     expect(isMeetingBusy('TRANSCRIBED')).toBe(false);
     expect(isMeetingInProgress(transcribed)).toBe(true);
     expect(hasMeetingsInProgress([transcribed])).toBe(true);
+  });
+
+  it('RECORDING 不在 BUSY_STATUSES 裡，但錄音還沒結束：要繼續 poll，批次清除也不能清掉它', () => {
+    // 清掉一場還在錄的會，語音備忘錄會一直錄下去，畫面上再也沒有停止按鍵
+    const recording = makeMeeting({ status: 'RECORDING', has_audio: false, recording_started_at: 1 });
+    expect(isMeetingBusy('RECORDING')).toBe(false);
+    expect(isMeetingInProgress(recording)).toBe(true);
+    expect(hasMeetingsInProgress([recording])).toBe(true);
   });
 
   it('全部到終點就不再 poll', () => {

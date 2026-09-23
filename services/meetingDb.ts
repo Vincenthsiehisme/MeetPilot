@@ -359,6 +359,22 @@ const MIGRATIONS: readonly string[] = [
   DROP TABLE analyses;
   ALTER TABLE analyses_v2 RENAME TO analyses;
   `,
+  // 網頁錄音（vault plan「MeetPilot · 網頁錄音」）：webapp 叫本機語音備忘錄錄音的起訖時間。
+  //
+  // 不加在 meetings 表上：只有從錄音按鍵開始的會才有這兩個值，其餘（上傳、搬遷）一律沒有，
+  // 放進 meetings 等於讓 Meeting 型別的每一個建構點都要多填兩個跟它無關的 null。
+  //
+  // started_at 落地是 AC-4 的前提：錄音由語音備忘錄負責，分頁關掉或 server 重啟都不會中斷，
+  // 重開頁面時畫面上的計時與停止按鍵要靠這一欄才接得回來，不能只存在前端。
+  // 停止後這一列留著不刪：取回的檔案要拿開始／停止時間比對長度（AC-3），事後也查得到這場會的
+  // 音檔是從語音備忘錄來的。stopped_at 是 NULL 代表還在錄。
+  `
+  CREATE TABLE voice_memo_recordings (
+    meeting_id TEXT PRIMARY KEY REFERENCES meetings(meeting_id) ON DELETE CASCADE,
+    started_at INTEGER NOT NULL,
+    stopped_at INTEGER
+  );
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

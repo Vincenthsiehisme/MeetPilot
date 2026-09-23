@@ -134,7 +134,8 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
       throw new Error(`Meeting ${meetingId} 的音檔不在 ${audioPath}，無法轉錄`);
     }
 
-    const totalDurationSeconds = await slicer.probeDurationSeconds(audioPath);
+    // 瀏覽器錄的 webm 沒寫長度，拖曳上傳進來要先補寫（見 audioSlicer 的說明）
+    const totalDurationSeconds = await slicer.probeDurationRemuxingIfMissing(audioPath);
     const plan = planSlices(totalDurationSeconds, SLICE_DURATION_SECONDS, SLICE_OVERLAP_SECONDS);
 
     const existing = store.getTranscript(meetingId);

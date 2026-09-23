@@ -862,3 +862,65 @@ describe('setTitle', () => {
     expect(() => store.setTitle('nope', '週會', T0)).toThrow('找不到 Meeting nope');
   });
 });
+
+describe('語音備忘錄錄音的起訖紀錄（vault plan「MeetPilot · 網頁錄音」）', () => {
+  it('開始錄音：狀態進 RECORDING、開始時間落地，兩件事一起發生', () => {
+    newMeeting();
+    const meeting = store.startRecording('m-1', T0 + 1000);
+    expect(meeting.status).toBe('RECORDING');
+    expect(store.getRecording('m-1')).toEqual({ meeting_id: 'm-1', started_at: T0 + 1000, stopped_at: null });
+    expect(store.listRecordingMeetings().map(m => m.meeting_id)).toEqual(['m-1']);
+  });
+
+  it('不是 CREATED 不能開始錄，而且不會留下半筆起訖紀錄', () => {
+    newMeeting();
+    store.setStatus('m-1', 'TRANSCRIBING', T0);
+    expect(() => store.startRecording('m-1', T0)).toThrow(/不能從 TRANSCRIBING 轉到 RECORDING/);
+    expect(store.getRecording('m-1')).toBeNull();
+  });
+
+  it('開始失敗退回 CREATED：起訖紀錄一起刪掉，不留一筆看起來還在錄的列', () => {
+    newMeeting();
+    store.startRecording('m-1', T0);
+    const meeting = store.abortRecording('m-1', T0 + 5);
+    expect(meeting.status).toBe('CREATED');
+    expect(store.getRecording('m-1')).toBeNull();
+    expect(store.listRecordingMeetings()).toEqual([]);
+  });
+
+  it('退回 CREATED 之後重新開始：開始時間換成這一次的，不留上一次的', () => {
+    newMeeting();
+    store.startRecording('m-1', T0);
+    store.markRecordingStopped('m-1', T0 + 10_000);
+    store.setStatus('m-1', 'CREATED', T0 + 11_000);
+    store.startRecording('m-1', T0 + 60_000);
+    expect(store.getRecording('m-1')).toEqual({ meeting_id: 'm-1', started_at: T0 + 60_000, stopped_at: null });
+  });
+
+  it('停止時間只能記一次：第二次寫會蓋掉第一次的終點，一律拋錯', () => {
+    newMeeting();
+    store.startRecording('m-1', T0);
+    store.markRecordingStopped('m-1', T0 + 10_000);
+    expect(store.getRecording('m-1')?.stopped_at).toBe(T0 + 10_000);
+    expect(() => store.markRecordingStopped('m-1', T0 + 20_000)).toThrow(/沒有進行中的錄音紀錄/);
+    expect(store.getRecording('m-1')?.stopped_at).toBe(T0 + 10_000);
+  });
+
+  it('沒有錄音紀錄的會記不了停止時間', () => {
+    newMeeting();
+    expect(() => store.markRecordingStopped('m-1', T0)).toThrow(/沒有進行中的錄音紀錄/);
+  });
+
+  it('刪除會議時起訖紀錄跟著刪（外鍵 cascade）', () => {
+    newMeeting();
+    store.startRecording('m-1', T0);
+    store.deleteMeeting('m-1');
+    expect(store.getRecording('m-1')).toBeNull();
+  });
+
+  it('補寫實際音檔大小', () => {
+    newMeeting();
+    store.setSourceFileSize('m-1', 91_557, T0 + 1);
+    expect(store.getMeeting('m-1')?.source_file_size).toBe(91_557);
+  });
+});

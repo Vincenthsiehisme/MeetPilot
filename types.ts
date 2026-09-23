@@ -54,6 +54,8 @@ export interface Job {
   processedSlices?: number;
   totalSlices?: number;
   etaSeconds?: number;
+  /** 語音備忘錄開始錄的時間（epoch ms）。只有錄音中的會有值，畫面的錄音計時用它 */
+  recordingStartedAt?: number;
   steps: {
     name: string;
     status: StepStatus;

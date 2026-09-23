@@ -34,6 +34,23 @@ export function isLoopbackHost(host: string): boolean {
   return LOOPBACK_HOSTS.has(host);
 }
 
+// 連線來源位址的寫法跟 HOST 設定不同：IPv4 經雙堆疊 socket 進來會是 `::ffff:127.0.0.1`，
+// 而且來源不會是 `localhost` 這種名字。整段 127.0.0.0/8 都是本機
+const IPV4_LOOPBACK = /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
+
+/**
+ * 這個請求是不是從跑 server 的這台機器來的（看 socket 的來源位址，不看 HOST 設定）。
+ *
+ * 用在會動到這台機器本身的路由：語音備忘錄錄音會打開這台筆電的麥克風，`HOST` 開到區網時
+ * 別台電腦不該能遠端啟動它（vault plan「MeetPilot · 網頁錄音」AC-6）。沒設 `trust proxy`，
+ * 所以 `X-Forwarded-For` 騙不過這裡。拿不到位址（undefined）一律當成不是本機。
+ */
+export function isLoopbackAddress(address: string | undefined): boolean {
+  if (address === undefined) return false;
+  const v4 = address.startsWith('::ffff:') ? address.slice('::ffff:'.length) : address;
+  return v4 === '::1' || IPV4_LOOPBACK.test(v4);
+}
+
 function readEnv(env: NodeJS.ProcessEnv, key: string): string | undefined {
   const value = env[key];
   if (value === undefined || value.trim() === '') return undefined;

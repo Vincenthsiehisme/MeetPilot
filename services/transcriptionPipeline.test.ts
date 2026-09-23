@@ -35,6 +35,7 @@ const fakeAudioStore = (present: Set<string>): AudioFileStore => ({
   dir: '/fake/audio',
   pathFor: (id: string) => `/fake/audio/${id}.audio`,
   exists: (id: string) => present.has(id),
+  tempPathFor: (id: string) => `/fake/audio/${id}_tmp_part`,
   sizeOf: () => 1024,
   saveFrom: async (id: string) => { present.add(id); return { path: `/fake/audio/${id}.audio`, bytes: 1024 }; },
   removePartialUploads: () => [],
@@ -42,7 +43,7 @@ const fakeAudioStore = (present: Set<string>): AudioFileStore => ({
 });
 
 const fakeSlicer = (durationSeconds: number, readSlice?: AudioSlicer['readSlice']): AudioSlicer => ({
-  probeDurationSeconds: async () => durationSeconds,
+  probeDurationRemuxingIfMissing: async () => durationSeconds,
   readSlice: readSlice ?? (async (_path, start) => Buffer.from(`wav@${start}`)),
 });
 
@@ -1094,17 +1095,17 @@ describe('run：失敗', () => {
 
   it('音檔不在時直接 FAILED，不會去呼叫 ffprobe', async () => {
     newMeeting();
-    const probeDurationSeconds = vi.fn(async () => THREE_SLICE_DURATION);
+    const probeDurationRemuxingIfMissing = vi.fn(async () => THREE_SLICE_DURATION);
     const pipeline = pipelineWith({
       store,
       audioStore: fakeAudioStore(new Set()),
-      slicer: { probeDurationSeconds, readSlice: async () => Buffer.from('x') },
+      slicer: { probeDurationRemuxingIfMissing, readSlice: async () => Buffer.from('x') },
       gemini: fakeGemini(),
       now: () => T0 + 1,
     });
 
     await expect(pipeline.run('m-1')).rejects.toThrow(/音檔不在/);
-    expect(probeDurationSeconds).not.toHaveBeenCalled();
+    expect(probeDurationRemuxingIfMissing).not.toHaveBeenCalled();
     expect(store.getMeeting('m-1')?.status).toBe('FAILED');
   });
 
@@ -1472,6 +1473,7 @@ const createAudioFileStoreStub = (): AudioFileStore => ({
     return `/fake/audio/${id}.audio`;
   },
   exists: () => false,
+  tempPathFor: (id: string) => `/fake/audio/${id}_tmp_part`,
   sizeOf: () => 0,
   saveFrom: async () => ({ path: '', bytes: 0 }),
   removePartialUploads: () => [],

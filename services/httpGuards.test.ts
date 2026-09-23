@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+  isLoopbackAddress,
   resolveListenConfig,
   checkBasicAuth,
   createRateLimiter,
@@ -206,5 +207,24 @@ describe('describeBodyParserError', () => {
     expect(describeBodyParserError({ type: 'something.else' })).toBeNull();
     expect(describeBodyParserError(undefined)).toBeNull();
     expect(describeBodyParserError(null)).toBeNull();
+  });
+});
+
+describe('isLoopbackAddress（錄音路由只收本機請求，AC-6）', () => {
+  it('IPv4、IPv6 與雙堆疊寫法的本機來源都算', () => {
+    for (const address of ['127.0.0.1', '127.0.0.53', '::1', '::ffff:127.0.0.1']) {
+      expect(isLoopbackAddress(address)).toBe(true);
+    }
+  });
+
+  it('區網與外部位址不算，拿不到位址也不算', () => {
+    for (const address of ['192.168.1.20', '::ffff:192.168.1.20', '10.0.0.5', 'fe80::1', '', undefined]) {
+      expect(isLoopbackAddress(address)).toBe(false);
+    }
+  });
+
+  it('只比對整段位址，不被長得像的字串騙過', () => {
+    expect(isLoopbackAddress('127.0.0.1.evil')).toBe(false);
+    expect(isLoopbackAddress('x127.0.0.1')).toBe(false);
   });
 });

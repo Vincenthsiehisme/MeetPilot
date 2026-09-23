@@ -23,6 +23,9 @@ export const resolveAudioDir = (env: NodeJS.ProcessEnv): string =>
 // meeting_id 對到同一個檔案，那是最難查的一種資料互蓋
 const SAFE_MEETING_ID = /^[A-Za-z0-9_-]+$/;
 
+/** tempPathFor 的結尾。不帶點，理由見 tempPathFor */
+const EXTERNAL_TEMP_SUFFIX = '_part';
+
 export interface SavedAudio {
   path: string;
   bytes: number;
@@ -43,6 +46,20 @@ export function createAudioFileStore(dir: string) {
     pathFor,
 
     exists: (meetingId: string): boolean => existsSync(pathFor(meetingId)),
+
+    /**
+     * 給外部程式先寫進來的暫存路徑（語音備忘錄的取檔捷徑用它當 `--output-path`）。
+     *
+     * **整個檔名不能有點**，所以不沿用 saveFrom 的 `.part`：`shortcuts run --output-path` 會照副檔名
+     * 轉換輸出，遇到不認得的副檔名（`.part`、`.voicememo-xxx`）就結束碼 0、什麼都不寫；沒有副檔名或
+     * `.m4a` 才寫得出來（2026-09-23 實測）。寫死 `.m4a` 的話，語音備忘錄哪天改存別的格式又會安靜失敗，
+     * 所以用沒有副檔名的 `_part` 結尾，removePartialUploads 一起認得它，server 掛掉留下的也會被清。
+     * 呼叫端用完要自己刪。
+     */
+    tempPathFor: (meetingId: string): string => {
+      pathFor(meetingId); // 同一條檔名規則：不合法的 meeting_id 在這裡就拋錯
+      return join(dir, `${meetingId}_${randomUUID()}${EXTERNAL_TEMP_SUFFIX}`);
+    },
 
     sizeOf: (meetingId: string): number => statSync(pathFor(meetingId)).size,
 
@@ -85,8 +102,9 @@ export function createAudioFileStore(dir: string) {
     removePartialUploads: (): string[] => {
       const removed: string[] = [];
       for (const name of readdirSync(dir)) {
-        // 比對只看 .part 結尾：中間那段是每次上傳的唯一碼，寫死 `.audio.part` 會一個都對不到
-        if (!name.endsWith('.part')) continue;
+        // 比對只看結尾：中間那段是每次上傳的唯一碼，寫死 `.audio.part` 會一個都對不到。
+        // `_part` 是 tempPathFor 給外部程式（語音備忘錄取檔捷徑）用的暫存名，理由見那支的說明
+        if (!name.endsWith('.part') && !name.endsWith(EXTERNAL_TEMP_SUFFIX)) continue;
         const target = join(dir, name);
         rmSync(target, { force: true });
         removed.push(target);

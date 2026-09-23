@@ -6,11 +6,13 @@ import FileUpload from './components/FileUpload';
 import ConfirmModal from './components/ConfirmModal';
 import ParticipantPicker from './components/ParticipantPicker';
 import { HttpError } from './services/httpError';
-import { MEETING_POLL_INTERVAL_MS, MeetingDetailResponse, MeetingView, PersonSummary } from './services/meetingApi';
+import { MEETING_POLL_INTERVAL_MS, MeetingDetailResponse, MeetingView, PersonSummary, RecordingAvailabilityResponse } from './services/meetingApi';
 import {
   confirmNameMention,
+  createMeeting,
   deleteMeeting,
   getMeetingDetail,
+  getRecordingAvailability,
   importLegacyJobs,
   listMeetings,
   listPeopleWithSingleRetry,
@@ -18,8 +20,11 @@ import {
   patchTitle,
   patchTranscript,
   retryMeeting,
+  startRecording,
+  stopRecording,
   submitAudio
 } from './services/meetingClient';
+import { findRecordingMeeting, formatRecordingElapsed, recordingMeetingFileName } from './services/recordingView';
 import {
   AudioBackupTarget,
   SelectionRef,
@@ -109,8 +114,13 @@ const App: React.FC = () => {
   // 建立新會議前的與會者名單（人名校正 N2）。null 是「還沒讀回來」，picker 用它跟 people 分開判斷
   const [people, setPeople] = useState<PersonSummary[] | null>(null);
   const [peopleLoadError, setPeopleLoadError] = useState<string | null>(null);
-  // 選好檔案、等使用者在 picker 裡選完與會者才真的送出（D-016：至少一位是前置條件）
-  const [pendingUploadFile, setPendingUploadFile] = useState<File | null>(null);
+  // 選好檔案或按了開始錄音，等使用者在 picker 裡選完與會者才真的送出（D-016：至少一位是前置條件）。
+  // 錄音也要先選人：與會者在會議開始時選（vault plan「MeetPilot · 網頁錄音」，使用者裁決）
+  const [pendingNew, setPendingNew] = useState<{ kind: 'file'; file: File } | { kind: 'recording' } | null>(null);
+  // 這台 server 能不能叫語音備忘錄錄音。null 是還沒問到；不能的時候帶原因，錄音按鍵照它決定顯不顯示（AC-5）
+  const [recordingAvailability, setRecordingAvailability] = useState<RecordingAvailabilityResponse | null>(null);
+  // 錄音計時用的「現在」。只在有會正在錄的時候每秒更新，其餘時間不跑計時器
+  const [now, setNow] = useState<number>(() => Date.now());
   const [confirmConfig, setConfirmConfig] = useState<{
     isOpen: boolean;
     title: string;
@@ -225,6 +235,20 @@ const App: React.FC = () => {
     loadPeople();
   }, [loadPeople]);
 
+  const loadRecordingAvailability = useCallback(async (): Promise<void> => {
+    try {
+      setRecordingAvailability(await getRecordingAvailability());
+    } catch (err: any) {
+      // 問不到也要講原因，不讓錄音按鍵安靜地消失：使用者會以為這台機器本來就沒有這個功能
+      console.error('讀取錄音功能狀態失敗', err);
+      setRecordingAvailability({ available: false, reason: `問不到 server 能不能錄音（${errorText(err)}）` });
+    }
+  }, []);
+
+  useEffect(() => {
+    loadRecordingAvailability();
+  }, [loadRecordingAvailability]);
+
   // 選到 server 的會議才去拉內容。本機紀錄的內容本來就在手上，不用再讀一次
   useEffect(() => {
     if (selection === null || selection.source !== 'server') {
@@ -252,6 +276,15 @@ const App: React.FC = () => {
     }, MEETING_POLL_INTERVAL_MS);
     return () => clearTimeout(timer);
   }, [meetings, selection, refreshMeetings, refreshActiveDetail]);
+
+  // 錄音計時：有會正在錄才每秒更新一次，沒有就不跑計時器
+  const hasRecordingMeeting = meetings !== null && meetings.some(m => m.status === 'RECORDING');
+  useEffect(() => {
+    if (!hasRecordingMeeting) return;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [hasRecordingMeeting]);
 
   /**
    * 送出音檔。targetMeetingId 給了就是對既有的那場補送，沒給才建立新的一場。
@@ -295,15 +328,75 @@ const App: React.FC = () => {
   };
 
   // 新建這條先開 picker 選與會者（D-016 必填），選完才真的送出；補送既有會議走 submitAudioFile 原路
-  const addMeeting = (file: File) => setPendingUploadFile(file);
+  const addMeeting = (file: File) => setPendingNew({ kind: 'file', file });
 
-  const handleConfirmParticipants = (participantIds: string[]) => {
-    const file = pendingUploadFile;
-    setPendingUploadFile(null);
-    if (file) submitAudioFile(file, null, participantIds);
+  /**
+   * 建立會議並叫語音備忘錄開始錄。
+   *
+   * 開始失敗時把剛建的會刪掉：server 已經把它退回 CREATED，留著的話清單上會多一筆沒有音檔、
+   * 也沒有人會去補的空會議。刪不掉就照實講它還在，讓使用者自己處理，不當作沒事。
+   */
+  const beginRecording = async (participantIds: string[]) => {
+    setBusyMessage('正在叫語音備忘錄開始錄音…');
+    let createdId: string | null = null;
+    try {
+      const created = await createMeeting({
+        fileName: recordingMeetingFileName(new Date()),
+        fileSize: 0,
+        participantIds,
+      });
+      createdId = created.meeting_id;
+      await startRecording(created.meeting_id);
+      selectRecord({ source: 'server', id: created.meeting_id });
+      if (!isSidebarOpen) setIsSidebarOpen(true);
+    } catch (err: any) {
+      console.error('開始錄音失敗', err);
+      let cleanup = '';
+      if (createdId !== null) {
+        try {
+          await deleteMeeting(createdId);
+        } catch (deleteErr: any) {
+          console.error('開始錄音失敗後刪除空會議也失敗', deleteErr);
+          cleanup = `\n\n剛建立的那場空會議沒有刪掉（${errorText(deleteErr)}），可以在清單裡自己刪除。`;
+        }
+      }
+      const reason = err instanceof HttpError ? err.message : translateError(errorText(err));
+      showAlert('沒有開始錄音', `${reason}${cleanup}`);
+    } finally {
+      setBusyMessage(null);
+      await refreshMeetings();
+    }
   };
 
-  const handleCancelParticipants = () => setPendingUploadFile(null);
+  /**
+   * 叫語音備忘錄停止、取回錄音、送進轉錄。server 的錯誤訊息原樣顯示：422 會講取回的為什麼
+   * 不是這場會的錄音、接下來怎麼補，502 會講是哪個捷徑失敗，套 translateError 會把這些都蓋掉
+   */
+  const handleStopRecording = async (meetingId: string) => {
+    setBusyMessage('正在停止錄音、取回檔案…');
+    try {
+      await stopRecording(meetingId);
+    } catch (err: any) {
+      console.error('停止錄音失敗', err);
+      showAlert('錄音沒有送出', err instanceof HttpError ? err.message : translateError(errorText(err)));
+    } finally {
+      setBusyMessage(null);
+      await refreshMeetings();
+      if (selectionRef.current !== null && selectionRef.current.source === 'server' && selectionRef.current.id === meetingId) {
+        await refreshActiveDetail(meetingId);
+      }
+    }
+  };
+
+  const handleConfirmParticipants = (participantIds: string[]) => {
+    const pending = pendingNew;
+    setPendingNew(null);
+    if (pending === null) return;
+    if (pending.kind === 'file') submitAudioFile(pending.file, null, participantIds);
+    else beginRecording(participantIds);
+  };
+
+  const handleCancelParticipants = () => setPendingNew(null);
 
   const handleRetryMeeting = async (meetingId: string) => {
     try {
@@ -418,10 +511,13 @@ const App: React.FC = () => {
     err instanceof HttpError && err.status === 409 ? err.message : translateError(errorText(err));
 
   const handleDeleteMeeting = (meetingId: string) => {
+    const isRecording = (meetings ?? []).some(m => m.meeting_id === meetingId && m.status === 'RECORDING');
     setConfirmConfig({
       isOpen: true,
       title: '刪除這場會議',
-      message: '確定要從任務清單刪除這場會議嗎？這個動作無法復原：伺服器上的逐字稿、分析與音檔都會一起刪掉；vault 裡的會議記錄副本不受影響。',
+      message: isRecording
+        ? '這場會議還在錄音。刪除會先叫語音備忘錄停止錄音，再刪掉這場會議；語音備忘錄裡已經錄下的那支不會被刪。'
+        : '確定要從任務清單刪除這場會議嗎？這個動作無法復原：伺服器上的逐字稿、分析與音檔都會一起刪掉；vault 裡的會議記錄副本不受影響。',
       isDestructive: true,
       onConfirm: async () => {
         closeConfirm();
@@ -561,6 +657,20 @@ const App: React.FC = () => {
   };
 
   const dashboard = buildDashboardView(meetings, serverError, localJobs);
+  // 正在錄的那一場。findRecordingMeeting 遇到兩場同時在錄會拋錯（不挑一場去停），
+  // 在這裡接住變成橫幅，不讓整個畫面因此掛掉
+  let recordingMeeting: MeetingView | null = null;
+  let recordingConflict: string | null = null;
+  try {
+    recordingMeeting = findRecordingMeeting(meetings);
+  } catch (err: any) {
+    recordingConflict = errorText(err);
+  }
+  const canStartRecording = recordingAvailability !== null && recordingAvailability.available === true
+    && recordingMeeting === null && recordingConflict === null;
+  const recordingElapsed = recordingMeeting !== null && recordingMeeting.recording_started_at !== null
+    ? formatRecordingElapsed(recordingMeeting.recording_started_at, now)
+    : null;
   const activeMeeting = activeDetail === null ? null : activeDetail.meeting;
   const activeEditBlockedReason = activeMeeting === null ? null : editBlockedReason(activeMeeting.status);
   const activeNeedsAudio = activeMeeting !== null && needsAudioUpload(activeMeeting);
@@ -655,6 +765,37 @@ const App: React.FC = () => {
               <i className="fa-solid fa-circle-notch fa-spin"></i>
               {busyMessage}
             </span>
+          )}
+          {recordingMeeting !== null && (
+            <div className="flex items-center gap-2 bg-rose-50 border border-rose-200 rounded-xl pl-3 pr-1 h-10">
+              <span className="w-2 h-2 rounded-full bg-rose-500 animate-pulse"></span>
+              <button
+                onClick={() => selectRecord({ source: 'server', id: recordingMeeting.meeting_id })}
+                className="text-xs font-bold text-rose-700 tabular-nums"
+                title="看這場會"
+              >
+                錄音中 {recordingElapsed}
+              </button>
+              <button
+                onClick={() => handleStopRecording(recordingMeeting.meeting_id)}
+                disabled={busyMessage !== null}
+                className="h-8 px-3 bg-rose-600 hover:bg-rose-700 disabled:bg-rose-300 text-white text-xs font-bold rounded-lg flex items-center gap-1 transition-colors"
+              >
+                <i className="fa-solid fa-stop"></i>
+                停止錄音
+              </button>
+            </div>
+          )}
+          {canStartRecording && (
+            <button
+              onClick={() => setPendingNew({ kind: 'recording' })}
+              disabled={busyMessage !== null}
+              className="h-10 px-4 bg-white hover:bg-rose-50 border border-rose-200 text-rose-600 disabled:opacity-50 rounded-xl font-bold text-sm flex items-center gap-2 transition-colors"
+              title="用這台 Mac 的語音備忘錄錄音，停止後自動送進轉錄"
+            >
+              <i className="fa-solid fa-microphone"></i>
+              開始錄音
+            </button>
           )}
           <FileUpload onFileSelect={addMeeting} onRejected={(reason) => showAlert('無法建立任務', reason)} />
         </div>
@@ -759,6 +900,30 @@ const App: React.FC = () => {
         <main className="flex-1 min-w-0 flex flex-col h-full bg-slate-50 relative">
           <div className="flex-1 p-0 sm:p-4 h-full overflow-hidden flex flex-col">
             <div className="w-full flex-1 bg-white sm:rounded-2xl border-x sm:border border-slate-200 shadow-sm overflow-hidden flex flex-col">
+              {recordingConflict !== null && (
+                <div className="bg-rose-50 border-b border-rose-200 text-rose-700 text-xs p-3 shrink-0">
+                  <i className="fa-solid fa-triangle-exclamation mr-1"></i>
+                  {recordingConflict}。請到語音備忘錄確認實際在錄的是哪一支，再刪掉多出來的那場會議。
+                </div>
+              )}
+              {activeMeeting !== null && activeMeeting.status === 'RECORDING' && (
+                <div className="bg-rose-50 border-b border-rose-200 text-rose-900 text-xs p-3 shrink-0 flex flex-wrap items-center gap-3">
+                  <span className="flex-1 min-w-[12rem] leading-relaxed">
+                    <i className="fa-solid fa-microphone mr-1"></i>
+                    語音備忘錄正在錄這場會{recordingElapsed !== null && `（${recordingElapsed}）`}。
+                    錄音在語音備忘錄裡，關掉這個分頁或重新整理都不會中斷；按「停止錄音」會自動取回檔案開始轉錄。
+                    筆電闔上或睡眠會不會中斷錄音還沒驗證過，開會時先讓筆電保持開著。
+                  </span>
+                  <button
+                    onClick={() => handleStopRecording(activeMeeting.meeting_id)}
+                    disabled={busyMessage !== null}
+                    className="shrink-0 bg-rose-600 hover:bg-rose-700 disabled:bg-rose-300 text-white text-xs font-bold px-3 py-1.5 rounded-lg transition-colors"
+                  >
+                    <i className="fa-solid fa-stop mr-1"></i>
+                    停止錄音
+                  </button>
+                </div>
+              )}
               {detailError && (
                 <div className="bg-rose-50 border-b border-rose-200 text-rose-700 text-xs p-3 shrink-0">
                   <i className="fa-solid fa-triangle-exclamation mr-1"></i>
@@ -834,6 +999,22 @@ const App: React.FC = () => {
                     onRejected={(reason) => showAlert('無法建立任務', reason)}
                     variant="zone"
                   />
+                  {canStartRecording && (
+                    <button
+                      onClick={() => setPendingNew({ kind: 'recording' })}
+                      disabled={busyMessage !== null}
+                      className="mt-4 w-full max-w-md bg-white hover:bg-rose-50 border-2 border-rose-200 hover:border-rose-400 text-rose-600 disabled:opacity-50 rounded-2xl px-8 py-5 flex flex-col items-center gap-1 transition-colors"
+                    >
+                      <span className="text-sm font-bold"><i className="fa-solid fa-microphone mr-2"></i>開始錄音</span>
+                      <span className="text-xs text-slate-500">用這台 Mac 的語音備忘錄錄，停止後自動送進轉錄</span>
+                    </button>
+                  )}
+                  {recordingAvailability !== null && recordingAvailability.available === false && (
+                    <p className="mt-4 max-w-md text-[11px] text-slate-400 leading-relaxed">
+                      <i className="fa-solid fa-microphone-slash mr-1"></i>
+                      語音備忘錄錄音目前不能用：{recordingAvailability.reason}
+                    </p>
+                  )}
                 </div>
               )}
             </div>
@@ -852,7 +1033,8 @@ const App: React.FC = () => {
       />
 
       <ParticipantPicker
-        isOpen={pendingUploadFile !== null}
+        isOpen={pendingNew !== null}
+        confirmVerb={pendingNew !== null && pendingNew.kind === 'recording' ? '開始錄音' : '建立會議'}
         people={people}
         loadError={peopleLoadError}
         onRetry={loadPeople}

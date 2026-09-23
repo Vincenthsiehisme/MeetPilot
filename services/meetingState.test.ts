@@ -42,6 +42,17 @@ describe('canTransition', () => {
     expect(canTransition('LINK_FAILED', 'LINKING')).toBe(true);
   });
 
+  it('錄音（語音備忘錄）：CREATED 才能開始錄，停止後直接進轉錄，取回失敗退回 CREATED', () => {
+    expect(canTransition('CREATED', 'RECORDING')).toBe(true);
+    expect(canTransition('RECORDING', 'TRANSCRIBING')).toBe(true);
+    expect(canTransition('RECORDING', 'CREATED')).toBe(true);
+    // 已經有音檔在跑的會不能再開始錄，錄音也不能跳過轉錄直接進後段
+    expect(canTransition('TRANSCRIBING', 'RECORDING')).toBe(false);
+    expect(canTransition('FAILED', 'RECORDING')).toBe(false);
+    expect(canTransition('RECORDING', 'TRANSCRIBED')).toBe(false);
+    expect(canTransition('RECORDING', 'ANALYZING')).toBe(false);
+  });
+
   it('FAILED 可以退回 CREATED 重跑整條', () => {
     expect(canTransition('FAILED', 'CREATED')).toBe(true);
   });
@@ -69,7 +80,7 @@ describe('assertTransition', () => {
 
 describe('legalNextStates', () => {
   it('每個狀態都把 FAILED 列進去，FAILED 自己不列', () => {
-    expect(legalNextStates('CREATED')).toEqual(['TRANSCRIBING', 'FAILED']);
+    expect(legalNextStates('CREATED')).toEqual(['TRANSCRIBING', 'RECORDING', 'FAILED']);
     expect(legalNextStates('LINKING')).toEqual(['LINKED', 'LINK_FAILED', 'FAILED']);
     expect(legalNextStates('FAILED')).toEqual(['CREATED']);
   });
@@ -82,12 +93,13 @@ describe('legalNextStates', () => {
 });
 
 describe('isMeetingStatus', () => {
-  it('只認九個狀態', () => {
+  it('只認十個狀態', () => {
     expect(isMeetingStatus('READY')).toBe(true);
     expect(isMeetingStatus('TRANSCRIBED')).toBe(true);
+    expect(isMeetingStatus('RECORDING')).toBe(true);
     expect(isMeetingStatus('COMPLETED')).toBe(false);
     expect(isMeetingStatus('')).toBe(false);
     expect(isMeetingStatus(undefined)).toBe(false);
-    expect(MEETING_STATUSES).toHaveLength(9);
+    expect(MEETING_STATUSES).toHaveLength(10);
   });
 });
