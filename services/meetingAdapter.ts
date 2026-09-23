@@ -53,6 +53,14 @@ const STATUS_VIEW: Record<MeetingStatus, StatusView> = {
     currentStep: 0,
     note: null,
   },
+  // 轉錄與分析拆成兩條獨立 queue 之後才有的停留點：轉錄完成、分析 job 還沒被排進去或還沒跑。
+  // 這段期間逐字稿可以編輯（不在 BUSY_STATUSES 裡），note 順便提示這件事
+  TRANSCRIBED: {
+    jobStatus: JobStatus.RUNNING,
+    stageStatuses: [StepStatus.SUCCESS, StepStatus.IDLE, StepStatus.IDLE],
+    currentStep: 1,
+    note: '逐字稿已完成，分析尚未開始，可以先修正逐字稿內容',
+  },
   ANALYZING: {
     jobStatus: JobStatus.RUNNING,
     stageStatuses: [StepStatus.SUCCESS, StepStatus.PROCESSING, StepStatus.IDLE],
@@ -253,11 +261,18 @@ export const editBlockedReason = (status: MeetingStatus): string | null =>
  *   CREATED + has_audio: false = 等使用者上傳。不算在跑
  *   CREATED + has_audio: true  = retry 之後在佇列裡排隊。算在跑
  *
+ * `TRANSCRIBED` 另外特判：它刻意不在 `BUSY_STATUSES` 裡（那段期間 server 沒在寫這場會，
+ * 逐字稿可以編輯），但這場會離結束還很遠——分析 job 可能還在佇列裡排隊。用 `isMeetingBusy`
+ * 判「還在跑」的話這裡會誤判成已經結束，polling 停掉，使用者不會看到分析什麼時候真的開始。
+ *
  * 其餘狀態剛好等於 `BUSY_STATUSES`：server 正在寫這場會的資料，跟「還在跑」是同一件事的兩面。
  * 共用一份清單，不要各留一份會漂移的字面值。
  */
-export const isMeetingInProgress = (meeting: MeetingView): boolean =>
-  meeting.status === 'CREATED' ? meeting.has_audio : isMeetingBusy(meeting.status);
+export const isMeetingInProgress = (meeting: MeetingView): boolean => {
+  if (meeting.status === 'CREATED') return meeting.has_audio;
+  if (meeting.status === 'TRANSCRIBED') return true;
+  return isMeetingBusy(meeting.status);
+};
 
 export const hasMeetingsInProgress = (meetings: MeetingView[]): boolean =>
   meetings.some(isMeetingInProgress);

@@ -448,6 +448,35 @@ describe('updateTranscript', () => {
   });
 });
 
+describe('getCurrentTranscript：legacy_unconfirmed_raw（Codex adversarial review 抓到）', () => {
+  it('這次升級之後才寫入的 raw，source_kind 是 raw', () => {
+    newMeeting();
+    store.saveTranscript('m-1', { segments: [{ start: 0, end: 1, text: '內容' }], polished_content: null }, T0);
+
+    expect(store.getCurrentTranscript('m-1')).toMatchObject({ source_kind: 'raw', source_edit_version: null });
+  });
+
+  it('升級前就存在的舊資料（legacy_unconfirmed_raw=1）標成 unknown，不假裝是 raw', () => {
+    // 這次升級前 PATCH 直接覆寫 segments，raw／edited 沒有分開，沒辦法回頭判斷這筆
+    // 究竟是模型原始輸出還是人改過的——標成 raw 是騙自己，unknown 才是「判不出來」的老實紀錄
+    newMeeting();
+    store.saveTranscript('m-1', { segments: [{ start: 0, end: 1, text: '可能被人改過的舊內容' }], polished_content: null }, T0);
+    // 模擬 migration 對「這次升級前就存在」的列做的標記
+    db.prepare('UPDATE transcripts SET legacy_unconfirmed_raw = 1 WHERE meeting_id = ?').run('m-1');
+
+    expect(store.getCurrentTranscript('m-1')).toMatchObject({ source_kind: 'unknown', source_edit_version: null });
+  });
+
+  it('就算是 legacy 資料，只要有人工編輯過，編輯版本優先於 unknown 標記', () => {
+    newMeeting();
+    store.saveTranscript('m-1', { segments: [{ start: 0, end: 1, text: '舊內容' }], polished_content: null }, T0);
+    db.prepare('UPDATE transcripts SET legacy_unconfirmed_raw = 1 WHERE meeting_id = ?').run('m-1');
+    store.updateTranscript('m-1', { segments: [{ start: 0, end: 1, text: '這次升級後才編輯過' }] }, T0 + 1);
+
+    expect(store.getCurrentTranscript('m-1')).toMatchObject({ source_kind: 'edited', source_edit_version: 1 });
+  });
+});
+
 describe('setTags', () => {
   it('寫進去再讀出來是排序過的同一組', () => {
     newMeeting();

@@ -502,7 +502,9 @@ export const createVaultProjector = (deps: VaultProjectorDeps) => {
     // 沒有的話（title 功能之前建立的舊會議、或標題抽取失敗）退回 overview（2026-09-21 裁決）
     const title = sanitizeTitle(meeting.title ?? analysis.overview);
 
-    const transcript = store.getTranscript(meetingId);
+    // 目前顯示的版本（人工編輯過就用編輯後的，見 CurrentTranscript），不是永遠不動的 raw：
+    // 人改過的時長／段落是使用者現在看到的事實
+    const transcript = store.getCurrentTranscript(meetingId);
     const durationMinutes = computeDurationMinutes(transcript?.segments ?? []);
     const seamReport = store.getSeamReport(meetingId);
     const needsReview = nameResolver.listNeedsReview(meetingId);

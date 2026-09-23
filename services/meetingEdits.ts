@@ -125,6 +125,17 @@ export function patchTranscriptRequest(
   const meeting = deps.store.getMeeting(meetingId);
   if (!meeting) return fail(404, `找不到 Meeting ${meetingId}`);
   if (isBusy(meeting.status)) return busyError(meetingId, meeting.status, '等它跑完再編輯');
+  // FAILED 目前只會是轉錄本身沒有完成（見 transcriptionPipeline.ts 的 runTranscriptionPhase／
+  // markFailed；分析失敗會退回 TRANSCRIBED，不會到這裡）。這種情況下 raw 可能只是部分逐字稿，
+  // 編輯它會落地一筆 transcript_edits；retry 續傳完成後新轉出來的內容接在 raw 後面，但
+  // getCurrentTranscript 永遠整份拿最新那筆編輯蓋過 raw，續傳補上的尾巴就會悄悄消失
+  // （Codex adversarial review 抓到）。擋在這裡：轉錄真的完成、到 TRANSCRIBED 之後才能編輯。
+  if (meeting.status === 'FAILED') {
+    return fail(
+      409,
+      `Meeting ${meetingId} 轉錄失敗尚未完成（可能只有部分逐字稿），重跑轉錄到 TRANSCRIBED 之後才能編輯`,
+    );
+  }
   if (!deps.store.getTranscript(meetingId)) {
     return fail(404, `Meeting ${meetingId} 還沒有逐字稿，轉錄完成後才能編輯`);
   }

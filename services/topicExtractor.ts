@@ -41,7 +41,9 @@ export function createTopicExtractor(deps: TopicExtractorDeps) {
    * 把一場分析成功的會標成 FAILED。寫入失敗則照拋——那代表資料庫壞了，不是模型的事。
    */
   const extract = async (meetingId: string): Promise<TopicExtractionSummary> => {
-    const transcript = store.getTranscript(meetingId);
+    // 跟 analyze() 讀同一個版本（getCurrentTranscript）：使用者訂正過的內容也該一起
+    // 反映在題目標籤上，不要一邊用編輯後的文字分析、一邊拿沒改過的 raw 抽標籤
+    const transcript = store.getCurrentTranscript(meetingId);
     if (!transcript || transcript.segments.length === 0) {
       // 走到這裡代表分析成功之後逐字稿不見了。這是真的壞掉，不是「抽不出標籤」，
       // 不能記成 failed 混在模型錯誤裡

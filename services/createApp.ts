@@ -21,11 +21,34 @@ import { NameResolver } from './nameResolver';
 import { MigrationRecord, isRejected, toMigrationRecord } from './jobMigration';
 import { GeminiServerClient } from './geminiServerClient';
 import { AudioFileStore } from './audioFileStore';
-import { TranscriptionQueue } from './transcriptionQueue';
 import { deleteMeetingRequest, isBusy, patchAnalysisRequest, patchTitleRequest, patchTranscriptRequest } from './meetingEdits';
 import { checkMeetingTitle } from './meetingTitle';
 import { TopicLinker } from './topicLinker';
 import { runProjection, VaultProjector } from './vaultProjector';
+
+/**
+ * `createApp` 對「有東西可以入列轉錄」的最小需求，不綁死是舊的記憶體 `TranscriptionQueue`
+ * 還是新的 `jobStore`（vault plan「MeetPilot · 轉錄分析佇列架構升級」）——`server.ts` 決定
+ * 給哪一個，這裡只用得到這兩個方法。`cancel` 特意不在這裡：舊佇列需要外部明講「這場不用跑了」
+ * 才會把記憶體裡的項目清掉；job table 的等價操作是刪 `meetings` 列本身的 cascade，
+ * `deleteMeetingRequest` 因此不再需要拿到佇列。
+ */
+export interface TranscriptionEnqueuer {
+  /** 已經在排隊或正在跑的同一場會不重複入列 */
+  enqueue(meetingId: string): void;
+  /** 這場會在不在佇列裡（排隊中或正在跑）——上傳／刪除擋衝突要用 */
+  has(meetingId: string): boolean;
+}
+
+/**
+ * 跟 `TranscriptionEnqueuer`同形狀，但入列的是分析 job（`POST /retry` 對 `TRANSCRIBED`
+ * 的會呼叫）。分開一個型別而不是共用同一個，是因為兩者入列的 job kind 不同，共用型別會讓
+ * 呼叫端誤把轉錄佇列傳進分析的位置——名字不同至少讓這種接錯線在讀 server.ts 接線時看得出來。
+ */
+export interface AnalysisEnqueuer {
+  enqueue(meetingId: string): void;
+  has(meetingId: string): boolean;
+}
 
 export interface AppDeps {
   listenConfig: ListenConfig;
@@ -35,7 +58,13 @@ export interface AppDeps {
   /** 人名比對（人名校正 N4／N5）。跟 peopleStore 同一個理由必填：`needs_review` 確認路由沒有它不成立 */
   nameResolver: NameResolver;
   audioStore: AudioFileStore;
-  transcriptionQueue: TranscriptionQueue;
+  transcriptionQueue: TranscriptionEnqueuer;
+  /**
+   * 分析佇列。`POST /retry` 對 `TRANSCRIBED` 的會呼叫這支重新排一次分析——跟轉錄失敗
+   * 退回 FAILED 不同，分析失敗退回 TRANSCRIBED 之後沒有自動路徑再排一次，這是唯一的入口
+   * （vault plan「MeetPilot · 轉錄分析佇列架構升級」，AC-4）。
+   */
+  analysisQueue: AnalysisEnqueuer;
   geminiClient: GeminiServerClient;
   llmLogger: LlmLogger;
   /** 跨會議關聯（W4）。null 代表這台 server 把關聯關掉了（`MEETPILOT_LINKING=off`） */
@@ -45,7 +74,10 @@ export interface AppDeps {
 }
 
 export function createApp(deps: AppDeps): express.Express {
-  const { listenConfig, meetingStore, peopleStore, nameResolver, audioStore, transcriptionQueue, geminiClient, llmLogger } = deps;
+  const {
+    listenConfig, meetingStore, peopleStore, nameResolver, audioStore,
+    transcriptionQueue, analysisQueue, geminiClient, llmLogger,
+  } = deps;
   const topicLinker = deps.topicLinker ?? null;
   const vaultProjector = deps.vaultProjector ?? null;
 
@@ -80,7 +112,10 @@ export function createApp(deps: AppDeps): express.Express {
   };
 
   const listNameMentionViews = (meetingId: string): NameMentionView[] => {
-    const transcript = meetingStore.getTranscript(meetingId);
+    // segment_index 是相對「analyze() 當時讀的那個版本」算的（見 transcriptionPipeline
+    // 的 getCurrentTranscript），這裡要用同一個版本查，不能查 raw——版本一旦不同，
+    // 索引對到的段落就是錯的
+    const transcript = meetingStore.getCurrentTranscript(meetingId);
     return nameResolver.listNeedsReview(meetingId).map((mention) => {
       const segmentText = transcript?.segments[mention.segment_index]?.text;
       if (typeof segmentText !== 'string') {
@@ -437,7 +472,9 @@ export function createApp(deps: AppDeps): express.Express {
       if (!meeting) return res.status(404).json({ error: `找不到 Meeting ${req.params.id}` });
       res.json({
         meeting: toView(meeting),
-        transcript: meetingStore.getTranscript(req.params.id),
+        // 目前顯示的版本（人工編輯過就是編輯後的），不是固定不變的 raw：PATCH 之後
+        // 重新整理要看得到剛存的修改，否則編輯功能形同寫進黑洞
+        transcript: meetingStore.getCurrentTranscript(req.params.id),
         analysis: meetingStore.getAnalysis(req.params.id),
         tags: meetingStore.getTags(req.params.id),
         // 題目標籤與上面的 tags 分成兩個欄位送（契約檔有寫為什麼不能併）
@@ -557,13 +594,30 @@ export function createApp(deps: AppDeps): express.Express {
 
   // 重跑失敗的會。processed_slices 不歸零：續傳游標就是為了不用把已經轉好的片再送一次，
   // 重跑一次失敗的分析不該連帶重跑兩小時的轉錄
+  //
+  // 兩種可重跑的狀態，各自對到不同的佇列（vault plan「MeetPilot · 轉錄分析佇列架構升級」AC-4）：
+  // FAILED 是轉錄失敗（job 重試次數用盡），退回 CREATED 重新入列轉錄；TRANSCRIBED 是分析失敗
+  // 退回來的落點（`runAnalysisPhase` 一律退回這裡，不管 job 重試次數有沒有用盡），逐字稿已經
+  // 在，不用重新轉錄，重新入列一個分析 job 就好，meeting 狀態本身不用改（worker claim 到之後
+  // 自己會轉 ANALYZING）。
   app.post('/api/meetings/:id/retry', (req, res) => {
     try {
       const meetingId = req.params.id;
       const meeting = meetingStore.getMeeting(meetingId);
       if (!meeting) return res.status(404).json({ error: `找不到 Meeting ${meetingId}` });
+
+      if (meeting.status === 'TRANSCRIBED') {
+        if (analysisQueue.has(meetingId)) {
+          return res.status(409).json({ error: `Meeting ${meetingId} 已經在分析佇列裡，正在等著跑` });
+        }
+        analysisQueue.enqueue(meetingId);
+        return res.status(202).json({ meeting: toView(meetingStore.getMeeting(meetingId)!) });
+      }
+
       if (meeting.status !== 'FAILED') {
-        return res.status(409).json({ error: `Meeting ${meetingId} 目前是 ${meeting.status}，只有 FAILED 能重跑` });
+        return res.status(409).json({
+          error: `Meeting ${meetingId} 目前是 ${meeting.status}，只有 FAILED 或 TRANSCRIBED 能重跑`,
+        });
       }
       if (!audioStore.exists(meetingId)) {
         return res.status(409).json({
@@ -583,10 +637,15 @@ export function createApp(deps: AppDeps): express.Express {
   });
 
   // 刪除整場會。規則與錯誤路徑在 services/meetingEdits.ts，這裡只把結果攤成 HTTP
+  //
+  // 不傳 queue：`meetings` 刪除時 `jobs` 表的對應列靠外鍵 `ON DELETE CASCADE` 自動清掉
+  // （`services/meetingDb.ts` 的 `jobs` 表定義），不像舊的記憶體 `TranscriptionQueue` 需要
+  // 外部明講一次「這場不用跑了」才會清掉排隊中的項目——job table 本身就是真相源，
+  // 刪除 meeting 這件事本身已經足夠
   app.delete('/api/meetings/:id', (req, res) => {
     try {
       const outcome = deleteMeetingRequest(
-        { store: meetingStore, audioStore, queue: transcriptionQueue, uploading },
+        { store: meetingStore, audioStore, uploading },
         req.params.id,
       );
       res.status(outcome.status).json(outcome.body);

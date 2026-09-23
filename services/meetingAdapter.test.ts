@@ -79,6 +79,7 @@ interface Expectation {
 const EXPECTED: Record<MeetingStatus, Expectation> = {
   CREATED: { jobStatus: JobStatus.PENDING, stageStatuses: [StepStatus.IDLE, StepStatus.IDLE, StepStatus.IDLE], currentStep: 0 },
   TRANSCRIBING: { jobStatus: JobStatus.RUNNING, stageStatuses: [StepStatus.PROCESSING, StepStatus.IDLE, StepStatus.IDLE], currentStep: 0 },
+  TRANSCRIBED: { jobStatus: JobStatus.RUNNING, stageStatuses: [StepStatus.SUCCESS, StepStatus.IDLE, StepStatus.IDLE], currentStep: 1 },
   ANALYZING: { jobStatus: JobStatus.RUNNING, stageStatuses: [StepStatus.SUCCESS, StepStatus.PROCESSING, StepStatus.IDLE], currentStep: 1 },
   READY: { jobStatus: JobStatus.COMPLETED, stageStatuses: [StepStatus.SUCCESS, StepStatus.SUCCESS, StepStatus.IDLE], currentStep: 2 },
   LINKING: { jobStatus: JobStatus.RUNNING, stageStatuses: [StepStatus.SUCCESS, StepStatus.SUCCESS, StepStatus.PROCESSING], currentStep: 2 },
@@ -91,7 +92,7 @@ const EXPECTED: Record<MeetingStatus, Expectation> = {
 describe('meetingToJob 的狀態對應', () => {
   it('這張表涵蓋 meetingState 宣告的每一個狀態', () => {
     expect(Object.keys(EXPECTED).sort()).toEqual([...MEETING_STATUSES].sort());
-    expect(MEETING_STATUSES).toHaveLength(8);
+    expect(MEETING_STATUSES).toHaveLength(9);
   });
 
   for (const status of MEETING_STATUSES) {
@@ -259,6 +260,15 @@ describe('polling 的停止條件與批次清除的名單（W3）', () => {
     ];
     const clearable = meetings.filter(m => !isMeetingInProgress(m)).map(m => m.meeting_id);
     expect(clearable).toEqual(['m_搬遷待上傳', 'm_完成']);
+  });
+
+  it('TRANSCRIBED 不在 BUSY_STATUSES 裡（逐字稿可編輯），但分析 job 可能還在排隊，仍要算處理中', () => {
+    // 這條專門釘住 isMeetingInProgress 對 TRANSCRIBED 的特判：用 isMeetingBusy 判斷的話
+    // 會誤判成已結束，polling 停掉，使用者看不到分析什麼時候真的開始
+    const transcribed = makeMeeting({ status: 'TRANSCRIBED' });
+    expect(isMeetingBusy('TRANSCRIBED')).toBe(false);
+    expect(isMeetingInProgress(transcribed)).toBe(true);
+    expect(hasMeetingsInProgress([transcribed])).toBe(true);
   });
 
   it('全部到終點就不再 poll', () => {
@@ -453,7 +463,7 @@ describe('處理中不讓編輯（配合 T1 的 V2）', () => {
   });
 
   it('其餘狀態可以編輯', () => {
-    for (const status of ['CREATED', 'READY', 'LINKED', 'LINK_FAILED', 'FAILED'] as const) {
+    for (const status of ['CREATED', 'TRANSCRIBED', 'READY', 'LINKED', 'LINK_FAILED', 'FAILED'] as const) {
       expect(isMeetingBusy(status)).toBe(false);
       expect(editBlockedReason(status)).toBeNull();
     }

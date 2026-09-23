@@ -69,6 +69,7 @@ function makeReadyMeeting(input: ReadyMeetingInput): string {
     { segments: input.segments ?? [{ start: 0, end: 600, text: '哈囉', speaker: 'Speaker 1' }], polished_content: null },
     T0,
   );
+  store.setStatus(id, 'TRANSCRIBED', T0);
   store.setStatus(id, 'ANALYZING', T0);
   store.saveAnalysis(
     id,

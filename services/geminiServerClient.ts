@@ -10,13 +10,32 @@
  * 全部照 server.ts 原樣搬過來，路由那邊只剩參數檢查與 res 的形狀。
  */
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { TranscriptSegment } from '../types';
 import { AnalysisModelOutput, assertAnalysisModelOutput } from './analysisContract';
+import { createConcurrencyLimiter } from './concurrencyLimiter';
 import { normalizeTranscribedSegments } from './transcribeSegments';
 import { LlmCallKind, LlmLogger } from './llmTelemetry';
 import { PairJudgement } from './topicLink';
+
+const DECIMAL_INTEGER = /^\d+$/;
+
+/**
+ * 兩條佇列（轉錄／分析）共用同一個 Gemini API project 的全域併發上限（AC-6，vault plan
+ * 「MeetPilot · 轉錄分析佇列架構升級」）。預設 2：今天完全序列，這個值不會改變任何現有行為，
+ * 只在兩條 queue 真的同時各跑一場會時才會擋到——調高前先查實際 Gemini 專案配額，
+ * 不是憑空的安全值（2026-09-22 查證：完全序列的今天，真實 log 就已經在撞 fallback）。
+ */
+function resolveGeminiMaxConcurrency(env: NodeJS.ProcessEnv): number {
+  const raw = (env.MEETPILOT_GEMINI_MAX_CONCURRENCY ?? '').trim();
+  if (raw === '') return 2;
+  if (!DECIMAL_INTEGER.test(raw) || Number(raw) < 1) {
+    throw new Error(`MEETPILOT_GEMINI_MAX_CONCURRENCY="${raw}" 必須是正整數，請修正 .env`);
+  }
+  return Number(raw);
+}
 
 /**
  * 會議記錄規範正本，`analyzeTranscript` 的 systemInstruction 從這裡讀（2026-09-20，
@@ -44,6 +63,13 @@ function loadAnalysisSpec(): string {
   }
   return raw;
 }
+
+/**
+ * 內容雜湊當版本號（`analyses.prompt_version`，vault plan「MeetPilot · 逐字稿版本分層與
+ * 來源標記」）。不維護人工版號檔：規範檔改了雜湊就變，比對得出「這筆分析是不是用現在這版
+ * 規範產的」，不用另外記一個容易忘記更新的數字。
+ */
+const hashContent = (text: string): string => createHash('sha256').update(text).digest('hex').slice(0, 12);
 
 // Lazy GoogleGenAI client
 let aiClient: GoogleGenAI | null = null;
@@ -172,6 +198,12 @@ export interface TranscribeSliceInput {
    * 範圍愈小同音誤配對的機率愈低，token 也愈省。
    */
   participantNames?: string[];
+  /**
+   * fallback 後這一片實際打中哪個模型（`transcripts.slice_models`，vault plan
+   * 「MeetPilot · 逐字稿版本分層與來源標記」）。只在成功時呼叫一次；呼叫端不給就不記，
+   * 假的測試 client 不用管這個欄位。
+   */
+  onModelUsed?: (model: string, attempt: number) => void;
 }
 
 export interface AnalyzeTranscriptInput {
@@ -181,6 +213,11 @@ export interface AnalyzeTranscriptInput {
   meetingId?: string;
   /** 同 `TranscribeSliceInput.participantNames`。只送名字，不含員編 */
   participantNames?: string[];
+  /**
+   * 這次分析實際打中哪個模型、規範檔當下的內容雜湊（`analyses.model`／`prompt_version`）。
+   * 只在成功時呼叫一次；呼叫端不給就不記。
+   */
+  onProvenance?: (info: { model: string; promptVersion: string }) => void;
 }
 
 /** 一條決議／待辦／未決事項的出處：段落編號範圍（1-based），跟送給模型的 `[#n ...]` 對應 */
@@ -370,6 +407,8 @@ export interface GeminiServerClient {
 export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClient {
   // 規範檔在建 client 的當下就讀，讀不到或空檔直接讓啟動失敗
   const analysisSpec = loadAnalysisSpec();
+  const analysisPromptVersion = hashContent(analysisSpec);
+  const geminiLimiter = createConcurrencyLimiter(resolveGeminiMaxConcurrency(process.env));
 
   // Generate content with automatic retry and model fallback for high availability
   async function generateContentWithFallback(
@@ -382,7 +421,12 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
       preferredModel?: string;
       validateResponse?: (response: any) => void;
     }
-  ): Promise<any> {
+  ): Promise<{ response: any; model: string; attempt: number }> {
+    // AC-6：整段（含 fallback 換模型與重試的 backoff 等待）都算「這次邏輯呼叫還在進行」，
+    // 一次 acquire／release 包到底，不是每個 attempt 各自搶一次——內部重試本來就是循序跑，
+    // 不是併發，包最外層改動最小也最好懂
+    await geminiLimiter.acquire();
+    try {
     const models = request.preferredModel
       ? [request.preferredModel, 'gemini-3.8-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest'].filter(
           (m, idx, arr) => arr.indexOf(m) === idx
@@ -418,7 +462,7 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
             response,
             configuredMaxOutputTokens: request.config?.maxOutputTokens ?? null,
           });
-          return response;
+          return { response, model, attempt: attempt + 1 };
         } catch (err: any) {
           lastError = err;
           // 兩種 transient 成因在這裡本來就是分開判斷的，記進紀錄時不要再壓平成同一個值：
@@ -453,6 +497,9 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
     }
 
     throw lastError;
+    } finally {
+      geminiLimiter.release();
+    }
   }
 
   return {
@@ -517,7 +564,7 @@ Output JSON format:
         }
       };
 
-      const response = await generateContentWithFallback(ai, {
+      const { response, model, attempt } = await generateContentWithFallback(ai, {
         kind: 'transcribe',
         meetingId,
         preferredModel: 'gemini-3.8-flash',
@@ -533,6 +580,7 @@ Output JSON format:
           }
         },
       });
+      input.onModelUsed?.(model, attempt);
 
       const rawText = typeof response.text === 'string' ? response.text : '';
       // 先剝 markdown 圍欄與前後雜訊再 parse。順序不能反過來拿原文判「像不像 JSON」：
@@ -592,7 +640,7 @@ Output JSON format:
       const ai = getAI();
       const fullText = formatTranscriptForAI(transcript);
 
-      const response = await generateContentWithFallback(ai, {
+      const { response } = await generateContentWithFallback(ai, {
         kind: 'polish',
         preferredModel: 'gemini-3.8-flash',
         contents: `請將以下會議逐字稿進行「全文修潤」。
@@ -636,7 +684,7 @@ ${fullText}`,
         meetingContext.trim() ? `背景補充：${meetingContext}` : null,
       ].filter((line): line is string => line !== null);
 
-      const response = await generateContentWithFallback(ai, {
+      const { response, model } = await generateContentWithFallback(ai, {
         kind: 'analyze',
         meetingId,
         preferredModel: 'gemini-3.8-flash',
@@ -666,13 +714,14 @@ ${formatTranscriptForAnalysis(transcript)}`,
       const jsonStr = cleanJsonString(response.text);
       const parsed = JSON.parse(jsonStr);
       assertAnalysisModelOutput(parsed);
+      input.onProvenance?.({ model, promptVersion: analysisPromptVersion });
       return parsed;
     },
 
     async extractTopicTags(input: { transcript: TranscriptSegment[]; meetingId?: string }): Promise<ExtractedTopicTag[]> {
       const ai = getAI();
 
-      const response = await generateContentWithFallback(ai, {
+      const { response } = await generateContentWithFallback(ai, {
         kind: 'extract-tags',
         meetingId: input.meetingId,
         // 不指定 preferredModel：fallback 鏈就是評測跑出 15 到 25 那個結果時用的那條
@@ -812,7 +861,7 @@ ${formatTranscriptForAnalysis(transcript)}`,
     async judgeMeetingPair(input: JudgeMeetingPairInput): Promise<PairJudgement> {
       const ai = getAI();
 
-      const response = await generateContentWithFallback(ai, {
+      const { response } = await generateContentWithFallback(ai, {
         kind: 'link-judge',
         // 記 idA：呼叫端（TopicLinker.link）一律傳「正在跑關聯的那場會」當 idA，
         // 這通呼叫的額度算在它頭上，跟 idB（被比對的歷史會議）無關

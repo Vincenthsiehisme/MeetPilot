@@ -11,16 +11,33 @@ import { createNameResolver } from './services/nameResolver';
 import { createGeminiServerClient } from './services/geminiServerClient';
 import { createAudioFileStore, resolveAudioDir } from './services/audioFileStore';
 import { createAudioSlicer, resolveFfmpegPaths } from './services/audioSlicer';
-import { createTranscriptionPipeline, requeueInterruptedMeetings } from './services/transcriptionPipeline';
+import { backfillInterruptedMeetings, createTranscriptionPipeline } from './services/transcriptionPipeline';
 import { createTopicExtractor } from './services/topicExtractor';
 import { createTopicLinker, isLinkingEnabled } from './services/topicLinker';
 import { resolveSeamRepairConfig } from './services/seamRepair';
-import { createTranscriptionQueue } from './services/transcriptionQueue';
+import { createJobStore } from './services/jobStore';
+import { createJobWorker } from './services/jobWorker';
 import { createApp } from './services/createApp';
 import { createVaultProjector, resolveVaultDir } from './services/vaultProjector';
 
 // 這個檔只做三件事：把真的依賴組出來、交給 createApp、listen。
 // 路由與 middleware 全部在 services/createApp.ts，理由見那個檔的檔頭（測得動）。
+
+const DECIMAL_INTEGER = /^\d+$/;
+
+/**
+ * 轉錄／分析各自可以同時跑幾場會（vault plan「MeetPilot · 轉錄分析佇列架構升級」）。
+ * 預設都是 1，沿用升級前完全序列的行為——拆解本身的價值先體現在「失敗互不阻塞、可以獨立
+ * 重跑」，調高併發是可選的加值，不是升級當天就要開。
+ */
+function resolveJobConcurrency(env: NodeJS.ProcessEnv, key: string): number {
+  const raw = (env[key] ?? '').trim();
+  if (raw === '') return 1;
+  if (!DECIMAL_INTEGER.test(raw) || Number(raw) < 1) {
+    throw new Error(`${key}="${raw}" 必須是正整數，請修正 .env`);
+  }
+  return Number(raw);
+}
 
 // 監聽設定在啟動時就解析：HOST 不是本機位址又沒設 Basic Auth 會在這裡直接拋錯，不進 listen
 const listenConfig = resolveListenConfig(process.env);
@@ -94,8 +111,86 @@ const transcriptionPipeline = createTranscriptionPipeline({
   topicLinker,
   vaultProjector,
 });
-// in-process 序列佇列：同一時間只跑一場會（理由見 services/transcriptionQueue.ts 檔頭）
-const transcriptionQueue = createTranscriptionQueue(transcriptionPipeline.run);
+// job table：轉錄與分析各自一條持久化 queue（vault plan「MeetPilot · 轉錄分析佇列架構升級」）。
+// 跟 meetingStore 共用同一個 DB 檔案（jobs 表對 meetings 的外鍵靠它做 cascade 刪除）。
+const jobStore = createJobStore(meetingDb);
+
+// lease 要蓋過一次完整執行最壞情況的時間，寧可設寬也不要讓還在跑的 job 被錯誤回收
+// （單一 process 下提早回收會導致同一場會被兩個呼叫同時跑，見 jobStore.ts 的 CAS 說明）。
+// 轉錄可能是好幾小時的長會逐片轉，分析是一次 Gemini 呼叫加關聯與投影，正常應該在幾分鐘內完成。
+const TRANSCRIPTION_LEASE_MS = 3 * 60 * 60_000;
+const ANALYSIS_LEASE_MS = 30 * 60_000;
+
+// analysisWorker 要給 transcriptionWorker 的 onSuccess 用（轉錄完自動接著排分析），
+// 兩個 worker 互相不呼叫對方，只是轉錄成功時「順手 enqueue 一個分析 job」，用 let 處理宣告順序
+let analysisWorker: ReturnType<typeof createJobWorker>;
+
+const transcriptionWorker = createJobWorker({
+  jobs: jobStore,
+  kind: 'transcription',
+  concurrency: resolveJobConcurrency(process.env, 'MEETPILOT_TRANSCRIPTION_CONCURRENCY'),
+  workerId: `transcription-${process.pid}`,
+  leaseMs: TRANSCRIPTION_LEASE_MS,
+  run: (meetingId) => transcriptionPipeline.runTranscriptionPhase(meetingId),
+  onSuccess: (meetingId) => {
+    // 轉錄完自動接著排分析（今天的行為：轉完自動分析）。這裡才第一次讀「目前顯示的版本」，
+    // 幾乎必然是 raw——PATCH 要等到 TRANSCRIBED 之後才會放行，而這個 onSuccess 是轉錄一成功
+    // 就同步觸發的，中間沒有時間窗讓使用者搶進來編輯
+    const transcript = meetingStore.getCurrentTranscript(meetingId);
+    jobStore.enqueue(
+      meetingId, 'analysis',
+      { source_kind: transcript?.source_kind ?? 'raw', source_edit_version: transcript?.source_edit_version ?? null },
+      Date.now(),
+    );
+    analysisWorker.poke();
+  },
+  onFailure: (meetingId, outcome, err) => {
+    console.error(`[Transcription Worker] Meeting ${meetingId} 轉錄失敗（${outcome}）：`, err);
+    if (outcome === 'failed') {
+      transcriptionPipeline.markTranscriptionFailed(
+        meetingId, err instanceof Error ? err.message : String(err),
+      );
+    }
+    // outcome === 'queued'：meeting 還停在 TRANSCRIBING，worker 下一輪 tick 會自動撿回來重試
+    // （不用在這裡做什麼；見 jobWorker.ts 的 runOne 檔頭關於「沒有 backoff」的說明）
+  },
+});
+
+analysisWorker = createJobWorker({
+  jobs: jobStore,
+  kind: 'analysis',
+  concurrency: resolveJobConcurrency(process.env, 'MEETPILOT_ANALYSIS_CONCURRENCY'),
+  workerId: `analysis-${process.pid}`,
+  leaseMs: ANALYSIS_LEASE_MS,
+  run: (meetingId, payload) => transcriptionPipeline.runAnalysisPhase(meetingId, payload),
+  onFailure: (meetingId, outcome, err) => {
+    console.error(`[Analysis Worker] Meeting ${meetingId} 分析失敗（${outcome}）：`, err);
+    // runAnalysisPhase 自己已經把 meeting 退回 TRANSCRIBED（不管 outcome 是 queued 還是
+    // failed，那支都是正確的落點），這裡不用再做什麼
+  },
+});
+
+// 給 createApp 的最小介面：只需要 enqueue／has，見 services/createApp.ts 的
+// TranscriptionEnqueuer／AnalysisEnqueuer
+const transcriptionQueue = {
+  enqueue: (meetingId: string): void => {
+    jobStore.enqueue(meetingId, 'transcription', null, Date.now());
+    transcriptionWorker.poke();
+  },
+  has: (meetingId: string): boolean => jobStore.hasActive(meetingId, 'transcription'),
+};
+const analysisQueue = {
+  enqueue: (meetingId: string): void => {
+    const transcript = meetingStore.getCurrentTranscript(meetingId);
+    jobStore.enqueue(
+      meetingId, 'analysis',
+      { source_kind: transcript?.source_kind ?? 'raw', source_edit_version: transcript?.source_edit_version ?? null },
+      Date.now(),
+    );
+    analysisWorker.poke();
+  },
+  has: (meetingId: string): boolean => jobStore.hasActive(meetingId, 'analysis'),
+};
 
 const app = createApp({
   listenConfig,
@@ -104,6 +199,7 @@ const app = createApp({
   nameResolver,
   audioStore,
   transcriptionQueue,
+  analysisQueue,
   geminiClient,
   llmLogger,
   topicLinker,
@@ -132,25 +228,54 @@ async function startServer() {
     console.log(`[MeetPilot] 清掉 ${removedPartials.length} 個沒上傳完的暫存音檔：${removedPartials.join(', ')}`);
   }
 
-  // 佇列在記憶體裡，server 一重啟就空了。停在 TRANSCRIBING 的那幾場不掃回來的話，
-  // 畫面上會永遠顯示轉錄中而其實沒有人在跑它
-  const resume = requeueInterruptedMeetings({
-    store: meetingStore,
-    audioStore,
-    enqueue: (meetingId: string) => transcriptionQueue.enqueue(meetingId),
-  });
-  if (resume.requeued.length > 0) {
-    console.log(`[MeetPilot] 續傳 ${resume.requeued.length} 場未跑完的會：${resume.requeued.join(', ')}`);
+  // job table 是持久化的，但「這個 process 還活著在跑它」這件事本身不是——server 一重啟，
+  // 上一輪停在 claimed／running 的 job 一定是上一個 process 死掉留下的（單一 process 前提，
+  // 見 jobStore.reclaimAllActive 的檔頭），先無條件全部回收。
+  const reclaimed = jobStore.reclaimAllActive(Date.now());
+  for (const { job, outcome } of reclaimed) {
+    if (job.kind === 'analysis') {
+      // runAnalysisPhase 的前置條件是 TRANSCRIBED；job 中斷代表這次分析沒跑完，
+      // 不管等一下會不會重試，都要先把 meeting 退回去，這支同時是兩種 outcome 的正確落點
+      transcriptionPipeline.markAnalysisFailed(
+        job.meeting_id,
+        new Error(outcome === 'failed' ? '分析多次中斷失敗（server 重啟），已用盡重試次數' : 'server 重啟前這次分析沒跑完'),
+      );
+    } else if (outcome === 'failed') {
+      transcriptionPipeline.markTranscriptionFailed(job.meeting_id, '轉錄多次中斷失敗（server 重啟），已用盡重試次數');
+    }
+    // kind === 'transcription' && outcome === 'queued'：meeting 已經在 TRANSCRIBING，
+    // 不用做什麼，worker 重新 claim 到之後 runTranscriptionPhase 會靠 processed_slices 續傳
   }
-  for (const failure of resume.failed) {
-    console.warn(`[MeetPilot] Meeting ${failure.meetingId} 轉為 FAILED：${failure.reason}`);
-  }
-  if (resume.waitingForAudio.length > 0) {
+  if (reclaimed.length > 0) {
     console.log(
-      `[MeetPilot] ${resume.waitingForAudio.length} 場會建立了但音檔還沒上傳，維持 CREATED 等上傳：`
-      + resume.waitingForAudio.join(', '),
+      `[MeetPilot] 回收 ${reclaimed.length} 個上次沒跑完的 job：`
+      + reclaimed.map(r => `${r.job.meeting_id}(${r.job.kind}→${r.outcome})`).join(', '),
     );
   }
+
+  // 回收完，再幫「沒有 active job 顧著」的在途會議補一筆——這次升級前就卡住的舊資料，
+  // 或極短的競態窗口（見 backfillInterruptedMeetings 檔頭）
+  const backfill = backfillInterruptedMeetings({ store: meetingStore, jobs: jobStore, audioStore });
+  if (backfill.transcriptionRequeued.length > 0) {
+    console.log(`[MeetPilot] 補上轉錄 job：${backfill.transcriptionRequeued.join(', ')}`);
+  }
+  if (backfill.analysisRequeued.length > 0) {
+    console.log(`[MeetPilot] 補上分析 job：${backfill.analysisRequeued.join(', ')}`);
+  }
+  for (const failure of backfill.failed) {
+    console.warn(`[MeetPilot] Meeting ${failure.meetingId} 轉為 FAILED：${failure.reason}`);
+  }
+  if (backfill.waitingForAudio.length > 0) {
+    console.log(
+      `[MeetPilot] ${backfill.waitingForAudio.length} 場會建立了但音檔還沒上傳，維持 CREATED 等上傳：`
+      + backfill.waitingForAudio.join(', '),
+    );
+  }
+
+  // 回收與補齊都是直接寫 job table，不是呼叫 transcriptionQueue.enqueue／analysisQueue.enqueue，
+  // 不會自動觸發 worker 去搶——啟動流程的最後手動 poke 兩個 worker 一次
+  transcriptionWorker.poke();
+  analysisWorker.poke();
 
   const { host, port, basicAuth } = listenConfig;
   app.listen(port, host, () => {

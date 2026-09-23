@@ -4,7 +4,8 @@ import { MEETING_STATUSES, assertTransition, canTransition, isMeetingStatus, leg
 describe('canTransition', () => {
   it('照 SDD 1.4 的主線放行', () => {
     expect(canTransition('CREATED', 'TRANSCRIBING')).toBe(true);
-    expect(canTransition('TRANSCRIBING', 'ANALYZING')).toBe(true);
+    expect(canTransition('TRANSCRIBING', 'TRANSCRIBED')).toBe(true);
+    expect(canTransition('TRANSCRIBED', 'ANALYZING')).toBe(true);
     expect(canTransition('ANALYZING', 'READY')).toBe(true);
     expect(canTransition('READY', 'LINKING')).toBe(true);
     expect(canTransition('LINKING', 'LINKED')).toBe(true);
@@ -16,6 +17,13 @@ describe('canTransition', () => {
     expect(canTransition('CREATED', 'ANALYZING')).toBe(false);
     expect(canTransition('TRANSCRIBING', 'READY')).toBe(false);
     expect(canTransition('READY', 'LINKED')).toBe(false);
+    // 轉錄與分析拆成兩條獨立 queue 之後，TRANSCRIBING 不能再一步跳到 ANALYZING，
+    // 中間一定要先落地 TRANSCRIBED
+    expect(canTransition('TRANSCRIBING', 'ANALYZING')).toBe(false);
+  });
+
+  it('ANALYZING 重試用盡可以退回 TRANSCRIBED，不連坐已成功的轉錄結果', () => {
+    expect(canTransition('ANALYZING', 'TRANSCRIBED')).toBe(true);
   });
 
   it('READY 與 LINKED 是分開的狀態，不能互相取代（D-002）', () => {
@@ -74,10 +82,12 @@ describe('legalNextStates', () => {
 });
 
 describe('isMeetingStatus', () => {
-  it('只認八個狀態', () => {
+  it('只認九個狀態', () => {
     expect(isMeetingStatus('READY')).toBe(true);
+    expect(isMeetingStatus('TRANSCRIBED')).toBe(true);
     expect(isMeetingStatus('COMPLETED')).toBe(false);
     expect(isMeetingStatus('')).toBe(false);
     expect(isMeetingStatus(undefined)).toBe(false);
+    expect(MEETING_STATUSES).toHaveLength(9);
   });
 });

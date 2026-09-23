@@ -13,7 +13,6 @@ import { MeetingStore, createMeetingStore } from './meetingStore';
 import { PeopleStore, createPeopleStore } from './peopleStore';
 import { NameResolver, createNameResolver } from './nameResolver';
 import { MATCH_KEY_VERSION } from './topicTag';
-import { TranscriptionQueue } from './transcriptionQueue';
 import { TopicLinker } from './topicLinker';
 import { createVaultProjector, VaultProjector } from './vaultProjector';
 
@@ -36,6 +35,7 @@ let server: Server;
 let url: string;
 let enqueued: string[];
 let cancelled: string[];
+let analysisEnqueued: string[];
 
 const fakeGemini = (): GeminiServerClient => ({
   transcribeSlice: async () => [],
@@ -49,20 +49,34 @@ const fakeGemini = (): GeminiServerClient => ({
   judgeMeetingPair: async () => ({ sameTopic: false, confidence: 0, reason: '假的判定', sharedTopics: [] }),
 });
 
+/**
+ * 只需要 `TranscriptionEnqueuer` 的最小介面（enqueue／has），`cancel` 多留著是因為部分
+ * 舊測試仍會斷言它有沒有被呼叫（見 DELETE 路由那條，現在斷言的是「不會被呼叫」）。
+ */
+interface FakeTranscriptionQueue {
+  enqueue(meetingId: string): void;
+  has(meetingId: string): boolean;
+  cancel(meetingId: string): boolean;
+}
+
 // 假佇列預設模仿真實佇列的同步行為：enqueue 會一路跑到 pipeline 的第一個 await，
 // 那時狀態已經被改成 TRANSCRIBING。S5 要驗的就是回應有沒有反映這件事
-const fakeQueue = (onEnqueue?: (id: string) => void, queued: string[] = []): TranscriptionQueue => ({
+const fakeQueue = (onEnqueue?: (id: string) => void, queued: string[] = []): FakeTranscriptionQueue => ({
   enqueue: (id: string) => { enqueued.push(id); onEnqueue?.(id); },
   has: (id: string) => queued.includes(id),
   cancel: (id: string) => { cancelled.push(id); return true; },
-  pending: 0,
-  running: null,
-  whenIdle: async () => {},
+});
+
+/** 分析佇列的假實作，只需要 AnalysisEnqueuer 的最小介面（enqueue／has） */
+const fakeAnalysisQueue = (queued: string[] = []): { enqueue(id: string): void; has(id: string): boolean } => ({
+  enqueue: (id: string) => { analysisEnqueued.push(id); },
+  has: (id: string) => queued.includes(id),
 });
 
 const startWith = async (options: {
   listenConfig?: Partial<ListenConfig>;
-  queue?: TranscriptionQueue;
+  queue?: FakeTranscriptionQueue;
+  analysisQueue?: { enqueue(id: string): void; has(id: string): boolean };
   audioStore?: AudioFileStore;
   topicLinker?: TopicLinker | null;
   vaultProjector?: VaultProjector | null;
@@ -83,6 +97,7 @@ const startWith = async (options: {
     transcriptionQueue: options.queue ?? fakeQueue(id => {
       if (store.getMeeting(id)?.status === 'CREATED') store.setStatus(id, 'TRANSCRIBING', Date.now());
     }),
+    analysisQueue: options.analysisQueue ?? fakeAnalysisQueue(),
     geminiClient: fakeGemini(),
     llmLogger: { log: () => {} },
     // 預設不給 linker：既有的測試不該因為 W4 多出一條背景呼叫而改變行為
@@ -97,7 +112,8 @@ const startWith = async (options: {
 
 const start = (options: {
   listenConfig?: Partial<ListenConfig>;
-  queue?: TranscriptionQueue;
+  queue?: FakeTranscriptionQueue;
+  analysisQueue?: { enqueue(id: string): void; has(id: string): boolean };
   topicLinker?: TopicLinker | null;
   vaultProjector?: VaultProjector | null;
 } = {}) =>
@@ -136,6 +152,7 @@ beforeEach(() => {
   audioStore = createAudioFileStore(audioDir);
   enqueued = [];
   cancelled = [];
+  analysisEnqueued = [];
 });
 
 afterEach(async () => {
@@ -520,6 +537,7 @@ describe('GET /api/meetings/:id 的 participantIds／nameMentions（人名校正
     store.setStatus(meetingId, 'TRANSCRIBING', T0);
     store.saveTranscript(meetingId, { segments: [{ start: 0, end: 5, text: '小明報告進度' }], polished_content: null }, T0);
     nameResolver.resolveTranscript(meetingId, [{ start: 0, end: 5, text: '小明報告進度' }], T0);
+    store.setStatus(meetingId, 'TRANSCRIBED', T0);
     store.setStatus(meetingId, 'ANALYZING', T0);
     store.setStatus(meetingId, 'READY', T0);
 
@@ -556,6 +574,7 @@ describe('GET /api/meetings/:id 的 participantIds／nameMentions（人名校正
     store.setStatus(meetingId, 'TRANSCRIBING', T0);
     store.saveTranscript(meetingId, { segments: [{ start: 0, end: 5, text: 'Tina 說明狀況' }], polished_content: null }, T0);
     nameResolver.resolveTranscript(meetingId, [{ start: 0, end: 5, text: 'Tina 說明狀況' }], T0);
+    store.setStatus(meetingId, 'TRANSCRIBED', T0);
     store.setStatus(meetingId, 'ANALYZING', T0);
     store.setStatus(meetingId, 'READY', T0);
 
@@ -583,6 +602,7 @@ describe('GET /api/meetings/:id 的 participantIds／nameMentions（人名校正
     const meetingId = created.body.meeting.meeting_id;
     store.setStatus(meetingId, 'TRANSCRIBING', T0);
     store.saveTranscript(meetingId, { segments: [{ start: 0, end: 5, text: '討論預算' }], polished_content: null }, T0);
+    store.setStatus(meetingId, 'TRANSCRIBED', T0);
     store.setStatus(meetingId, 'ANALYZING', T0);
     store.saveAnalysis(meetingId, {
       contract_version: 3, overview: '摘要', topics: [], open_questions: [],
@@ -659,7 +679,10 @@ describe('GET /api/meetings/:id 的 participantIds／nameMentions（人名校正
       const created = await createMeeting();
       const meetingId = created.body.meeting.meeting_id;
       store.setStatus(meetingId, 'TRANSCRIBING', T0);
-      if (status === 'ANALYZING' || status === 'LINKING') store.setStatus(meetingId, 'ANALYZING', T0);
+      if (status === 'ANALYZING' || status === 'LINKING') {
+        store.setStatus(meetingId, 'TRANSCRIBED', T0);
+        store.setStatus(meetingId, 'ANALYZING', T0);
+      }
       if (status === 'LINKING') {
         store.setStatus(meetingId, 'READY', T0);
         store.setStatus(meetingId, 'LINKING', T0);
@@ -754,14 +777,16 @@ describe('POST /api/meetings/:id/retry', () => {
 });
 
 describe('DELETE /api/meetings/:id', () => {
-  it('刪掉會議時順手把排隊中的那筆從佇列移除', async () => {
+  it('刪掉會議成功，不需要另外通知佇列——job table 靠外鍵 cascade 自動清掉排隊中的項目', async () => {
+    // 跟舊版記憶體 TranscriptionQueue 不同：這裡不再呼叫 queue.cancel()（deleteMeetingRequest
+    // 沒有拿到 queue 這個依賴，見 createApp.ts 那條路由的註解），`cancelled` 因此保持空陣列
     await start({ queue: fakeQueue() });
     store.createMeeting({ meeting_id: 'm-1', created_at: T0 });
 
     const res = await fetch(`${url}/api/meetings/m-1`, { method: 'DELETE' });
 
     expect(res.status).toBe(200);
-    expect(cancelled).toEqual(['m-1']);
+    expect(cancelled).toEqual([]);
     expect(store.getMeeting('m-1')).toBeNull();
   });
 });
@@ -772,6 +797,7 @@ describe('W4：關聯的路由', () => {
     for (const id of ['m-1', 'm-2']) {
       store.createMeeting({ meeting_id: id, created_at: Date.now(), source_file_name: 'a.m4a', source_file_size: 1 });
       store.setStatus(id, 'TRANSCRIBING', Date.now());
+      store.setStatus(id, 'TRANSCRIBED', Date.now());
       store.setStatus(id, 'ANALYZING', Date.now());
       store.setStatus(id, 'READY', Date.now());
     }
@@ -899,6 +925,7 @@ describe('W5：PATCH 逐字稿／分析之後同步重投影', () => {
     store.createMeeting({ meeting_id: id, created_at: T0, source_file_name: 'a.m4a', source_file_size: 1 });
     store.setStatus(id, 'TRANSCRIBING', T0);
     store.saveTranscript(id, { segments: [{ start: 0, end: 60, text: '第一版逐字稿' }], polished_content: null }, T0);
+    store.setStatus(id, 'TRANSCRIBED', T0);
     store.setStatus(id, 'ANALYZING', T0);
     store.saveAnalysis(id, {
       contract_version: 3, overview: '第一版標題', topics: [],
@@ -1013,6 +1040,7 @@ describe('PATCH /api/meetings/:id/title', () => {
   const readyMeeting = (id = 'm-1') => {
     store.createMeeting({ meeting_id: id, created_at: T0, source_file_name: 'a.m4a', source_file_size: 1 });
     store.setStatus(id, 'TRANSCRIBING', T0);
+    store.setStatus(id, 'TRANSCRIBED', T0);
     store.setStatus(id, 'ANALYZING', T0);
     store.setStatus(id, 'READY', T0);
   };
