@@ -11,6 +11,7 @@
 
 export type MeetingStatus =
   | 'CREATED'
+  | 'RECORDING'
   | 'TRANSCRIBING'
   | 'TRANSCRIBED'
   | 'ANALYZING'
@@ -21,7 +22,7 @@ export type MeetingStatus =
   | 'FAILED';
 
 export const MEETING_STATUSES: readonly MeetingStatus[] = [
-  'CREATED', 'TRANSCRIBING', 'TRANSCRIBED', 'ANALYZING', 'READY', 'LINKING', 'LINKED', 'LINK_FAILED', 'FAILED',
+  'CREATED', 'RECORDING', 'TRANSCRIBING', 'TRANSCRIBED', 'ANALYZING', 'READY', 'LINKING', 'LINKED', 'LINK_FAILED', 'FAILED',
 ];
 
 export const isMeetingStatus = (value: unknown): value is MeetingStatus =>
@@ -40,8 +41,14 @@ export const isMeetingStatus = (value: unknown): value is MeetingStatus =>
 // FAILED，不連坐已經成功的轉錄結果（跟 topicLinker／關聯失敗不阻塞 READY 可見性同一個
 // 精神）——逐字稿還在、還能看、還能手動重跑分析。轉錄本身失敗維持退回 FAILED：沒有可用
 // 的 raw，沒東西可留。
+//
+// RECORDING 是「webapp 叫本機語音備忘錄在錄」的那段時間（vault plan「MeetPilot · 網頁錄音」）。
+// 停止後取回音檔成功就直接進 TRANSCRIBING，跟 PUT audio 收完檔同一個落點；取回失敗或開始
+// 錄音失敗退回 CREATED，不進 FAILED：這場會什麼都還沒跑，語音備忘錄裡的錄音也還在，
+// 退回 CREATED 之後畫面會給「補上音檔」入口，使用者把那支錄音拖進來就能接著跑。
 const ALLOWED: Record<MeetingStatus, readonly MeetingStatus[]> = {
-  CREATED: ['TRANSCRIBING'],
+  CREATED: ['TRANSCRIBING', 'RECORDING'],
+  RECORDING: ['TRANSCRIBING', 'CREATED'],
   TRANSCRIBING: ['TRANSCRIBED'],
   TRANSCRIBED: ['ANALYZING'],
   ANALYZING: ['READY', 'TRANSCRIBED'],

@@ -27,6 +27,7 @@ import {
   PatchTranscriptResponse,
   PeopleListResponse,
   PersonSummary,
+  RecordingAvailabilityResponse,
 } from './meetingApi';
 
 async function requestJson<T>(endpoint: string, init: RequestInit): Promise<T> {
@@ -204,4 +205,23 @@ export const submitAudio = async (
   });
   if (onCreated) onCreated(created);
   return uploadAudio(created.meeting_id, file);
+};
+
+/** 這台 server 能不能叫語音備忘錄錄音（vault plan「MeetPilot · 網頁錄音」）。不能的時候帶原因 */
+export const getRecordingAvailability = (): Promise<RecordingAvailabilityResponse> =>
+  requestJson<RecordingAvailabilityResponse>('/api/recording/availability', { method: 'GET' });
+
+/** 叫語音備忘錄開始錄。會議要先用 createMeeting 建好（與會者必填）；失敗時 server 已經把它退回 CREATED */
+export const startRecording = async (meetingId: string): Promise<MeetingView> => {
+  const data = await requestJson<MeetingResponse>(meetingPath(meetingId, '/recording/start'), { method: 'POST' });
+  return data.meeting;
+};
+
+/**
+ * 叫語音備忘錄停止、取回錄音、送進轉錄。要等取檔與比對跑完才回，錄音越長越久。
+ * 取回的不是這場會的錄音時 server 回 422，訊息裡帶原因與退路（從語音備忘錄把檔拖進來），原樣顯示
+ */
+export const stopRecording = async (meetingId: string): Promise<MeetingView> => {
+  const data = await requestJson<MeetingResponse>(meetingPath(meetingId, '/recording/stop'), { method: 'POST' });
+  return data.meeting;
 };

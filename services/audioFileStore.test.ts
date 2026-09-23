@@ -3,7 +3,7 @@ import express from 'express';
 import { createServer, Server } from 'node:http';
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { Readable } from 'node:stream';
 import { AudioFileStore, createAudioFileStore, resolveAudioDir } from './audioFileStore';
 import { checkBasicAuth, createRateLimiter } from './httpGuards';
@@ -161,6 +161,28 @@ describe('removePartialUploads', () => {
 
   it('目錄乾淨時回空陣列，不拋錯', () => {
     expect(store.removePartialUploads()).toEqual([]);
+  });
+
+  it('語音備忘錄取檔留下的 _part 暫存檔一起清掉', async () => {
+    await store.saveFrom('m-done', Readable.from([Buffer.from('RIFF')]));
+    const temp = store.tempPathFor('m-rec');
+    writeFileSync(temp, 'half');
+    expect(store.removePartialUploads()).toEqual([temp]);
+    expect(store.exists('m-done')).toBe(true);
+  });
+});
+
+describe('tempPathFor', () => {
+  it('在音檔目錄裡、每次唯一、整個檔名沒有點（shortcuts 遇到不認得的副檔名會安靜不寫檔）', () => {
+    const a = store.tempPathFor('m-1');
+    const b = store.tempPathFor('m-1');
+    expect(a).not.toBe(b);
+    expect(a.startsWith(`${dir}/`)).toBe(true);
+    expect(basename(a)).not.toContain('.');
+  });
+
+  it('不合法的 meeting_id 拋錯，跟 pathFor 同一條規則', () => {
+    expect(() => store.tempPathFor('../evil')).toThrow(/不能當成檔名/);
   });
 });
 

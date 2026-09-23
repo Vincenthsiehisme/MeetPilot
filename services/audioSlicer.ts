@@ -11,6 +11,8 @@
  * 是兩件事，後者不該擋住前者的測試。
  */
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { renameSync, rmSync } from 'node:fs';
 
 /** 一片的計畫。時間是相對整個音檔的絕對秒數，durationSeconds 含 overlap */
 export interface SlicePlanEntry {
@@ -141,23 +143,59 @@ export function createAudioSlicer(options: AudioSlicerOptions) {
     return result;
   };
 
-  return {
-    /** 用 ffprobe 讀總長度。讀不出有限正數（0、NaN、Infinity）就拋錯，不回 0 也不回 Infinity：
-     *  那兩個值拿去當切片迴圈的上限，一個切不出東西、一個永遠不停 */
-    probeDurationSeconds: async (filePath: string): Promise<number> => {
-      const result = await run(
-        options.ffprobePath,
-        ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', filePath],
-        'ffprobe 讀取音訊長度',
+  const readRawDuration = async (filePath: string): Promise<string> => {
+    const result = await run(
+      options.ffprobePath,
+      ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', filePath],
+      'ffprobe 讀取音訊長度',
+    );
+    return result.stdout.toString('utf8').trim();
+  };
+
+  // 讀不出有限正數（0、NaN、Infinity）就拋錯，不回 0 也不回 Infinity：
+  // 那兩個值拿去當切片迴圈的上限，一個切不出東西、一個永遠不停
+  const parseDuration = (raw: string, filePath: string): number => {
+    const duration = Number(raw);
+    if (!isPositiveFinite(duration)) {
+      throw new Error(
+        `ffprobe 沒有回出有限正數的長度（拿到 ${JSON.stringify(raw)}），無法切片：${filePath}`,
       );
-      const raw = result.stdout.toString('utf8').trim();
-      const duration = Number(raw);
-      if (!isPositiveFinite(duration)) {
-        throw new Error(
-          `ffprobe 沒有回出有限正數的長度（拿到 ${JSON.stringify(raw)}），無法切片：${filePath}`,
+    }
+    return duration;
+  };
+
+  return {
+    /**
+     * 用 ffprobe 讀總長度；容器裡沒寫長度（ffprobe 回 `N/A`）時，先原地 remux 一次再讀。
+     *
+     * 瀏覽器 `MediaRecorder` 錄的 webm 沒有 Duration 也沒有 Cues，ffprobe 讀不到長度，
+     * 拖曳上傳這種檔原本會在轉錄一開始就 FAILED。2026-09-23 實測：同一支檔 `ffmpeg -c copy`
+     * 之後長度讀得到（vault plan「MeetPilot · 網頁錄音」AC-7）。
+     *
+     * 只救 `N/A` 這一種。0、負數、ffprobe 自己失敗代表檔案本身有問題，remux 救不回來，
+     * 照原本的錯誤爆，不要把一個壞檔包裝成「補寫過長度」的樣子繼續往下送。
+     *
+     * `-c copy` 不重新編碼，只重寫容器；輸出 matroska（webm 是它的子集，opus、vorbis、aac 都裝得下）。
+     * 先寫 `.part` 再 rename 蓋回原檔：中途失敗不留半個檔，server 掛掉留下的 `.part`
+     * 由啟動時的 `removePartialUploads` 清掉。
+     */
+    probeDurationRemuxingIfMissing: async (filePath: string): Promise<number> => {
+      const raw = await readRawDuration(filePath);
+      if (raw !== 'N/A') return parseDuration(raw, filePath);
+
+      const partPath = `${filePath}.remux-${randomUUID()}.part`;
+      try {
+        await run(
+          options.ffmpegPath,
+          ['-v', 'error', '-y', '-i', filePath, '-c', 'copy', '-f', 'matroska', partPath],
+          'ffmpeg 補寫音訊長度（remux）',
         );
+        renameSync(partPath, filePath);
+      } catch (err) {
+        rmSync(partPath, { force: true });
+        throw err;
       }
-      return duration;
+      return parseDuration(await readRawDuration(filePath), filePath);
     },
 
     /**

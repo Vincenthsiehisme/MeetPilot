@@ -154,6 +154,17 @@ export interface LinkWriteReport {
   blockedByExclusion: string[];
 }
 
+/**
+ * 一場由錄音按鍵開始的會（`voice_memo_recordings`，vault plan「MeetPilot · 網頁錄音」）。stopped_at 是 null 代表還在錄。
+ * 寫成 type 不寫 interface：node:sqlite 回帶 index signature 的 Record，interface 沒有隱式 index signature，
+ * 直接轉型會被 tsc 擋（同檔 MeetingRow 的做法）
+ */
+export type VoiceMemoRecording = {
+  meeting_id: string;
+  started_at: number;
+  stopped_at: number | null;
+};
+
 export interface CreateMeetingInput {
   meeting_id: string;
   title?: string | null;
@@ -568,6 +579,87 @@ export const createMeetingStore = (db: DatabaseSync) => {
       requireMeeting(id);
       db.prepare('UPDATE meetings SET title = ?, updated_at = ? WHERE meeting_id = ?').run(title, updatedAt, id);
       return requireMeeting(id);
+    },
+
+    /**
+     * 開始錄音：寫下開始時間、狀態推成 RECORDING，兩件事同一個交易。
+     *
+     * 分成兩次寫的話，中間斷掉會留下「RECORDING 但沒有開始時間」：畫面接不回計時，
+     * 停止時也沒有東西可以拿來比對取回的檔案長度（AC-3），只能整場當成失敗。
+     *
+     * 同一場會可能第二次開始錄（上一次叫語音備忘錄失敗、退回 CREATED 之後重按），
+     * 那時舊列要整個換成這一次的：留著上一次的 started_at，長度比對會拿錯的起點算。
+     */
+    startRecording: (id: string, startedAt: number): Meeting => {
+      const current = requireMeeting(id);
+      assertTransition(id, current.status, 'RECORDING');
+      db.exec('BEGIN');
+      try {
+        db.prepare(`
+          INSERT INTO voice_memo_recordings (meeting_id, started_at, stopped_at) VALUES (?, ?, NULL)
+          ON CONFLICT(meeting_id) DO UPDATE SET started_at = excluded.started_at, stopped_at = NULL
+        `).run(id, startedAt);
+        db.prepare('UPDATE meetings SET status = ?, updated_at = ?, error = NULL WHERE meeting_id = ?')
+          .run('RECORDING', startedAt, id);
+        db.exec('COMMIT');
+      } catch (err) {
+        db.exec('ROLLBACK');
+        throw err;
+      }
+      return requireMeeting(id);
+    },
+
+    /**
+     * 開始錄音沒成功（語音備忘錄沒被叫起來）：退回 CREATED，並刪掉這一次的起訖紀錄。
+     *
+     * 紀錄要刪：留著一列 stopped_at 是 NULL 的，讀的人會以為這場會還在錄，而語音備忘錄
+     * 其實從來沒開始。跟 startRecording 同一個理由用交易包住。
+     */
+    abortRecording: (id: string, updatedAt: number): Meeting => {
+      const current = requireMeeting(id);
+      assertTransition(id, current.status, 'CREATED');
+      db.exec('BEGIN');
+      try {
+        db.prepare('DELETE FROM voice_memo_recordings WHERE meeting_id = ?').run(id);
+        db.prepare('UPDATE meetings SET status = ?, updated_at = ?, error = NULL WHERE meeting_id = ?')
+          .run('CREATED', updatedAt, id);
+        db.exec('COMMIT');
+      } catch (err) {
+        db.exec('ROLLBACK');
+        throw err;
+      }
+      return requireMeeting(id);
+    },
+
+    getRecording: (id: string): VoiceMemoRecording | null =>
+      (db.prepare('SELECT meeting_id, started_at, stopped_at FROM voice_memo_recordings WHERE meeting_id = ?')
+        .get(id) as VoiceMemoRecording | undefined) ?? null,
+
+    /**
+     * 記下停止時間。只收還在錄的那一列：已經停過的再寫一次會把第一次的停止時間蓋掉，
+     * 長度比對就拿錯的終點算，所以寫不到（沒有列、或已經停過）一律拋錯，不當成功。
+     */
+    markRecordingStopped: (id: string, stoppedAt: number): void => {
+      const result = db.prepare(
+        'UPDATE voice_memo_recordings SET stopped_at = ? WHERE meeting_id = ? AND stopped_at IS NULL',
+      ).run(stoppedAt, id);
+      if (result.changes !== 1) {
+        throw new Error(`Meeting ${id} 沒有進行中的錄音紀錄，無法記下停止時間`);
+      }
+    },
+
+    /** 正在錄音的會。語音備忘錄一次只能錄一支，開始錄音前靠它擋掉第二場 */
+    listRecordingMeetings: (): Meeting[] =>
+      (db.prepare("SELECT * FROM meetings WHERE status = 'RECORDING' ORDER BY created_at, meeting_id").all() as MeetingRow[])
+        .map(toMeeting),
+
+    /**
+     * 補寫實際的音檔大小。錄音按鍵建立會議時還沒有檔案，只能先寫 0；
+     * 取回音檔之後不補的話，畫面上這場會的大小會一直是 0，看起來像空檔
+     */
+    setSourceFileSize: (id: string, bytes: number, updatedAt: number): void => {
+      requireMeeting(id);
+      db.prepare('UPDATE meetings SET source_file_size = ?, updated_at = ? WHERE meeting_id = ?').run(bytes, updatedAt, id);
     },
 
     /**

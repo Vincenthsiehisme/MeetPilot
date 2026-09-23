@@ -1,4 +1,7 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   CommandResult,
   CommandRunner,
@@ -80,7 +83,7 @@ describe('resolveFfmpegPaths', () => {
   });
 });
 
-describe('probeDurationSeconds', () => {
+describe('probeDurationRemuxingIfMissing：讀長度', () => {
   it('照契約的參數呼叫 ffprobe 並解析長度', async () => {
     const calls: { executable: string; args: readonly string[] }[] = [];
     const slicer = createAudioSlicer({
@@ -89,18 +92,11 @@ describe('probeDurationSeconds', () => {
       runner: fakeRunner({ stdout: Buffer.from('6382.351000\n') }, calls),
     });
 
-    expect(await slicer.probeDurationSeconds('/tmp/a.audio')).toBe(6382.351);
+    expect(await slicer.probeDurationRemuxingIfMissing('/tmp/a.audio')).toBe(6382.351);
     expect(calls[0].executable).toBe('/opt/ffprobe');
     expect(calls[0].args).toEqual([
       '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', '/tmp/a.audio',
     ]);
-  });
-
-  it.each([['N/A'], [''], ['0']])('長度解不出有限正數（%s）時拋錯，不回 0 也不回 Infinity', async (raw) => {
-    const slicer = createAudioSlicer({
-      ffmpegPath: 'ffmpeg', ffprobePath: 'ffprobe', runner: fakeRunner({ stdout: Buffer.from(raw) }),
-    });
-    await expect(slicer.probeDurationSeconds('/tmp/a.audio')).rejects.toThrow(/沒有回出有限正數的長度/);
   });
 
   it('結束碼非 0 時拋錯，訊息帶 stderr 尾段', async () => {
@@ -109,8 +105,71 @@ describe('probeDurationSeconds', () => {
       ffprobePath: 'ffprobe',
       runner: fakeRunner({ code: 1, stderr: 'x'.repeat(50) + '\n/tmp/a.audio: Invalid data found when processing input' }),
     });
-    await expect(slicer.probeDurationSeconds('/tmp/a.audio'))
+    await expect(slicer.probeDurationRemuxingIfMissing('/tmp/a.audio'))
       .rejects.toThrow(/Invalid data found when processing input/);
+  });
+});
+
+describe('probeDurationRemuxingIfMissing（AC-7：瀏覽器錄的 webm 沒寫長度）', () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'meetpilot-remux-')); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  /** ffprobe 依序回 durations 裡的值；ffmpeg 把 remuxOutput 寫到它的輸出路徑（最後一個參數） */
+  const scripted = (durations: string[], calls: { executable: string; args: readonly string[] }[], remux: { code?: number; output?: string } = {}): CommandRunner =>
+    async (executable, args) => {
+      calls.push({ executable, args });
+      if (executable === 'ffprobe') return { code: 0, stdout: Buffer.from(durations.shift() ?? ''), stderr: '' };
+      if ((remux.code ?? 0) === 0) writeFileSync(args[args.length - 1] as string, remux.output ?? 'remuxed');
+      return { code: remux.code ?? 0, stdout: Buffer.alloc(0), stderr: remux.code ? 'Invalid data found' : '' };
+    };
+
+  it('讀得到長度就直接回，不去 remux', async () => {
+    const calls: { executable: string; args: readonly string[] }[] = [];
+    const slicer = createAudioSlicer({ ffmpegPath: 'ffmpeg', ffprobePath: 'ffprobe', runner: scripted(['61.5'], calls) });
+    expect(await slicer.probeDurationRemuxingIfMissing(join(dir, 'a.audio'))).toBe(61.5);
+    expect(calls.map(c => c.executable)).toEqual(['ffprobe']);
+  });
+
+  it('N/A 時 -c copy remux 成 matroska 蓋回原檔，再讀一次長度', async () => {
+    const calls: { executable: string; args: readonly string[] }[] = [];
+    const file = join(dir, 'a.audio');
+    writeFileSync(file, 'webm-without-duration');
+    const slicer = createAudioSlicer({ ffmpegPath: 'ffmpeg', ffprobePath: 'ffprobe', runner: scripted(['N/A', '2.459000'], calls) });
+
+    expect(await slicer.probeDurationRemuxingIfMissing(file)).toBe(2.459);
+    expect(calls.map(c => c.executable)).toEqual(['ffprobe', 'ffmpeg', 'ffprobe']);
+    const remuxArgs = calls[1].args;
+    expect(remuxArgs.slice(0, -1)).toEqual(['-v', 'error', '-y', '-i', file, '-c', 'copy', '-f', 'matroska']);
+    expect(remuxArgs[remuxArgs.length - 1]).toMatch(/\.part$/);
+    expect(readFileSync(file, 'utf8')).toBe('remuxed');
+    expect(readdirSync(dir)).toEqual(['a.audio']);
+  });
+
+  it('remux 失敗：原檔不動、暫存檔清掉、錯誤往上拋', async () => {
+    const calls: { executable: string; args: readonly string[] }[] = [];
+    const file = join(dir, 'a.audio');
+    writeFileSync(file, 'original');
+    const slicer = createAudioSlicer({ ffmpegPath: 'ffmpeg', ffprobePath: 'ffprobe', runner: scripted(['N/A'], calls, { code: 1 }) });
+
+    await expect(slicer.probeDurationRemuxingIfMissing(file)).rejects.toThrow(/remux/);
+    expect(readFileSync(file, 'utf8')).toBe('original');
+    expect(readdirSync(dir)).toEqual(['a.audio']);
+  });
+
+  it('remux 之後還是讀不到長度就照原本的錯誤爆，不塞一個假長度', async () => {
+    const calls: { executable: string; args: readonly string[] }[] = [];
+    const file = join(dir, 'a.audio');
+    writeFileSync(file, 'x');
+    const slicer = createAudioSlicer({ ffmpegPath: 'ffmpeg', ffprobePath: 'ffprobe', runner: scripted(['N/A', 'N/A'], calls) });
+    await expect(slicer.probeDurationRemuxingIfMissing(file)).rejects.toThrow(/沒有回出有限正數的長度/);
+  });
+
+  it.each([['0'], ['']])('N/A 以外讀不出長度（%s）代表檔案本身有問題，不 remux', async (raw) => {
+    const calls: { executable: string; args: readonly string[] }[] = [];
+    const slicer = createAudioSlicer({ ffmpegPath: 'ffmpeg', ffprobePath: 'ffprobe', runner: scripted([raw], calls) });
+    await expect(slicer.probeDurationRemuxingIfMissing(join(dir, 'a.audio'))).rejects.toThrow(/沒有回出有限正數的長度/);
+    expect(calls.map(c => c.executable)).toEqual(['ffprobe']);
   });
 });
 

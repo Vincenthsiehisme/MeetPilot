@@ -17,6 +17,7 @@ const audioStore = (removeFails = false): AudioFileStore => ({
   dir: '/fake/audio',
   pathFor: (id: string) => `/fake/audio/${id}.audio`,
   exists: (id: string) => present.has(id),
+  tempPathFor: (id: string) => `/fake/audio/${id}_tmp_part`,
   sizeOf: () => 1024,
   saveFrom: async (id: string) => { present.add(id); return { path: `/fake/audio/${id}.audio`, bytes: 1024 }; },
   removePartialUploads: () => [],

@@ -19,6 +19,7 @@ import { createJobStore } from './services/jobStore';
 import { createJobWorker } from './services/jobWorker';
 import { createApp } from './services/createApp';
 import { createVaultProjector, resolveVaultDir } from './services/vaultProjector';
+import { createVoiceMemoRecorder } from './services/voiceMemoRecorder';
 
 // 這個檔只做三件事：把真的依賴組出來、交給 createApp、listen。
 // 路由與 middleware 全部在 services/createApp.ts，理由見那個檔的檔頭（測得動）。
@@ -192,6 +193,15 @@ const analysisQueue = {
   has: (meetingId: string): boolean => jobStore.hasActive(meetingId, 'analysis'),
 };
 
+// 語音備忘錄錄音（vault plan「MeetPilot · 網頁錄音」）。一律建起來、不設 off 開關：
+// 能不能錄（是不是 macOS、三個捷徑在不在）每次由 GET /api/recording/availability 當下去查，
+// 前端靠它決定錄音按鍵要不要出現，這裡不先判斷一次就記住
+const voiceMemoRecorder = createVoiceMemoRecorder({
+  shortcutsPath: 'shortcuts',
+  ffprobePath: ffmpegPaths.ffprobe,
+  platform: process.platform,
+});
+
 const app = createApp({
   listenConfig,
   meetingStore,
@@ -204,6 +214,7 @@ const app = createApp({
   llmLogger,
   topicLinker,
   vaultProjector,
+  voiceMemoRecorder,
 });
 
 // Vite middleware & Production static serving

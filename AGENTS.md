@@ -187,3 +187,8 @@ function f(p: Pick) {
 - `services/httpGuards.ts` 的環境變數只收十進位整數（`/^\d+$/`）。`Number()` 會放行
   `6e1`、`0x3c`，設定看起來生效但值不是寫的那個。
 - 不設 `trust proxy` 是刻意的（理由在 README），反向代理後全員共用一個限流桶。
+- **錄音路由的「只收本機請求」（`isLoopbackAddress`）在同機反向代理後面會失效**：經代理轉進來的請求 socket 來源一律是
+  loopback。2026-09-23 Codex review 提出，使用者裁定不改程式、只寫進文件（對外開放一律用 `HOST` 加 Basic Auth，
+  不用同機代理；那種部署下整個 API 本來就沒有認證）。不要用 `X-Forwarded-For`、`Origin`、`Host` 補判斷：
+  沒設 `trust proxy` 的前提下這些都是客戶端能偽造的 header。真的要支援同機代理，做法是錄音 API 另開只綁
+  loopback 的 listener。

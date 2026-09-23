@@ -64,9 +64,28 @@ export interface PeopleListResponse {
 export interface MeetingView extends Meeting {
   /** server 端這場會的音檔現在在不在。`CREATED` 的兩種處境靠它分開 */
   has_audio: boolean;
+  /**
+   * 語音備忘錄開始錄的時間（epoch ms）。只有 `RECORDING` 時有值，其餘一律 null。
+   * 畫面上的錄音計時靠它：錄音不因分頁關掉而中斷，重開頁面時計時要從 server 接回來，
+   * 不能從「這個分頁按下開始的那一刻」算（vault plan「MeetPilot · 網頁錄音」AC-4）
+   */
+  recording_started_at: number | null;
 }
 
-/** `POST /api/meetings` 201、`PUT /api/meetings/:id/audio` 202、`POST /api/meetings/:id/retry` 202 */
+/**
+ * `GET /api/recording/availability`。這台 server 能不能叫語音備忘錄錄音。
+ *
+ * 不能的時候一定帶原因：錄音按鍵要嘛不出現、要嘛講清楚為什麼不能按（AC-5），
+ * 不讓使用者按下去才失敗。原因只有 server 知道（平台、三個捷徑在不在、請求是不是從本機來）。
+ */
+export type RecordingAvailabilityResponse =
+  | { available: true }
+  | { available: false; reason: string };
+
+/**
+ * `POST /api/meetings` 201、`PUT /api/meetings/:id/audio` 202、`POST /api/meetings/:id/retry` 202、
+ * `POST /api/meetings/:id/recording/start` 200、`POST /api/meetings/:id/recording/stop` 202
+ */
 export interface MeetingResponse {
   meeting: MeetingView;
 }
