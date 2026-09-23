@@ -3,7 +3,7 @@ import express from 'express';
 import { createServer, Server } from 'node:http';
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, join, resolve, sep } from 'node:path';
 import { Readable } from 'node:stream';
 import { AudioFileStore, createAudioFileStore, resolveAudioDir } from './audioFileStore';
 import { checkBasicAuth, createRateLimiter } from './httpGuards';
@@ -22,11 +22,11 @@ afterEach(() => {
 
 describe('resolveAudioDir', () => {
   it('沒設就用 data/audio', () => {
-    expect(resolveAudioDir({})).toMatch(/data\/audio$/);
+    expect(resolveAudioDir({})).toBe(resolve('data/audio'));
   });
 
   it('設了就用設的，前後空白不算', () => {
-    expect(resolveAudioDir({ MEETPILOT_AUDIO_DIR: '  /var/meetpilot/audio  ' })).toBe('/var/meetpilot/audio');
+    expect(resolveAudioDir({ MEETPILOT_AUDIO_DIR: '  /var/meetpilot/audio  ' })).toBe(resolve('/var/meetpilot/audio'));
   });
 });
 
@@ -177,7 +177,7 @@ describe('tempPathFor', () => {
     const a = store.tempPathFor('m-1');
     const b = store.tempPathFor('m-1');
     expect(a).not.toBe(b);
-    expect(a.startsWith(`${dir}/`)).toBe(true);
+    expect(a.startsWith(`${dir}${sep}`)).toBe(true);
     expect(basename(a)).not.toContain('.');
   });
 

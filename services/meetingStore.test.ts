@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { SCHEMA_VERSION, openMeetingDb, resolveDbPath } from './meetingDb';
 import { createMeetingStore, MeetingStore } from './meetingStore';
 import { MigrationRecord } from './jobMigration';
@@ -99,7 +99,7 @@ describe('openMeetingDb', () => {
 
 describe('resolveDbPath', () => {
   it('沒設就用 data/meetpilot.db', () => {
-    expect(resolveDbPath({})).toMatch(/data\/meetpilot\.db$/);
+    expect(resolveDbPath({})).toBe(resolve('data/meetpilot.db'));
   });
 
   it(':memory: 原樣回傳，不解析成路徑', () => {
