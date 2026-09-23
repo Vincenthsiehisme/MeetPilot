@@ -21,6 +21,19 @@ npm run build           # 前端與 server bundle
 
 目標分支 `main`。`npm run build` 會產生 `dist/`，驗證完記得 `rm -rf dist`，否則工作樹不乾淨。
 
+**CI（`.github/workflows/ci.yml`）在 macOS 與 Windows 各跑一次三條 gate，外加正式版冒煙測試**
+（`npm prune --omit=dev` 後跑 `scripts/smokeProduction.mjs`）。本機只有 macOS，**Windows 的結果只有
+CI 看得到**：碰到路徑、換行、spawn、檔案權限、`process.platform` 的改動，本機綠不代表 Windows 綠，
+要等 CI 的 Windows 那格。
+
+- `dist/server.cjs` 不能在檔頭 require 任何 devDependency。esbuild `--packages=external` 會把 static
+  import 原樣變成檔頭 `require()`，只有開發模式才用的東西（`vite`）要在分支裡 `await import()`。
+  冒煙測試在拿掉 devDependencies 之後啟動，守的就是這條。
+- `.gitattributes` 強制 LF。`prompt_version` 是規範檔原始內容的雜湊，換行一變就變，`lineEndings.test.ts`
+  在 Windows runner 上守它。
+- `npm start` 用 `cross-env` 設 `NODE_ENV`，因為 cmd 與 PowerShell 不吃 `VAR=value cmd` 的寫法。
+  它放在 `dependencies` 不是 `devDependencies`：`--omit=dev` 的安裝也要能 `npm start`。
+
 ## CodeGraph
 
 索引在 `.codegraph/`（2026-09-14 建，`codegraph init`）。本機產物，不進版控。

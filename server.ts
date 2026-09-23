@@ -1,6 +1,5 @@
 import express from 'express';
 import path from 'path';
-import { createServer as createViteServer } from 'vite';
 import { resolveListenConfig } from './services/httpGuards';
 import { createLlmLogger, resolveLlmLogPath } from './services/llmTelemetry';
 import { openMeetingDb, resolveDbPath } from './services/meetingDb';
@@ -220,6 +219,10 @@ const app = createApp({
 // Vite middleware & Production static serving
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
+    // vite 是 devDependency，只有開發模式用得到。寫成檔頭的 static import 的話，esbuild 會把它
+    // 轉成 dist/server.cjs 檔頭無條件的 require("vite")，不裝 devDependencies 的安裝（打包成
+    // 桌面 app、`npm install --omit=dev`）一啟動就炸，跟有沒有走到這個分支無關
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
