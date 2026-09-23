@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { mkdtempSync, readFileSync, existsSync, rmSync, chmodSync } from 'node:fs';
+import { mkdtempSync, readFileSync, existsSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -26,7 +26,6 @@ function tempLogPath(name = 'llm.jsonl'): string {
 afterEach(() => {
   while (tempDirs.length) {
     const dir = tempDirs.pop()!;
-    chmodSync(dir, 0o700);
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -486,12 +485,15 @@ describe('createLlmLogger', () => {
   });
 
   it('路徑不可寫時在建立當下就拋錯，訊息指得出是哪個設定與哪條路徑', () => {
-    const logPath = tempLogPath();
-    const dir = join(logPath, '..');
-    const blocked = join(dir, 'blocked.jsonl');
-    chmodSync(dir, 0o500);
+    // 讓上一層是個一般檔案，mkdir 與 append 在兩個平台都一定失敗。原本用 chmod 0o500 把目錄設成
+    // 唯讀，但 Windows 不吃目錄的 POSIX 權限位元，那個目錄照樣寫得進去，這條在 Windows 上會紅，紅的是測試的前提不是程式
+    const notADir = tempLogPath('not-a-dir');
+    writeFileSync(notADir, '');
+    const blocked = join(notADir, 'blocked.jsonl');
+    // Windows 路徑的反斜線放進 RegExp 會變成跳脫字元，要先跳脫
+    const escaped = blocked.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     expect(() => createLlmLogger(blocked)).toThrowError(
-      new RegExp(`MEETPILOT_LLM_LOG="${blocked}" 無法寫入：.*設成 off 關閉呼叫紀錄`)
+      new RegExp(`MEETPILOT_LLM_LOG="${escaped}" 無法寫入：.*設成 off 關閉呼叫紀錄`)
     );
   });
 });

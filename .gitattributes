@@ -1,0 +1,6 @@
+# 所有文字檔一律以 LF 取出，不管 clone 的機器是 macOS 還是 Windows。
+# Windows 的 git 預設 core.autocrlf=true，會把文字檔換成 CRLF 取出。對這個 repo 那不只是
+# diff 變髒：analyses.prompt_version 是 prompts/meeting-record-spec.md 原始內容的雜湊
+# （services/geminiServerClient.ts 的 hashContent），同一版規範在 Windows 上會算出另一個
+# 版本號，來源標記就對不起來，而且不會有任何錯誤訊息。守著這條的是 lineEndings.test.ts。
+* text=auto eol=lf

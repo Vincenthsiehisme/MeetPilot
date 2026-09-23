@@ -1,0 +1,30 @@
+# 三條 gate 加正式版冒煙測試，在 macOS 與 Windows 各跑一次。
+# 記錄人用的電腦兩個平台都有，只在 macOS 上驗等於每次改碼都在猜 Windows。
+# Node 24 對齊之後要打包的 Electron 內建的 Node（Electron 46 帶 Node 24.21）。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  gate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm test
+      - run: npm run build
+      # 拿掉 devDependencies 之後再啟動一次，守 dist/server.cjs 不依賴 vite 這類開發工具
+      - run: npm prune --omit=dev
+      - run: node scripts/smokeProduction.mjs

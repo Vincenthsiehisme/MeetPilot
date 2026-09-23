@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { openMeetingDb } from './meetingDb';
 import { createMeetingStore, MeetingStore } from './meetingStore';
 import { createPeopleStore, PeopleStore } from './peopleStore';
@@ -131,7 +131,7 @@ describe('resolveVaultDir', () => {
   });
 
   it('設了就用設的，前後空白不算', () => {
-    expect(resolveVaultDir({ MEETPILOT_VAULT: '  /var/meetpilot-vault  ' })).toBe('/var/meetpilot-vault');
+    expect(resolveVaultDir({ MEETPILOT_VAULT: '  /var/meetpilot-vault  ' })).toBe(resolve('/var/meetpilot-vault'));
   });
 
   it('開頭 ~ 展開成家目錄', () => {

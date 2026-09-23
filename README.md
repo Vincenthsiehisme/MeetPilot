@@ -4,15 +4,31 @@
 
 ## 跑起來
 
-前置需求：Node、以及 **ffmpeg（含 ffprobe）**。切片在 server 端用 ffmpeg 串流處理，
-記憶體與會議長度無關，不再受瀏覽器分頁的記憶體限制。
+前置需求：Node 22.13 以上（`node:sqlite` 從這版起不用旗標；CI 跑 Node 24）、以及 **ffmpeg（含 ffprobe）**。
+切片在 server 端用 ffmpeg 串流處理，記憶體與會議長度無關，不再受瀏覽器分頁的記憶體限制。
+
+macOS：
 
 ```bash
-brew install ffmpeg     # macOS；沒有它上傳的會議會轉 FAILED 並在 error 裡說要裝
+brew install ffmpeg     # 沒有它上傳的會議會轉 FAILED 並在 error 裡說要裝
 cp .env.example .env    # 填 GEMINI_API_KEY
 npm install
 npm run dev             # http://127.0.0.1:3000
 ```
+
+Windows（PowerShell）：
+
+```powershell
+winget install Gyan.FFmpeg   # 裝完要開新的終端機，PATH 才吃得到；或用 MEETPILOT_FFMPEG / MEETPILOT_FFPROBE 指定完整路徑
+Copy-Item .env.example .env  # 填 GEMINI_API_KEY
+npm install
+npm run dev
+```
+
+Windows 上沒有語音備忘錄錄音：錄音按鍵不會出現，空狀態會顯示一行「語音備忘錄錄音目前不能用」加原因，
+只能拖檔或選檔上傳（見〈用語音備忘錄錄音〉）。
+repo 的 `.gitattributes` 強制所有文字檔以 LF 取出，不要在本機另外設 `core.autocrlf` 去蓋它：規範檔換成
+CRLF 會讓 `prompt_version` 跟 macOS 算出來的不一樣。
 
 ### 匯入與會者名單
 
@@ -77,6 +93,12 @@ npm run build           # 前端與 server bundle
 ```
 
 三條都要綠才算通過。`npm run lint` 等同第一條。
+
+GitHub Actions（`.github/workflows/ci.yml`）在 macOS 與 Windows 各跑一次三條 gate，再加一步正式版冒煙測試：
+`npm prune --omit=dev` 拿掉 devDependencies 之後跑 `node scripts/smokeProduction.mjs`，用 `npm start`
+啟動 `dist/server.cjs`，確認 `/api/health` 與前端頁回得出來。這一步守的是三條 gate 看不到的東西：
+bundle 能不能在沒有開發工具的環境啟動，以及 `npm start` 在 Windows 上能不能跑。本機要跑它，先
+`npm run build`；它的資料全部寫進暫存目錄，不碰 `data/`。
 
 ## 資料存在哪
 
