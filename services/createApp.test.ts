@@ -1333,6 +1333,30 @@ describe('語音備忘錄錄音的路由（vault plan「MeetPilot · 網頁錄�
       expect(store.getMeeting(id)).toBeNull();
     });
 
+    it('停止成功但刪除失敗：停止時間已經落地，重試刪除不會再叫一次 Stop（Codex review 抓到）', async () => {
+      let removeFails = true;
+      const flakyStore: AudioFileStore = {
+        ...audioStore,
+        remove: (meetingId: string) => {
+          if (removeFails) throw new Error('EACCES: permission denied');
+          audioStore.remove(meetingId);
+        },
+      };
+      await startWith({ voiceMemoRecorder: fakeRecorder(), audioStore: flakyStore });
+      const id = await createRecordingMeeting();
+      await post(`/api/meetings/${id}/recording/start`);
+
+      const first = await fetch(`${url}/api/meetings/${id}`, { method: 'DELETE' });
+      expect(first.status).toBe(500);
+      expect(store.getMeeting(id)?.status).toBe('RECORDING');
+      expect(store.getRecording(id)?.stopped_at).not.toBeNull();
+
+      removeFails = false;
+      const second = await fetch(`${url}/api/meetings/${id}`, { method: 'DELETE' });
+      expect(second.status).toBe(200);
+      expect(recorderCalls.filter(c => c === 'stop')).toHaveLength(1);
+    });
+
     it('停不下來就不刪', async () => {
       await startWith({ voiceMemoRecorder: fakeRecorder({ stopFails: true }) });
       const id = await createRecordingMeeting();

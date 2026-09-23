@@ -912,6 +912,10 @@ export function createApp(deps: AppDeps): express.Express {
           } finally {
             recorderBusy = null;
           }
+          // 停止成功就先落地，再往下刪（Codex review 抓到）：下面刪檔或刪紀錄失敗時這場會還在，
+          // 沒記下停止時間的話，重試停止或刪除會再叫一次 Stop，而使用者那之間若在語音備忘錄
+          // 開了另一支錄音，被停的就是那一支
+          meetingStore.markRecordingStopped(meetingId, Date.now());
         }
       }
       const outcome = deleteMeetingRequest(

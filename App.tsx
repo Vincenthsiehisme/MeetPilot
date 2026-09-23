@@ -119,6 +119,9 @@ const App: React.FC = () => {
   const [pendingNew, setPendingNew] = useState<{ kind: 'file'; file: File } | { kind: 'recording' } | null>(null);
   // 這台 server 能不能叫語音備忘錄錄音。null 是還沒問到；不能的時候帶原因，錄音按鍵照它決定顯不顯示（AC-5）
   const [recordingAvailability, setRecordingAvailability] = useState<RecordingAvailabilityResponse | null>(null);
+  // 正在叫語音備忘錄開始或停止時的訊息。跟 busyMessage 分開：上傳一支大檔可能跑好幾分鐘，
+  // 共用同一個狀態的話那段期間停止按鍵會被停用，webapp 停不了還在進行的錄音（Codex review 抓到）
+  const [recordingOp, setRecordingOp] = useState<string | null>(null);
   // 錄音計時用的「現在」。只在有會正在錄的時候每秒更新，其餘時間不跑計時器
   const [now, setNow] = useState<number>(() => Date.now());
   const [confirmConfig, setConfirmConfig] = useState<{
@@ -338,7 +341,7 @@ const App: React.FC = () => {
    * 也沒有人會去補的空會議；刪不掉就照實講它還在，讓使用者自己處理，不當作沒事。
    */
   const beginRecording = async (participantIds: string[]) => {
-    setBusyMessage('正在叫語音備忘錄開始錄音…');
+    setRecordingOp('正在叫語音備忘錄開始錄音…');
     let createdId: string | null = null;
     try {
       const created = await createMeeting({
@@ -384,7 +387,7 @@ const App: React.FC = () => {
       }
       showAlert('沒有開始錄音', `${reason}${cleanup}`);
     } finally {
-      setBusyMessage(null);
+      setRecordingOp(null);
       await refreshMeetings();
     }
   };
@@ -394,14 +397,14 @@ const App: React.FC = () => {
    * 不是這場會的錄音、接下來怎麼補，502 會講是哪個捷徑失敗，套 translateError 會把這些都蓋掉
    */
   const handleStopRecording = async (meetingId: string) => {
-    setBusyMessage('正在停止錄音、取回檔案…');
+    setRecordingOp('正在停止錄音、取回檔案…');
     try {
       await stopRecording(meetingId);
     } catch (err: any) {
       console.error('停止錄音失敗', err);
       showAlert('錄音沒有送出', err instanceof HttpError ? err.message : translateError(errorText(err)));
     } finally {
-      setBusyMessage(null);
+      setRecordingOp(null);
       await refreshMeetings();
       if (selectionRef.current !== null && selectionRef.current.source === 'server' && selectionRef.current.id === meetingId) {
         await refreshActiveDetail(meetingId);
@@ -787,6 +790,12 @@ const App: React.FC = () => {
               {busyMessage}
             </span>
           )}
+          {recordingOp && (
+            <span className="text-xs text-rose-600 font-bold flex items-center gap-2">
+              <i className="fa-solid fa-circle-notch fa-spin"></i>
+              {recordingOp}
+            </span>
+          )}
           {recordingMeeting !== null && (
             <div className="flex items-center gap-2 bg-rose-50 border border-rose-200 rounded-xl pl-3 pr-1 h-10">
               <span className="w-2 h-2 rounded-full bg-rose-500 animate-pulse"></span>
@@ -799,7 +808,7 @@ const App: React.FC = () => {
               </button>
               <button
                 onClick={() => handleStopRecording(recordingMeeting.meeting_id)}
-                disabled={busyMessage !== null}
+                disabled={recordingOp !== null}
                 className="h-8 px-3 bg-rose-600 hover:bg-rose-700 disabled:bg-rose-300 text-white text-xs font-bold rounded-lg flex items-center gap-1 transition-colors"
               >
                 <i className="fa-solid fa-stop"></i>
@@ -810,7 +819,7 @@ const App: React.FC = () => {
           {canStartRecording && (
             <button
               onClick={() => setPendingNew({ kind: 'recording' })}
-              disabled={busyMessage !== null}
+              disabled={busyMessage !== null || recordingOp !== null}
               className="h-10 px-4 bg-white hover:bg-rose-50 border border-rose-200 text-rose-600 disabled:opacity-50 rounded-xl font-bold text-sm flex items-center gap-2 transition-colors"
               title="用這台 Mac 的語音備忘錄錄音，停止後自動送進轉錄"
             >
@@ -937,7 +946,7 @@ const App: React.FC = () => {
                   </span>
                   <button
                     onClick={() => handleStopRecording(activeMeeting.meeting_id)}
-                    disabled={busyMessage !== null}
+                    disabled={recordingOp !== null}
                     className="shrink-0 bg-rose-600 hover:bg-rose-700 disabled:bg-rose-300 text-white text-xs font-bold px-3 py-1.5 rounded-lg transition-colors"
                   >
                     <i className="fa-solid fa-stop mr-1"></i>
@@ -1023,7 +1032,7 @@ const App: React.FC = () => {
                   {canStartRecording && (
                     <button
                       onClick={() => setPendingNew({ kind: 'recording' })}
-                      disabled={busyMessage !== null}
+                      disabled={busyMessage !== null || recordingOp !== null}
                       className="mt-4 w-full max-w-md bg-white hover:bg-rose-50 border-2 border-rose-200 hover:border-rose-400 text-rose-600 disabled:opacity-50 rounded-2xl px-8 py-5 flex flex-col items-center gap-1 transition-colors"
                     >
                       <span className="text-sm font-bold"><i className="fa-solid fa-microphone mr-2"></i>開始錄音</span>
