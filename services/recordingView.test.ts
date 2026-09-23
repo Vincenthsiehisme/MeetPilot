@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { MeetingView } from './meetingApi';
-import { findRecordingMeeting, formatRecordingElapsed, recordingMeetingFileName } from './recordingView';
+import { decideAfterStartFailure, findRecordingMeeting, formatRecordingElapsed, recordingMeetingFileName } from './recordingView';
 
 const view = (overrides: Partial<MeetingView>): MeetingView => ({
   meeting_id: 'm_1',
@@ -60,5 +60,26 @@ describe('findRecordingMeeting', () => {
   it('同時兩場在錄直接拋錯，不挑一場去停', () => {
     const meetings = [view({ meeting_id: 'a', status: 'RECORDING' }), view({ meeting_id: 'b', status: 'RECORDING' })];
     expect(() => findRecordingMeeting(meetings)).toThrow(/同時有 2 場會在錄音/);
+  });
+});
+
+describe('decideAfterStartFailure（開始錄音失敗後要不要刪剛建的會）', () => {
+  it('確定沒在錄（CREATED、沒音檔）才刪', () => {
+    expect(decideAfterStartFailure(view({ status: 'CREATED', has_audio: false }), null)).toEqual({ kind: 'delete' });
+  });
+
+  it('其實已經在錄（回應丟了或組回應時出錯）就留著，不切掉錄音', () => {
+    expect(decideAfterStartFailure(view({ status: 'RECORDING', recording_started_at: 1 }), null)).toEqual({ kind: 'keep-recording' });
+  });
+
+  it('讀不到狀態就不刪，並講原因', () => {
+    const action = decideAfterStartFailure(null, 'Failed to fetch');
+    expect(action.kind).toBe('keep-unknown');
+    if (action.kind === 'keep-unknown') expect(action.reason).toContain('Failed to fetch');
+  });
+
+  it('其他狀態（例如已經有音檔在轉錄）也不刪', () => {
+    expect(decideAfterStartFailure(view({ status: 'TRANSCRIBING', has_audio: true }), null).kind).toBe('keep-unknown');
+    expect(decideAfterStartFailure(view({ status: 'CREATED', has_audio: true }), null).kind).toBe('keep-unknown');
   });
 });

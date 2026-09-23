@@ -24,7 +24,7 @@ import {
   stopRecording,
   submitAudio
 } from './services/meetingClient';
-import { findRecordingMeeting, formatRecordingElapsed, recordingMeetingFileName } from './services/recordingView';
+import { decideAfterStartFailure, findRecordingMeeting, formatRecordingElapsed, recordingMeetingFileName } from './services/recordingView';
 import {
   AudioBackupTarget,
   SelectionRef,
@@ -333,8 +333,9 @@ const App: React.FC = () => {
   /**
    * 建立會議並叫語音備忘錄開始錄。
    *
-   * 開始失敗時把剛建的會刪掉：server 已經把它退回 CREATED，留著的話清單上會多一筆沒有音檔、
-   * 也沒有人會去補的空會議。刪不掉就照實講它還在，讓使用者自己處理，不當作沒事。
+   * 開始失敗時先重讀那場會再決定要不要刪（decideAfterStartFailure）：失敗不代表沒在錄，
+   * 直接刪會把一支其實已經開始的錄音切掉。確定沒在錄才刪，免得清單上多一筆沒有音檔、
+   * 也沒有人會去補的空會議；刪不掉就照實講它還在，讓使用者自己處理，不當作沒事。
    */
   const beginRecording = async (participantIds: string[]) => {
     setBusyMessage('正在叫語音備忘錄開始錄音…');
@@ -351,16 +352,36 @@ const App: React.FC = () => {
       if (!isSidebarOpen) setIsSidebarOpen(true);
     } catch (err: any) {
       console.error('開始錄音失敗', err);
-      let cleanup = '';
-      if (createdId !== null) {
-        try {
-          await deleteMeeting(createdId);
-        } catch (deleteErr: any) {
-          console.error('開始錄音失敗後刪除空會議也失敗', deleteErr);
-          cleanup = `\n\n剛建立的那場空會議沒有刪掉（${errorText(deleteErr)}），可以在清單裡自己刪除。`;
-        }
-      }
       const reason = err instanceof HttpError ? err.message : translateError(errorText(err));
+      if (createdId === null) {
+        showAlert('沒有開始錄音', reason);
+        return;
+      }
+      let current: MeetingView | null = null;
+      let readError: string | null = null;
+      try {
+        current = (await getMeetingDetail(createdId)).meeting;
+      } catch (readErr: any) {
+        console.error('開始錄音失敗後讀取會議狀態也失敗', readErr);
+        readError = errorText(readErr);
+      }
+      const action = decideAfterStartFailure(current, readError);
+      if (action.kind === 'keep-recording') {
+        selectRecord({ source: 'server', id: createdId });
+        showAlert('錄音其實已經開始', `開始錄音的回應出錯了（${reason}），但伺服器上這場會已經在錄音中，錄音不受影響。結束時照常按「停止錄音」。`);
+        return;
+      }
+      if (action.kind === 'keep-unknown') {
+        showAlert('沒有確認是否開始錄音', `${reason}\n\n${action.reason}。請到語音備忘錄確認有沒有在錄，再決定要不要刪掉清單上這場會。`);
+        return;
+      }
+      let cleanup = '';
+      try {
+        await deleteMeeting(createdId);
+      } catch (deleteErr: any) {
+        console.error('開始錄音失敗後刪除空會議也失敗', deleteErr);
+        cleanup = `\n\n剛建立的那場空會議沒有刪掉（${errorText(deleteErr)}），可以在清單裡自己刪除。`;
+      }
       showAlert('沒有開始錄音', `${reason}${cleanup}`);
     } finally {
       setBusyMessage(null);

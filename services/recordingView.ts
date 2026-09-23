@@ -44,3 +44,29 @@ export const findRecordingMeeting = (meetings: MeetingView[] | null): MeetingVie
   }
   return recording[0] ?? null;
 };
+
+export type StartFailureAction =
+  | { kind: 'delete' }
+  | { kind: 'keep-recording' }
+  | { kind: 'keep-unknown'; reason: string };
+
+/**
+ * 「開始錄音」請求失敗之後，剛建立的那場會要不要刪（2026-09-23 Codex review 抓到）。
+ *
+ * 不能看到失敗就刪：失敗不代表語音備忘錄沒開始錄。捷徑成功了但回應在路上丟了、或 server 叫完
+ * 語音備忘錄之後組回應時拋錯（回 500），這場會其實已經是 RECORDING，而刪除錄音中的會會先叫
+ * 語音備忘錄停止——一次暫時性的回應失敗就把一支正在錄的錄音切掉，畫面上還說「沒有開始錄音」。
+ *
+ * 所以呼叫端要先重讀這場會，照 server 當下的狀態決定：
+ * - CREATED 而且沒有音檔：確定沒在錄（server 開始失敗時會退回這裡），刪掉不留空會議
+ * - RECORDING：其實在錄，留著，讓使用者照常按停止
+ * - 讀不到或其他狀態：不知道發生什麼事，不刪，照實講
+ */
+export const decideAfterStartFailure = (meeting: MeetingView | null, readError: string | null): StartFailureAction => {
+  if (meeting === null) {
+    return { kind: 'keep-unknown', reason: `讀不到這場會現在的狀態（${readError ?? '沒有回應'}），為了不切掉可能已經開始的錄音，沒有刪除它` };
+  }
+  if (meeting.status === 'RECORDING') return { kind: 'keep-recording' };
+  if (meeting.status === 'CREATED' && !meeting.has_audio) return { kind: 'delete' };
+  return { kind: 'keep-unknown', reason: `這場會現在是 ${meeting.status}，不是預期的狀態，沒有刪除它` };
+};

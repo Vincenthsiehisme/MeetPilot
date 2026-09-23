@@ -1310,6 +1310,18 @@ describe('語音備忘錄錄音的路由（vault plan「MeetPilot · 網頁錄�
     });
   });
 
+  it('取回失敗後改用 PUT audio 補送：大小以收到的位元組為準，不留建立時的 0（Codex review 抓到）', async () => {
+    await startWith({ voiceMemoRecorder: fakeRecorder({ probe: () => ({ durationSeconds: 3600, creationTimeMs: 0 }) }) });
+    const id = await createRecordingMeeting();
+    await post(`/api/meetings/${id}/recording/start`);
+    expect((await post(`/api/meetings/${id}/recording/stop`)).status).toBe(422);
+    expect(store.getMeeting(id)?.source_file_size).toBe(0);
+
+    const payload = Buffer.from('dragged-in-from-voice-memos');
+    expect((await putAudio(id, payload)).status).toBe(202);
+    expect(store.getMeeting(id)?.source_file_size).toBe(payload.length);
+  });
+
   describe('刪除錄音中的會', () => {
     it('先叫語音備忘錄停止再刪，不留一支沒人停得了的錄音', async () => {
       await startWith({ voiceMemoRecorder: fakeRecorder() });

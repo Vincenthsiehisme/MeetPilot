@@ -308,6 +308,10 @@ export function createApp(deps: AppDeps): express.Express {
         return res.status(400).json({ error: '上傳的音檔是空的，沒有內容可以轉錄' });
       }
 
+      // 大小以收到的位元組為準，不信建立時前端報的數字：錄音按鍵建立的會先寫 0，取回失敗、
+      // 改用這條補送音檔時不更新的話，這場會與匯出的 metadata 會永遠說來源是 0 bytes
+      // （2026-09-23 Codex review 抓到）。一般上傳這兩個數字本來就一樣
+      meetingStore.setSourceFileSize(meetingId, saved.bytes, Date.now());
       meetingStore.setStatus(meetingId, 'TRANSCRIBING', Date.now());
       transcriptionQueue.enqueue(meetingId);
       // enqueue 會同步跑到 pipeline 的第一個 await 為止，狀態可能又往前走了。
