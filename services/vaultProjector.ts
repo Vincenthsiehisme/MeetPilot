@@ -18,7 +18,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, w
 import { homedir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { TranscriptSegment } from '../types';
-import { ActionItemV3, DecisionV3, Evidence, OpenQuestionV3 } from './analysisContract';
+import { ActionItemV3, DecisionV3, Evidence, OpenQuestionV3, TopicV3 } from './analysisContract';
 import { SeamReportEntry } from './meetingApi';
 import { MeetingStatus } from './meetingState';
 import { MeetingStore } from './meetingStore';
@@ -226,9 +226,20 @@ const renderOpenQuestionsSection = (questions: readonly OpenQuestionV3[]): strin
   }).join('\n');
 };
 
-const renderTopicsSection = (topics: readonly { title: string; content: string }[]): string =>
+/**
+ * 議題：小標、「走到哪」一行、條列要點，每點後面接行內程式碼的時間範圍（Obsidian 顯示成小灰底標籤，SDD v0.9）。
+ * 舊資料沒有 points（`undefined`）就只印整段 content，跟改版前一樣；有 points 但是空的，照新格式只印走到哪
+ */
+const renderTopicsSection = (topics: readonly TopicV3[]): string =>
   topics.length > 0
-    ? topics.map((t) => `### ${t.title}\n${t.content}`).join('\n\n')
+    ? topics.map((t) => {
+      if (t.points === undefined) return `### ${t.title}\n${t.content}`;
+      const points = t.points.map((pt) => {
+        const range = formatEvidenceRange(pt.evidence);
+        return range === null ? `- ${pt.text}` : `- ${pt.text} \`${range}\``;
+      });
+      return [`### ${t.title}`, `走到哪：${t.content}`, ...points].join('\n');
+    }).join('\n\n')
     : '（沒有討論題目）';
 
 /** `repair` 缺席只會發生在 verdict 不是 gap 的接縫，這裡只被拿來處理 gap，理論上一定有值；沒有就誠實印出來，不猜 */
@@ -276,7 +287,7 @@ interface SystemRegionInput {
   decisions: readonly DecisionV3[];
   actionItems: readonly ActionItemV3[];
   openQuestions: readonly OpenQuestionV3[];
-  topics: readonly { title: string; content: string }[];
+  topics: readonly TopicV3[];
   topicTags: readonly TopicTag[];
   relatedSection: string;
   seamReport: readonly SeamReportEntry[] | null;

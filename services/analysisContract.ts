@@ -123,10 +123,27 @@ export interface OpenQuestionV3 {
   evidence: Evidence | null;
 }
 
+/**
+ * 討論段的一個要點（SDD v0.9，vault plan「MeetPilot · 會議記錄結構化與逐點出處」）。加在 v3 上的選填欄位，
+ * `contract_version` 不動：舊資料的 topic 沒有 `points` 這個 key，呈現端退回只印 `content`。
+ * 不帶提出者（SDD D-021）：轉錄的講者只是人聲編號，對不上真人。
+ */
+export interface TopicPointV3 {
+  text: string;
+  evidence: Evidence | null;
+}
+
+export interface TopicV3 {
+  title: string;
+  /** v0.9 起是「本節走到哪」一兩句；舊資料是整段內容 */
+  content: string;
+  points?: TopicPointV3[];
+}
+
 export interface AnalysisV3 {
   contract_version: 3;
   overview: string;
-  topics: { title: string; content: string }[];
+  topics: TopicV3[];
   decisions: DecisionV3[];
   action_items: ActionItemV3[];
   open_questions: OpenQuestionV3[];
@@ -174,7 +191,7 @@ export interface AnalysisModelOutput {
   /** 建議標題（規範〈標題〉節）。存進 `meetings.title`、不在 C-ANALYSIS 裡；只在那場會還沒有標題時採用 */
   title: string;
   overview: string;
-  topics: { title: string; content: string }[];
+  topics: { title: string; content: string; points: (AnalysisModelSegmentRef & { text: string })[] }[];
   decisions: (AnalysisModelSegmentRef & { text: string; decided_by: string | null })[];
   action_items: (AnalysisModelSegmentRef & { text: string; assignee: string | null; due: string | null })[];
   open_questions: (AnalysisModelSegmentRef & { text: string })[];
@@ -197,9 +214,11 @@ export function assertAnalysisModelOutput(value: unknown): asserts value is Anal
   if (typeof value.overview !== 'string') throw new Error('結構化輸出的 overview 不是字串');
   if (
     !Array.isArray(value.topics)
-    || !value.topics.every((t) => isPlainObject(t) && typeof t.title === 'string' && typeof t.content === 'string')
+    || !value.topics.every((t) => isPlainObject(t) && typeof t.title === 'string' && typeof t.content === 'string'
+      && Array.isArray(t.points)
+      && t.points.every((pt) => isSegmentRef(pt) && isPlainObject(pt) && typeof pt.text === 'string'))
   ) {
-    throw new Error('結構化輸出的 topics 形狀不對：每筆要有字串 title 與 content');
+    throw new Error('結構化輸出的 topics 形狀不對：每筆要有字串 title、content 與 points（每點字串 text、整數 segment_from／segment_to）');
   }
   if (
     !Array.isArray(value.decisions)
@@ -266,7 +285,14 @@ export const buildAnalysisV3FromModelOutput = (
 ): AnalysisV3 => ({
   contract_version: 3,
   overview: output.overview,
-  topics: output.topics,
+  topics: output.topics.map((t, i) => ({
+    title: t.title,
+    content: t.content,
+    points: t.points.map((pt, j) => ({
+      text: pt.text,
+      evidence: resolveEvidence(pt, transcript, `第 ${i + 1} 個議題的第 ${j + 1} 點`),
+    })),
+  })),
   decisions: output.decisions.map((d, i) => ({
     text: d.text,
     decided_by: d.decided_by,

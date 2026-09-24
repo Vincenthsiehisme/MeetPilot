@@ -316,6 +316,19 @@ describe('PATCH /api/meetings/:id/analysis', () => {
     expect(store.getAnalysis('m-1')).toEqual(edited);
   });
 
+  it('議題帶要點（SDD v0.9）的分析也收，要點與出處原樣存進去', () => {
+    readyMeeting();
+    const withPoints: AnalysisV3 = {
+      ...edited,
+      topics: [{ title: '報價', content: '已對齊', points: [{ text: '改過的要點', evidence: { start: 3, end: 8 } }, { text: '沒出處', evidence: null }] }],
+    };
+
+    const outcome = patchAnalysisRequest({ store }, 'm-1', { analysis: withPoints }, T1);
+
+    expect(outcome.status).toBe(200);
+    expect(store.getAnalysis('m-1')).toEqual(withPoints);
+  });
+
   it('更新 updated_at，但不動 status', () => {
     readyMeeting();
 
@@ -330,6 +343,16 @@ describe('PATCH /api/meetings/:id/analysis', () => {
     ['整個 body 沒有 analysis', {}, 'analysis 必須是物件'],
     ['contract_version 不是 3', { analysis: { ...edited, contract_version: 2 } }, 'contract_version 必須是 3'],
     ['欄位形狀不對', { analysis: { ...edited, topics: '不是陣列' } }, '形狀不是 C-ANALYSIS v3'],
+    [
+      'topics 的 points 不是陣列',
+      { analysis: { ...edited, topics: [{ title: 't', content: 'c', points: '一段文字' }] } },
+      '形狀不是 C-ANALYSIS v3',
+    ],
+    [
+      'topics 的要點 evidence 形狀不對',
+      { analysis: { ...edited, topics: [{ title: 't', content: 'c', points: [{ text: 'x', evidence: { start: 5, end: 1 } }] }] } },
+      '形狀不是 C-ANALYSIS v3',
+    ],
     [
       'decisions 的 evidence 形狀不對',
       { analysis: { ...edited, decisions: [{ text: 'x', evidence: { start: '0', end: 5 }, decided_by: null }] } },

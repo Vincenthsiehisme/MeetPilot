@@ -243,8 +243,20 @@ const ANALYSIS_RESPONSE_SCHEMA = {
       type: Type.ARRAY,
       items: {
         type: Type.OBJECT,
-        properties: { title: { type: Type.STRING }, content: { type: Type.STRING } },
-        required: ['title', 'content'],
+        properties: {
+          title: { type: Type.STRING },
+          content: { type: Type.STRING, description: '這個議題當場走到哪，一兩句' },
+          // 要點不帶提出者（SDD D-021）：講者欄只是人聲編號，對不上真人
+          points: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: { text: { type: Type.STRING }, ...SEGMENT_REF_SCHEMA_PROPERTIES },
+              required: ['text', 'segment_from', 'segment_to'],
+            },
+          },
+        },
+        required: ['title', 'content', 'points'],
       },
     },
     decisions: {

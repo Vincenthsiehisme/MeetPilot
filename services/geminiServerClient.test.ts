@@ -301,7 +301,7 @@ describe('analyzeTranscript', () => {
   const okOutput = {
     title: '預算與報價',
     overview: '討論預算',
-    topics: [{ title: '預算', content: '內容' }],
+    topics: [{ title: '預算', content: '內容', points: [{ text: '預算上限 50 萬', segment_from: 1, segment_to: 1 }] }],
     decisions: [{ text: '採用方案 A', segment_from: 1, segment_to: 1, decided_by: null }],
     action_items: [{ text: '追蹤報價', segment_from: 1, segment_to: 1, assignee: null, due: null }],
     open_questions: [],
@@ -351,6 +351,11 @@ describe('analyzeTranscript', () => {
 
     const schema = (generateContent.mock.calls[0][0] as any).config.responseSchema;
     expect(schema.properties.decisions.items.properties.decided_by.nullable).toBe(true);
+    // 討論要點必填且每點要有出處，不帶提出者（SDD v0.9、D-021）
+    const topicItem = schema.properties.topics.items;
+    expect(topicItem.required).toEqual(['title', 'content', 'points']);
+    expect(topicItem.properties.points.items.required).toEqual(['text', 'segment_from', 'segment_to']);
+    expect(Object.keys(topicItem.properties.points.items.properties).sort()).toEqual(['segment_from', 'segment_to', 'text']);
     expect(schema.properties.action_items.items.properties.assignee.nullable).toBe(true);
     expect(schema.properties.action_items.items.properties.due.nullable).toBe(true);
   });

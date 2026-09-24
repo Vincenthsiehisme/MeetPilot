@@ -265,8 +265,11 @@ base64**：base64 會先把整個檔案變成一條字串留在記憶體裡還�
 可以只重跑分析。續傳游標是 `meetings.processed_slices`。音檔在**分析成功之後**才刪，轉錄或分析
 失敗時保留供重試。
 
-`ANALYZING`（產出結論、待辦、未決事項）的規範正本在 `prompts/meeting-record-spec.md`，
-`analyzeTranscript` 啟動時讀進 systemInstruction，不在程式碼裡另外抄一份規則。
+`ANALYZING`（產出討論、結論、待辦、未決事項）的規範正本在 `prompts/meeting-record-spec.md`，
+`analyzeTranscript` 啟動時讀進 systemInstruction，不在程式碼裡另外抄一份規則。討論段每個議題是
+「走到哪」一兩句加條列要點，每點都帶逐字稿出處、不標提出者（`C-ANALYSIS` 的 `topics[].points`，加欄位、
+`contract_version` 不動；舊會議沒有 `points`，照原本只顯示整段內容，不會自動重跑）。網頁、列印、匯出、
+vault 投影都把出處印成接在要點後面的縮小時間標籤。
 
 重啟時分兩步：
 

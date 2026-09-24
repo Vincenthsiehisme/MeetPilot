@@ -44,6 +44,24 @@ describe('buildPrintDocument', () => {
     );
   });
 
+  it('議題的要點逐條印出、時間放在縮小標籤裡，文字與時間都經過跳脫（SDD v0.9）', () => {
+    const analysis: AnalysisV3 = {
+      ...baseAnalysis,
+      topics: [{
+        title: '報價',
+        content: '已對齊',
+        points: [{ text: '<script>x</script>', evidence: { start: 0, end: 30 } }, { text: '沒出處', evidence: null }],
+      }],
+    };
+    const html = buildPrintDocument(baseJob, analysis);
+
+    expect(html).not.toContain('<script>x');
+    expect(html).toContain(
+      '<div class="topic-item"><span class="topic-title">報價</span><div class="pre">已對齊</div>'
+      + '<ul><li>&lt;script&gt;x&lt;/script&gt;<span class="evidence-tag">00:00–00:30</span></li><li>沒出處</li></ul></div>'
+    );
+  });
+
   it('topic content 含 <img onerror> 時被跳脫', () => {
     const analysis: AnalysisV3 = {
       ...baseAnalysis,

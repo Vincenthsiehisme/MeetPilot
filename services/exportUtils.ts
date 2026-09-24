@@ -1,6 +1,6 @@
 
 import { Job, TranscriptSegment } from "../types";
-import { ActionItemV3, AnalysisV3, DecisionV3, Evidence, OpenQuestionV3 } from "./analysisContract";
+import { ActionItemV3, AnalysisV3, DecisionV3, Evidence, OpenQuestionV3, TopicV3 } from "./analysisContract";
 import { jobDisplayName, jobDownloadBaseName } from "./meetingTitle";
 
 /**
@@ -102,12 +102,23 @@ export const exportPolishedContent = (fileName: string, content: string) => {
   downloadFile(content, `${fileName}_polished.md`, "text/markdown");
 };
 
+/** 議題：小標、走到哪、條列要點；要點的出處用行內程式碼當縮小標籤，跟 vaultProjector.ts 同一種寫法。
+ * 舊資料沒有 points，只印 content */
+const renderTopicMarkdown = (t: TopicV3): string => [
+  `### ${t.title}`,
+  t.content,
+  ...(t.points ?? []).map((pt) => {
+    const range = formatEvidenceRange(pt.evidence);
+    return range === null ? `- ${pt.text}` : `- ${pt.text} \`${range}\``;
+  }),
+].join('\n');
+
 // 會議記錄的匯出收整個 job 不只收檔名：檔名用標題（jobDownloadBaseName），內文的「來源檔名」仍是原始檔名，
 // 兩者不是同一個字串，收一個字串進來就得在呼叫端二選一
 export const exportSummaryAsMarkdown = (job: Pick<Job, 'title' | 'fileName'>, analysis: AnalysisV3) => {
   const { overview, topics, decisions, action_items, open_questions } = analysis;
 
-  const topicsSection = topics.map((t) => `### ${t.title}\n${t.content}`).join('\n\n');
+  const topicsSection = topics.map((t) => renderTopicMarkdown(t)).join('\n\n');
 
   const md = `
 # ${jobDisplayName(job)}
@@ -141,7 +152,14 @@ ${open_questions.length > 0 ? open_questions.map((q) => `- ${renderOpenQuestionL
 export const exportSummaryAsText = (job: Pick<Job, 'title' | 'fileName'>, analysis: AnalysisV3) => {
    const { overview, topics, decisions, action_items, open_questions } = analysis;
 
-   const topicsSection = topics.map((t) => `【${t.title}】\n${t.content}`).join('\n\n');
+   const topicsSection = topics.map((t) => [
+     `【${t.title}】`,
+     t.content,
+     ...(t.points ?? []).map((pt) => {
+       const range = formatEvidenceRange(pt.evidence);
+       return range === null ? `・${pt.text}` : `・${pt.text}（${range}）`;
+     }),
+   ].join('\n')).join('\n\n');
 
    const txt = `
  ${jobDisplayName(job)}

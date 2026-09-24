@@ -16,6 +16,7 @@ const PRINT_STYLE = `
   h3 { font-size: 12px; color: #999; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 5px; }
   .meta { font-size: 12px; color: #666; margin-bottom: 30px; }
   .meta-inline { font-size: 11px; color: #999; }
+  .evidence-tag { font-size: 10px; color: #888; background: #f1f1f1; border-radius: 3px; padding: 0 4px; margin-left: 6px; white-space: nowrap; }
   .pre { white-space: pre-wrap; }
   .topic-item { margin-bottom: 20px; }
   .topic-title { font-weight: bold; display: block; margin-bottom: 5px; }
@@ -36,10 +37,16 @@ const renderTopics = (topics: AnalysisV3['topics']): string => {
     return '<p class="empty">無議題</p>';
   }
   return topics
-    .map(
-      (topic) =>
-        `<div class="topic-item"><span class="topic-title">${escapeHtml(topic.title)}</span><div class="pre">${escapeHtml(topic.content)}</div></div>`
-    )
+    .map((topic) => {
+      // 舊資料沒有 points：只印整段 content，跟改版前一樣
+      const points = topic.points === undefined || topic.points.length === 0
+        ? ''
+        : `<ul>${topic.points.map((pt) => {
+          const range = formatEvidenceRange(pt.evidence);
+          return `<li>${escapeHtml(pt.text)}${range === null ? '' : `<span class="evidence-tag">${escapeHtml(range)}</span>`}</li>`;
+        }).join('')}</ul>`;
+      return `<div class="topic-item"><span class="topic-title">${escapeHtml(topic.title)}</span><div class="pre">${escapeHtml(topic.content)}</div>${points}</div>`;
+    })
     .join('');
 };
 

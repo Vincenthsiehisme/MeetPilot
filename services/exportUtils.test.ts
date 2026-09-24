@@ -140,6 +140,25 @@ describe('exportSummaryAsMarkdown／exportSummaryAsText 的標題與空題目', 
     expect(withoutTitle.startsWith('a.m4a\n')).toBe(true);
   });
 
+  it('有要點時 Markdown 用行內程式碼當時間標籤、Text 用括號；舊資料沒有要點只印 content（SDD v0.9）', async () => {
+    const withPoints: AnalysisV3 = {
+      ...analysis,
+      topics: [
+        { title: '報價', content: '已對齊', points: [{ text: 'A 廠每套 1,200 元', evidence: { start: 65, end: 70 } }, { text: '沒出處', evidence: null }] },
+        { title: '舊的', content: '整段舊內容' },
+      ],
+    };
+    exportSummaryAsMarkdown({ fileName: 'a.m4a' }, withPoints);
+    const md = await lastBlob().text();
+    expect(md).toContain('### 報價\n已對齊\n- A 廠每套 1,200 元 `01:05–01:10`\n- 沒出處');
+    expect(md).toContain('### 舊的\n整段舊內容');
+
+    exportSummaryAsText({ fileName: 'a.m4a' }, withPoints);
+    const txt = await lastBlob().text();
+    expect(txt).toContain('【報價】\n已對齊\n・A 廠每套 1,200 元（01:05–01:10）\n・沒出處');
+    expect(txt).toContain('【舊的】\n整段舊內容');
+  });
+
   it('Text：沒有討論題目時顯式寫「本場沒有討論題目」，不是空白', async () => {
     exportSummaryAsText({ fileName: 'a.m4a' }, analysis);
     expect(await lastBlob().text()).toContain('(本場沒有討論題目)');
