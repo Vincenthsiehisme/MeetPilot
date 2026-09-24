@@ -18,8 +18,11 @@ import { join } from 'node:path';
 import { buildServerEnv } from './serverEnv';
 import { createLogTail } from './logTail';
 
-// userData 固定叫 MeetPilot，不跟 package.json 的 name 走：資料夾名要穩定，改套件名或產品名不能讓資料「消失」
-app.setPath('userData', join(app.getPath('appData'), 'MeetPilot'));
+// userData 固定叫 MeetPilot，不跟 package.json 的 name 走：資料夾名要穩定，改套件名或產品名不能讓資料「消失」。
+// MEETPILOT_DESKTOP_USER_DATA 只給 scripts/smokeDesktop.mjs 用：冒煙測試要用拋棄式的資料夾，
+// 不能拿正式資料啟動（server 一起來就會 migrate、回收 job、開始跑 worker）。單一實例鎖也跟著 userData 走，
+// 所以測試跟正式 app 可以同時開
+app.setPath('userData', process.env.MEETPILOT_DESKTOP_USER_DATA || join(app.getPath('appData'), 'MeetPilot'));
 
 const SERVER_READY_TIMEOUT_MS = 30_000;
 const LOG_TAIL_LINES = 40;
@@ -29,6 +32,13 @@ let tray: Tray | null = null;
 let server: UtilityProcess | null = null;
 let serverOrigin: string | null = null;
 let quitting = false;
+
+/** 啟動階段的失敗：帶著結束碼與最後幾行輸出，交給唯一負責復原的地方（bootServerIntoWindow） */
+class ServerStartupError extends Error {
+  constructor(message: string, readonly code: number, readonly lines: string[]) {
+    super(message);
+  }
+}
 
 const logDir = () => join(app.getPath('userData'), 'logs');
 const serverLogPath = () => join(logDir(), 'server.log');
@@ -98,13 +108,24 @@ async function startServer(): Promise<void> {
   child.stderr?.on('data', onOutput);
   appendFileSync(serverLogPath(), `\n--- ${new Date().toISOString()} 啟動 server（port ${port}）---\n`);
 
+  // 就緒之前的結束不在這裡處理：waitForServer 會拋，由 bootServerIntoWindow 的 catch 負責，
+  // 只有一個地方跳錯誤視窗。兩邊都處理的話，使用者按兩次「重新啟動」就會起兩個 server 搶同一個 DB
+  // （Codex review 2026-09-24）
+  let ready = false;
+  let exitCode: number | null = null;
   child.once('exit', (code) => {
+    exitCode = code;
     if (server === child) server = null;
-    if (quitting) return;
+    if (quitting || !ready) return;
     void onServerExit(code, logTail.lines());
   });
   server = child;
-  await waitForServer(origin, child);
+  try {
+    await waitForServer(origin, child);
+  } catch (err) {
+    throw new ServerStartupError((err as Error).message, exitCode ?? -1, [...logTail.lines(), (err as Error).message]);
+  }
+  ready = true;
   serverOrigin = origin;
 }
 
@@ -136,7 +157,8 @@ async function bootServerIntoWindow(): Promise<void> {
     const child = server;
     server = null;
     child?.kill();
-    await onServerExit(-1, [(err as Error).message]);
+    const failure = err instanceof ServerStartupError ? err : new ServerStartupError(String(err), -1, [String(err)]);
+    await onServerExit(failure.code, failure.lines);
     return;
   }
   await mainWindow?.loadURL(`${serverOrigin}/`);
@@ -153,10 +175,28 @@ function createWindow(): void {
     title: 'MeetPilot',
     webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
-  // 視窗只顯示 server 的頁面；外部連結開系統瀏覽器，不在 app 裡換頁
+  // 視窗只顯示 server 的頁面；外部連結開系統瀏覽器，不在 app 裡換頁。
+  // 唯一放行的新視窗是 about:blank：會議記錄的列印是 window.open('', '_blank') 寫入內容再 print()
+  // （components/SummaryView.tsx），全擋的話 window.open 回 null，列印按了沒反應（Codex review 2026-09-24）
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (url === 'about:blank' || url === '') {
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          width: 900,
+          height: 700,
+          title: 'MeetPilot 列印',
+          webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
+        },
+      };
+    }
     if (/^https?:\/\//.test(url) && !isServerUrl(url)) void shell.openExternal(url);
     return { action: 'deny' };
+  });
+  // 列印視窗只准停在 about:blank，不准再導去別的地方，也不准再開視窗
+  mainWindow.webContents.on('did-create-window', (child) => {
+    child.webContents.on('will-navigate', (event) => event.preventDefault());
+    child.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   });
   mainWindow.webContents.on('will-navigate', (event, url) => {
     if (!isServerUrl(url)) event.preventDefault();

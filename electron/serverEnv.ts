@@ -27,10 +27,14 @@ export interface ServerEnvInput {
 }
 
 // server 會看的設定變數前綴與名稱。不在這張表裡的系統變數（PATH、HOME、SystemRoot、TEMP…）照傳，
-// 子程序要靠它們找 ffmpeg、建暫存檔
+// 子程序要靠它們找 ffmpeg、建暫存檔。
+// 比對前轉大寫：Windows 的環境變數名稱不分大小寫，父程序帶 `meetpilot_basic_auth_user` 的話，
+// 子程序照樣讀得到 MEETPILOT_BASIC_AUTH_USER（Codex review 2026-09-24）
 const SERVER_CONFIG_KEYS = new Set(['HOST', 'PORT', 'NODE_ENV', 'GEMINI_API_KEY']);
-const isServerConfigKey = (key: string): boolean =>
-  SERVER_CONFIG_KEYS.has(key) || key.startsWith('MEETPILOT_');
+const isServerConfigKey = (key: string): boolean => {
+  const upper = key.toUpperCase();
+  return SERVER_CONFIG_KEYS.has(upper) || upper.startsWith('MEETPILOT_');
+};
 
 export function buildServerEnv(input: ServerEnvInput): Record<string, string> {
   const env: Record<string, string> = {};

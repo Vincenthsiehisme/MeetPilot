@@ -53,6 +53,19 @@ describe('buildServerEnv', () => {
     expect(env).not.toHaveProperty('GEMINI_API_KEY');
   });
 
+  it('大小寫不同的同名變數也擋：Windows 的環境變數名稱不分大小寫', () => {
+    const env = buildServerEnv({
+      baseEnv: { meetpilot_basic_auth_user: 'u', MeetPilot_Linking: 'off', Port: '3000', gemini_api_key: 'k', Path: 'C:\\bin' },
+      userDataDir: '/d',
+      port: 5000,
+    });
+    expect(Object.keys(env).map((k) => k.toUpperCase())).not.toContain('MEETPILOT_BASIC_AUTH_USER');
+    expect(env).not.toHaveProperty('MeetPilot_Linking');
+    expect(env).not.toHaveProperty('Port');
+    expect(env).not.toHaveProperty('gemini_api_key');
+    expect(env.Path).toBe('C:\\bin');
+  });
+
   it('有給 Gemini key 才帶；空白的 key 不帶，不拿空字串頂替', () => {
     expect(buildServerEnv({ baseEnv: {}, userDataDir: '/d', port: 1, geminiApiKey: ' k ' }).GEMINI_API_KEY).toBe('k');
     expect(buildServerEnv({ baseEnv: {}, userDataDir: '/d', port: 1, geminiApiKey: '  ' })).not.toHaveProperty('GEMINI_API_KEY');
