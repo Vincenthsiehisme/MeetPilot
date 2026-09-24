@@ -221,16 +221,23 @@ export const shouldApplyDetail = (requestedMeetingId: string, current: Selection
 /**
  * 同一場會的詳情請求會重疊：存檔後重拉一次，polling 那一拍也在拉。先送出的請求晚回來時，
  * 它帶的是較舊的資料，套上去會把剛存的內容蓋回舊版；使用者若在那之後接著編輯，舊版會連同新修改
- * 一起被存回 server。所以只套用最後送出的那個請求的回應。
+ * 一起被存回 server。所以只套用同一場會最後送出的那個請求的回應。
  *
- * begin() 在送出請求前呼叫，回傳的函式在回應回來時問「我還是最後一個嗎」。
+ * 新舊一場會各算各的：存完 A 就點去 B 的時候，B 的請求先送出、A 存完後的重拉才送出。
+ * 全部共用一個計數的話，A 的重拉會讓 B 的請求變成「不是最後一個」，B 的回應被丟掉，A 的回應
+ * 又因為已經不在 A 被丟掉，B 就一直停在沒有詳情的畫面（2026-09-24 在隔離 server 上實測）。
+ * 別場會的回應本來就由 shouldApplyDetail 擋，這裡只管同一場裡的新舊。
+ *
+ * begin(meetingId) 在送出請求前呼叫，回傳的函式在回應回來時問「我還是這場會最後一個嗎」。
  */
 export const createLatestRequestGate = () => {
-  let latest = 0;
+  const latest = new Map<string, number>();
+  let counter = 0;
   return {
-    begin: (): (() => boolean) => {
-      const id = ++latest;
-      return () => id === latest;
+    begin: (meetingId: string): (() => boolean) => {
+      const id = ++counter;
+      latest.set(meetingId, id);
+      return () => latest.get(meetingId) === id;
     },
   };
 };

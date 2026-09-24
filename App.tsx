@@ -149,7 +149,7 @@ const App: React.FC = () => {
   // 都要看 meeting 的原始狀態，activeServerJob 是轉成 Job 形狀給元件用的顯示版本，缺這些欄位
   const [activeDetail, setActiveDetail] = useState<MeetingDetailResponse | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
-  // 詳情請求重疊時（存檔後重拉、polling 那一拍）只套最後送出的那個：先送出的晚回來，帶的是存檔前的舊內容
+  // 同一場會的詳情請求重疊時（存檔後重拉、polling 那一拍）只套最後送出的那個：先送出的晚回來，帶的是存檔前的舊內容
   const [detailRequests] = useState(createLatestRequestGate);
   // 人工編輯的寫回一次一個、照送出的順序。送的是整份快照，兩次重疊時晚到的舊快照會蓋掉新的
   const [editSaves] = useState(createSaveQueue);
@@ -234,7 +234,7 @@ const App: React.FC = () => {
       meetingId,
       getMeetingDetail,
       () => selectionRef.current,
-      detailRequests.begin(),
+      detailRequests.begin(meetingId),
       {
         onDetail: detail => {
           try {
@@ -870,7 +870,7 @@ const App: React.FC = () => {
 
   /**
    * JobDetail 的編輯寫回 server。回傳這次有沒有存進去：沒有的話原因已經用 alert 講了，
-   * SummaryView 靠它決定草稿要不要留著等下一次送。
+   * SummaryView、TranscriptView 靠它決定草稿要不要留著等下一次送。
    *
    * 寫完重新拉一次 detail，不只更新本地 state：畫面上顯示的要是 server 真的存下來的東西，
    * 不是前端以為它存進去的東西。

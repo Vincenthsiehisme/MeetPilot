@@ -11,7 +11,7 @@ import { isDesktopApp } from '../services/micRecorder';
 
 interface JobDetailProps {
   job: Job;
-  /** 回傳這次有沒有存進去（沒有的話原因已經講給使用者了）。SummaryView 靠它決定草稿要不要留著 */
+  /** 回傳這次有沒有存進去（沒有的話原因已經講給使用者了）。SummaryView、TranscriptView 靠它決定草稿要不要留著 */
   onUpdateJob: (updates: Partial<Job>) => Promise<boolean>;
   onAlert: (title: string, message: string) => void;
   onRetry?: (id: string) => void;
@@ -238,8 +238,10 @@ const JobDetail: React.FC<JobDetailProps> = ({
           </div>
         )}
 
+        {/* key：理由同下面的 SummaryView */}
         {activeTab === 'transcript' && job.transcript && (
-          <TranscriptView 
+          <TranscriptView
+            key={job.id}
             exportBaseName={jobDownloadBaseName(job)}
             segments={job.transcript}
             polishedContent={job.polishedContent}

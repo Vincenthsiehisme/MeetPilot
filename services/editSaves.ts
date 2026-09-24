@@ -1,14 +1,14 @@
 /**
- * 人工編輯寫回 server 的兩道順序保證（App.tsx 與 SummaryView 用）。
+ * 人工編輯寫回 server 的兩道順序保證（App.tsx、SummaryView 與 TranscriptView 用）。
  *
- * 會議記錄與逐字稿的 PATCH 都是送整份快照。原本 SummaryView 每打一個字就送一次，而且快照是用
+ * 會議記錄與逐字稿的 PATCH 都是送整份快照。原本 SummaryView 與 TranscriptView 每打一個字就送一次，而且快照是用
  * 還沒刷新的 prop 組的：受控的 textarea 在刷新回來前被 React 還原成舊值，下一個字就接在舊值後面。
  * 2026-09-24 在隔離 server 上逐鍵打 26 個字母，26 支 PATCH 同時在路上，最後 server 只多了最後一個字，
  * 第 49 個請求開始吃 429（web 版限流每分鐘 60 次，每個字是 PATCH 加兩支 GET）。
  *
  * 修法分兩半，這裡是可以脫離 React 測的那兩半：
  * - createSaveQueue：同一個 App 的寫回一次一個、照送出的順序寫。
- * - createDraftSync：SummaryView 的本地草稿什麼時候可以拿 server 的版本蓋掉。
+ * - createDraftSync：SummaryView、TranscriptView 的本地草稿什麼時候可以拿 server 的版本蓋掉。
  * 詳情回應的新舊判斷在 meetingAdapter.ts 的 createLatestRequestGate。
  */
 
