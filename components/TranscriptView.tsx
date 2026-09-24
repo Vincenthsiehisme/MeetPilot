@@ -3,6 +3,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { TranscriptSegment } from '../types';
 import { polishTranscript } from '../services/geminiService';
 import { exportTranscriptAsSRT, exportTranscriptAsText, exportPolishedContent } from '../services/exportUtils';
+import { splitForHighlight } from '../services/searchHighlight';
 
 interface TranscriptViewProps {
   /** 下載檔名的主體（標題或原始檔名，JobDetail 算好傳進來）。這個元件只拿它組匯出檔名 */
@@ -61,13 +62,13 @@ const TranscriptView: React.FC<TranscriptViewProps> = ({ exportBaseName, segment
 
   const highlightText = (text: string) => {
     if (!searchTerm.trim()) return text;
-    const parts = text.split(new RegExp(`(${searchTerm})`, 'gi'));
+    const parts = splitForHighlight(text, searchTerm);
     return (
       <span>
-        {parts.map((part, i) => 
-          part.toLowerCase() === searchTerm.toLowerCase() 
-            ? <mark key={i} className="bg-yellow-200 text-slate-900 rounded-sm px-0.5">{part}</mark> 
-            : part
+        {parts.map((part, i) =>
+          part.match
+            ? <mark key={i} className="bg-yellow-200 text-slate-900 rounded-sm px-0.5">{part.text}</mark>
+            : part.text
         )}
       </span>
     );
