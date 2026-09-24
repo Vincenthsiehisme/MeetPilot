@@ -147,6 +147,8 @@ node scripts/smokeDesktop.mjs <打包後的執行檔>   # 啟動打包後的 app
 - token 與 Gemini key 用 Electron `safeStorage` 加密後存在 userData 的 `credentials.json`（macOS 鑰匙圈的
   「MeetPilot Safe Storage」、Windows DPAPI）；安全儲存不能用的電腦不存，不退回明文。名單存 `roster.json`，
   投影資料夾存 `desktop-settings.json`，這兩個不加密：名單匯入後本來就以明文存在 SQLite。
+  Windows 的加密金鑰（DPAPI 保護）存在 userData 的 `Local State`，Chromium 約十秒內或正常結束時才寫檔：
+  設定完不到十秒 app 就被強制結束的話，下次打開登入資料解不開，設定頁會講原因、要重新輸入邀請碼。
 - **每次啟動都向 gateway 更新 key 與名單。** 連不上（網路、逾時、5xx、回應內容不對）就用上次存的繼續，
   server 的畫面底部掛一條離線橫幅說哪一樣是舊的；gateway 回 401（邀請碼被撤銷）就刪掉 token、key、名單，
   回設定頁講原因，不退回上次的。撤銷只在啟動時檢查，app 一直開著不會中途停。

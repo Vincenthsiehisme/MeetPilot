@@ -280,6 +280,14 @@ await waitFor(phase, 'server 的頁面載好', () => evaluate(serverPageOnline, 
 if (await evaluate(serverPageOnline, `document.getElementById('meetpilot-offline-banner') !== null`)) {
   await fail(phase, 'gateway 正常時也掛了離線橫幅');
 }
+// Windows 的 safeStorage 金鑰由 DPAPI 保護、存在 userData 的 Local State，Chromium 約十秒或正常結束時才寫檔；
+// 這裡的 stop() 是 taskkill /F，太早砍掉金鑰就沒存下來，下一段解不開（2026-09-24 CI 實測）。等它寫下來再收
+if (process.platform === 'win32') {
+  await waitFor(phase, 'Local State 存下 safeStorage 的金鑰', () => {
+    const localState = join(userData, 'Local State');
+    return existsSync(localState) && readFileSync(localState, 'utf8').includes('"encrypted_key"');
+  }, 30_000);
+}
 await stop();
 console.log(`[desktop-smoke] ${phase}通過：錯的邀請碼與拿不到名單都留在設定頁；正確的換到 key 與 ${names.length} 人名單，port ${first.port}，ffmpeg 用隨附的 ${ffmpegLine}`);
 

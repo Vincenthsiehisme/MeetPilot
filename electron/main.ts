@@ -364,7 +364,12 @@ function readStoredState(): { vaultDir: string | null; credentials: DesktopCrede
     if (!(err instanceof DesktopStoreError)) throw err;
     // 不刪：讀不到可能是暫時的（Windows 防毒鎖檔、macOS 鑰匙圈詢問時按了拒絕），刪了就只能重拿邀請碼。
     // 重新輸入邀請碼存檔時會整份蓋掉；只有 gateway 回 401 才刪（2026-09-24 review）
-    problems.push(`上次存的登入資料讀不出來（${err.message}）。如果剛才鑰匙圈跳出詢問，請結束後重新打開 MeetPilot 並按「允許」；不然就重新輸入邀請碼`);
+    // 兩個平台讀不出來的常見原因不同：macOS 是鑰匙圈詢問時按了拒絕；Windows 的加密金鑰存在 userData 的
+    // Local State，設定完不到十秒 app 就被強制結束的話金鑰沒寫下來（2026-09-24 CI 實測）
+    const hint = process.platform === 'darwin'
+      ? '如果剛才鑰匙圈跳出詢問，請結束後重新打開 MeetPilot 並按「允許」；不然就重新輸入邀請碼'
+      : '上次設定完 MeetPilot 可能很快就被強制結束，加密用的金鑰沒存下來，請重新輸入邀請碼';
+    problems.push(`上次存的登入資料讀不出來（${err.message}）。${hint}`);
   }
   return { vaultDir, credentials, problem: problems.length === 0 ? null : problems.join('\n') };
 }
