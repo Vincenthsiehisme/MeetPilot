@@ -28,7 +28,7 @@ if [ ! -f "$TARBALL" ]; then
 fi
 actual=$( (command -v sha256sum >/dev/null && sha256sum "$TARBALL" || shasum -a 256 "$TARBALL") | cut -d' ' -f1)
 if [ "$actual" != "$SHA256" ]; then
-  echo "ffmpeg-$VERSION.tar.xz 的 sha256 是 $actual，預期 $SHA256，拒絕編譯" >&2
+  echo "ffmpeg-$VERSION.tar.xz 的 sha256 是 ${actual}，預期 ${SHA256}，拒絕編譯" >&2
   exit 1
 fi
 if command -v gpg >/dev/null; then
@@ -82,5 +82,5 @@ fi
 rm -rf "$OUT" && mkdir -p "$OUT"
 cp "ffmpeg$EXE" "ffprobe$EXE" "$OUT/"
 cp COPYING.LGPLv2.1 "$OUT/LICENSE-ffmpeg.txt"
-echo "ffmpeg $VERSION（$TARGET，LGPL 2.1+）→ $OUT"
+echo "ffmpeg ${VERSION}（${TARGET}，LGPL 2.1+）→ $OUT"
 ls -l "$OUT"
