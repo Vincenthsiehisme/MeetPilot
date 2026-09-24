@@ -66,7 +66,7 @@ while (Date.now() < deadline) {
   if (starts.length > 0) {
     port = starts[starts.length - 1][1];
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/api/health`);
+      const res = await fetch(`http://127.0.0.1:${port}/api/health`, { signal: AbortSignal.timeout(3000) });
       if (res.ok) { health = await res.json(); break; }
     } catch {
       // server 還沒 listen，下一輪再試
@@ -76,7 +76,7 @@ while (Date.now() < deadline) {
 }
 if (health === null) fail(port === null ? `${TIMEOUT_MS / 1000} 秒內 server.log 沒出現新的啟動紀錄` : `${TIMEOUT_MS / 1000} 秒內 port ${port} 的 /api/health 沒有回 200`);
 
-const page = await fetch(`http://127.0.0.1:${port}/`);
+const page = await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(10_000) });
 const html = await page.text();
 if (!page.ok || !html.includes('<div id="root">')) fail(`GET / 回 ${page.status}，內容不是 build 出來的 index.html`);
 

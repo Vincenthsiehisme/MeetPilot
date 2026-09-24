@@ -292,7 +292,13 @@ async function startServer() {
   analysisWorker.poke();
 
   const { host, port, basicAuth } = listenConfig;
-  app.listen(port, host, () => {
+  // Express 5 把 listen 失敗（EADDRINUSE、EACCES）交給這個 callback。不看 err 的話會印出「Server running」
+  // 然後因為沒有任何東西撐住事件迴圈而以結束碼 0 安靜退出，看起來像成功（2026-09-24 實測）
+  app.listen(port, host, (err?: Error) => {
+    if (err) {
+      console.error(`[MeetPilot] 無法在 ${host}:${port} 監聽：${err.message}`);
+      process.exit(1);
+    }
     console.log(`Server running on http://${host}:${port}${basicAuth ? ' (Basic Auth on /api/*)' : ''}`);
   });
 }

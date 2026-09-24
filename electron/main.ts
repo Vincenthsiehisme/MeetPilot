@@ -100,6 +100,8 @@ const statusPage = (title: string, body: string) =>
 
 async function startServer(): Promise<void> {
   const logTail = createLogTail(LOG_TAIL_LINES);
+  // 寫入錯誤跟著這一輪 server 走：上次磁碟滿、這次空出來了，不該還顯示上次的原因
+  logWriteError = null;
   const port = await pickFreePort();
   const origin = `http://127.0.0.1:${port}`;
   const appPath = app.getAppPath();
@@ -141,6 +143,11 @@ async function startServer(): Promise<void> {
   } catch (err) {
     throw new ServerStartupError((err as Error).message, exitCode ?? -1, [...logTail.lines(), (err as Error).message]);
   }
+  // health 回 200 之後才處理到 exit 事件的話，exit listener 看到 ready === false 已經 return 了；
+  // 這裡不再確認一次，這次崩潰就沒有任何地方處理（沒有錯誤視窗）
+  if (exitCode !== null) {
+    throw new ServerStartupError('server 回應健康檢查之後就結束了', exitCode, logTail.lines());
+  }
   ready = true;
   serverOrigin = origin;
 }
@@ -152,7 +159,7 @@ async function onServerExit(code: number, lines: string[]): Promise<void> {
   const logNote = logWriteError === null
     ? `完整紀錄：${serverLogPath()}`
     : `紀錄檔寫不進去（${logWriteError}），這次沒有完整紀錄：${serverLogPath()}`;
-  mainWindow?.loadURL(statusPage('MeetPilot 的背景程式停止了', `結束碼 ${code}。完整紀錄在 ${serverLogPath()}`));
+  loadInWindow(statusPage('MeetPilot 的背景程式停止了', `結束碼 ${code}。${logNote}`));
   const { response } = await dialog.showMessageBox({
     type: 'error',
     title: 'MeetPilot',
@@ -167,20 +174,41 @@ async function onServerExit(code: number, lines: string[]): Promise<void> {
   else app.quit();
 }
 
+// loadURL 在下一次載入打斷它時會以 ERR_ABORTED reject（例如 server 在頁面載入途中崩潰，改載錯誤頁）。
+// 那是預期的，其他失敗寫進 log，不留 unhandled rejection
+function loadInWindow(url: string): void {
+  mainWindow?.loadURL(url).catch((err: Error & { code?: string }) => {
+    if (err.code !== 'ERR_ABORTED') writeLog(`--- 視窗載入失敗（${url.slice(0, 80)}）：${err.message} ---\n`);
+  });
+}
+
+// 殺掉子程序之後等它真的結束，才讓使用者按「重新啟動」：同一個 userData 只能有一個 server，
+// 不能靠「SIGTERM 通常很快」這種時間差成立
+function killAndWait(child: UtilityProcess | null, timeoutMs = 5_000): Promise<void> {
+  if (!child || child.pid === undefined) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    child.once('exit', () => { clearTimeout(timer); resolve(); });
+    child.kill();
+  });
+}
+
 async function bootServerIntoWindow(): Promise<void> {
-  mainWindow?.loadURL(statusPage('MeetPilot 啟動中…', '正在準備資料庫與背景程式。'));
+  loadInWindow(statusPage('MeetPilot 啟動中…', '正在準備資料庫與背景程式。'));
   try {
     await startServer();
   } catch (err) {
     // 就緒失敗時子程序可能還活著（例如卡在啟動），先收掉，再交給跟崩潰同一條路處理
     const child = server;
     server = null;
-    child?.kill();
+    await killAndWait(child);
+    // 啟動途中使用者按了「結束」：server 是被 before-quit 收掉的，不是壞了，不跳錯誤視窗
+    if (quitting) return;
     const failure = err instanceof ServerStartupError ? err : new ServerStartupError(String(err), -1, [String(err)]);
     await onServerExit(failure.code, failure.lines);
     return;
   }
-  await mainWindow?.loadURL(`${serverOrigin}/`);
+  loadInWindow(`${serverOrigin}/`);
 }
 
 function isServerUrl(url: string): boolean {
