@@ -51,13 +51,16 @@ CLI。這仍然是 CLI 邏輯的重用，不是新增的 API 端點或前端介�
 admin 在自己的電腦發布一次：
 
 ```bash
-BLOB_READ_WRITE_TOKEN=<token> npx tsx scripts/publishRoster.ts <csv-path>
+npx tsx scripts/publishRoster.ts <csv-path>
 ```
+
+macOS 與 Windows 同一行。腳本先驗 CSV，驗過才提示貼上 Blob token（Vercel 的 Blob store 頁面拿），輸入不顯示、
+不進 shell history。
 
 先用跟 CLI 匯入同一套 `parseRosterCsv` 整份驗過，有任何一列錯就整批不發；通過才上傳到 gateway
 私有 Blob store 的 `roster/people.json`（`{ version: 1, rows }`，形狀在 `services/rosterDocument.ts`）。
-名單是 PII，只放 Blob，不進任何 git repo。token 在 Vercel 的 Blob store 頁面，只在這次指令的環境
-變數裡帶，不要寫進 `.env`。app 端從 gateway 拿名單的那一段屬於之後的桌面 app 工作，還沒做。
+名單是 PII，只放 Blob，不進任何 git repo。token 不要寫進 `.env`，也不要用 `BLOB_READ_WRITE_TOKEN=... 指令`
+的寫法帶（會留在 shell history）；那個環境變數只給非互動環境（CI）用。app 端從 gateway 拿名單的那一段屬於之後的桌面 app 工作，還沒做。
 
 ### 用語音備忘錄錄音
 
