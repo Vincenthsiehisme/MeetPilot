@@ -110,7 +110,8 @@ server 行程自己讀不到（`Operation not permitted`），授權是捷徑 Ap
 ## 桌面 app（開發中）
 
 多位記錄人各自在 Mac 或 Windows 上用的版本，Electron 包一層，裡面跑的就是上面這個 server（vault plan
-`MeetPilot · 跨平台打包部署`）。目前做到外殼（E1）、隨附 ffmpeg（E2）、邀請碼設定畫面（E3）與 app 內錄音（E4）。
+`MeetPilot · 跨平台打包部署`）。目前做到外殼（E1）、隨附 ffmpeg（E2）、邀請碼設定畫面（E3）、app 內錄音（E4）
+與從共享資料夾更新（E5）。
 
 ```bash
 npm run ffmpeg:build -- mac-arm64   # 先編隨附的 ffmpeg（mac-arm64、mac-x64、win-x64），輸出到 vendor/ffmpeg/
@@ -165,6 +166,24 @@ node scripts/smokeDesktop.mjs <打包後的執行檔>   # 啟動打包後的 app
   - 中斷之後（app 被結束、當掉、重新整理）那場會停在「錄音中斷了」，server 已經收到的段落都在，按「送出已錄的部分」
     就轉錄那一段；中斷之後的內容沒有錄到，不能接著錄，要另開一場。
   - 還沒驗證：Windows 實機（E6）、跟語音備忘錄同場對照的品質（AC-8）、長時間（100 分鐘）錄音、闔蓋再打開的行為。
+- **從共享資料夾更新（E5，`electron/updater.ts`）。** 新版放在投影資料夾的上一層 `_更新/`，也就是 OneDrive 的
+  `MeetPilot 記錄/_更新/`（投影資料夾是 `MeetPilot 記錄/<自己的名字>/`）。app 啟動時、每 4 小時、托盤「檢查更新…」各看一次；
+  清單版本比這版新、安裝檔大小與 sha512 都對得上，才在托盤與畫面右上角提示「安裝新版」，按了才裝。
+  - **發版（admin）：** 升 `package.json` 的 `version`，推上去等 CI 跑完，下載 `update-bundle` 這個 artifact，
+    裡面的檔案（兩個 dmg、一個 exe、`meetpilot-update.json`）全部放進 `_更新/`，舊版的檔案刪掉。
+    這包由 `scripts/writeUpdateBundle.ts` 產，少任何一個平台、或安裝檔版本跟 `package.json` 不一樣就不產。
+  - `_更新/` 對記錄人的群組只給檢視權限，只有 admin 能寫：安裝檔沒有簽章，app 會直接執行它。
+  - Windows：安裝檔先複製到暫存、複本再驗一次雜湊，才以 `--updated /S --force-run` 靜默安裝，MeetPilot 結束、裝完自動重開。
+    macOS：沒有簽章不能自動換版，打開 dmg 後結束，使用者把 MeetPilot 拖到「應用程式」取代，再自己打開。
+  - 錄音中不裝（更新要結束 app），複製與驗雜湊之後、起安裝程式之前再擋一次。安裝檔還沒同步完（大小不對）只說
+    「還在同步」；讀不了（OneDrive 正在寫、權限）講實際原因；大小對但雜湊不對、或清單讀不懂，提示卡改成警告、不給安裝，要通知 admin。
+  - 起安裝程式之前在 userData 留 `update-pending.json`。安裝程式是 detached 起的、app 接著就結束，它失敗時沒有畫面，
+    所以下次啟動比對版本：沒換成新版就跳一次「上次更新沒有完成」。暫存的安裝檔（`%TEMP%`／`$TMPDIR` 的 `MeetPilot-update/`）每次裝之前清掉。
+  - 不用 electron-updater：它抓檔用的 `net.request` 不收 `file://`（Electron 44.4.5 實測），macOS 的自動安裝又要簽章。
+  - 從 electron-builder 26 的 NSIS 模板讀到、實機還沒驗的：只裝給自己（per-user）的話，靜默更新從 registry 的
+    `InstallLocation` 讀回原本的安裝目錄；第一次安裝時選了「所有使用者」的話，靜默更新會跳系統的權限詢問，按取消就沒裝（下次啟動會講）。
+  - 還沒驗證：兩平台實際換版（AC-7，E6 實機）、OneDrive「檔案隨選」的佔位檔被讀時會不會自動下載、
+    macOS 換版後鑰匙圈會不會跳詢問。
 
 ## 驗證
 

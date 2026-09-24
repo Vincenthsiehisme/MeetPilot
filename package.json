@@ -88,10 +88,14 @@
         }
       ]
     },
+    "dmg": {
+      "artifactName": "MeetPilot-${version}-mac-${arch}.${ext}"
+    },
     "nsis": {
       "oneClick": false,
       "perMachine": false,
-      "allowToChangeInstallationDirectory": true
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "MeetPilot-${version}-win-${arch}.${ext}"
     }
   }
 }

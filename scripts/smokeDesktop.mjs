@@ -8,13 +8,15 @@
 // cwd 對不對、utilityProcess 與 safeStorage 在那個平台能不能用。這支是唯一會真的跑安裝檔內容的檢查，
 // CI 在兩個平台各跑一次；本機只有 macOS，Windows 的結果只有 CI 看得到。
 //
-// 四段，同一份 userData 接著跑（E3）：
+// 六段，同一份 userData 接著跑（E3 起）：
 //   1. 首次設定：出現設定頁 → 經 CDP 填邀請碼與資料夾、按儲存 → server 起來，拿到 gateway 的 key 與名單。
 //   2. 離線：gateway 連不上 → server 用上次存的 key 照樣起來，畫面底部有離線橫幅。
 //   2a. 錄音（E4）：經 CDP 按「開始錄音」、選人、確認 → 把視窗關到系統匣 → 段落照常送到 server →
 //       按「停止錄音」→ 收到的段落變成音檔進轉錄，隨附的 ffmpeg 解得出 opus、長度對得上。
 //       麥克風用 Chromium 的假裝置（--use-fake-device-for-media-stream），不碰真的麥克風、不跳系統權限詢問。
 //   2b. 資料夾不見了：上次選的投影資料夾被刪掉 → 回設定頁講原因，不起 server、不重建資料夾。
+//   2c. 更新（E5）：投影資料夾旁邊的 _更新/ 放比這版新的清單與假安裝檔 → 右上角提示安裝新版；
+//       安裝檔改掉一個位元組（大小不變）→ 不給安裝、講出對不上。不真的安裝：假安裝檔不能執行。
 //   3. 撤銷：gateway 回 401 → 不起 server，回到設定頁講原因，存著的 token、key、名單都刪掉。
 // gateway 是這支自己起的假的（MEETPILOT_DESKTOP_GATEWAY_URL），不用真的邀請碼。設定頁用 CDP
 // （--remote-debugging-port）操作；原生的選資料夾視窗驅動不了，所以直接填路徑欄。
@@ -25,7 +27,8 @@
 // server 一啟動就 migrate、回收上次沒跑完的 job、開始跑 worker，冒煙測試又會把它強制關掉，
 // 在用過桌面版的電腦上會動到真的會議狀態（Codex review 2026-09-24）。
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer as createHttpServer } from 'node:http';
 import { createServer as createNetServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -433,6 +436,55 @@ await stop();
 mkdirSync(vaultDir);
 console.log(`[desktop-smoke] ${phase}通過：不起 server、不重建資料夾，設定頁：${missingMessage}`);
 
+// ======== 2c. 更新（E5） ========
+// 投影資料夾的上一層放 _更新/：一份比這版新的清單加一個假安裝檔 → 畫面右上角提示「安裝新版」；
+// 同一個檔改掉一個位元組（大小不變）→ 不給安裝，改講安裝檔對不上。不按安裝：假安裝檔不能真的執行
+phase = '更新';
+gatewayMode = 'ok';
+const updateDir = join(dirname(vaultDir), '_更新');
+mkdirSync(updateDir);
+const [updateOs, updateExt] = process.platform === 'win32' ? ['win', 'exe'] : ['mac', 'dmg'];
+const fakeInstallerName = `MeetPilot-99.0.0-${updateOs}-${process.arch}.${updateExt}`;
+const fakeInstaller = Buffer.from(`smoke test fake installer ${Date.now()}`);
+writeFileSync(join(updateDir, fakeInstallerName), fakeInstaller);
+writeFileSync(join(updateDir, 'meetpilot-update.json'), JSON.stringify({
+  schema: 1,
+  version: '99.0.0',
+  artifacts: [{
+    platform: process.platform, arch: process.arch, file: fakeInstallerName, size: fakeInstaller.length,
+    sha512: createHash('sha512').update(fakeInstaller).digest('hex'),
+  }],
+}));
+const startupChecks = () => [...readLog().matchAll(/更新檢查（啟動）\[([a-z-]+)\]：(.*) ---/g)];
+const updateBanner = `document.getElementById('meetpilot-update-banner')?.textContent ?? null`;
+
+const checksBeforeReady = startupChecks().length;
+const beforeUpdate = startCount();
+await launch();
+const upd = await waitForServer(phase, beforeUpdate);
+const readyCheck = await waitFor(phase, '啟動時的更新檢查', () => startupChecks()[checksBeforeReady] ?? null);
+if (readyCheck[1] !== 'ready') await fail(phase, `清單與安裝檔都對，更新檢查應該是 ready，實際是 ${readyCheck[1]}：${readyCheck[2]}`);
+const updPage = await waitFor(phase, '主視窗換到 server 的頁面', () => findPage((u) => u.startsWith(`http://127.0.0.1:${upd.port}/`)));
+const readyBanner = await waitFor(phase, '出現新版提示', () => evaluate(updPage, updateBanner), 15_000);
+if (!readyBanner.includes('99.0.0') || !readyBanner.includes('安裝新版')) await fail(phase, `新版提示的內容不對：${readyBanner}`);
+await stop();
+
+const tampered = Buffer.from(fakeInstaller);
+tampered[0] ^= 0xff;
+writeFileSync(join(updateDir, fakeInstallerName), tampered);
+const checksBeforeCorrupt = startupChecks().length;
+const beforeCorrupt = startCount();
+await launch();
+const cor = await waitForServer(phase, beforeCorrupt);
+const corruptCheck = await waitFor(phase, '啟動時的更新檢查', () => startupChecks()[checksBeforeCorrupt] ?? null);
+if (corruptCheck[1] !== 'corrupt') await fail(phase, `安裝檔被改過，更新檢查應該是 corrupt，實際是 ${corruptCheck[1]}：${corruptCheck[2]}`);
+const corPage = await waitFor(phase, '主視窗換到 server 的頁面', () => findPage((u) => u.startsWith(`http://127.0.0.1:${cor.port}/`)));
+const corruptBanner = await waitFor(phase, '出現安裝檔對不上的提示', () => evaluate(corPage, updateBanner), 15_000);
+if (!corruptBanner.includes('對不上') || corruptBanner.includes('安裝新版')) await fail(phase, `安裝檔對不上時的提示不對：${corruptBanner}`);
+await stop();
+rmSync(updateDir, { recursive: true, force: true });
+console.log(`[desktop-smoke] ${phase}通過：新版提示「${readyBanner}」；安裝檔改過一個位元組時不給安裝：「${corruptBanner}」`);
+
 // ======== 3. 撤銷 ========
 phase = '撤銷';
 gatewayMode = 'revoked';
@@ -452,5 +504,5 @@ console.log(`[desktop-smoke] ${phase}通過：gateway 回 401 時不起 server�
 gatewayServer.close();
 await sleep(1500);
 cleanup();
-console.log('[desktop-smoke] 通過：首次設定、離線、錄音、資料夾不見了、撤銷五段都對');
+console.log('[desktop-smoke] 通過：首次設定、離線、錄音、資料夾不見了、更新、撤銷六段都對');
 process.exit(0);
