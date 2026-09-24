@@ -4,14 +4,17 @@ import { TranscriptSegment } from '../types';
 import { polishTranscript } from '../services/geminiService';
 import { exportTranscriptAsSRT, exportTranscriptAsText, exportPolishedContent } from '../services/exportUtils';
 import { splitForHighlight } from '../services/searchHighlight';
+import { createDraftSync } from '../services/editSaves';
 
 interface TranscriptViewProps {
   /** 下載檔名的主體（標題或原始檔名，JobDetail 算好傳進來）。這個元件只拿它組匯出檔名 */
   exportBaseName: string;
   segments: TranscriptSegment[];
   polishedContent?: string;
-  onUpdate: (segments: TranscriptSegment[]) => void;
-  onSavePolished: (text: string) => void;
+  /** 送出一份完整的段落快照去存。回傳有沒有存進去；沒有的話原因已經由呼叫端講給使用者 */
+  onUpdate: (segments: TranscriptSegment[]) => Promise<boolean>;
+  /** 存修潤稿，回傳同 onUpdate */
+  onSavePolished: (text: string) => Promise<boolean>;
   onAlert: (title: string, message: string) => void;
 }
 
@@ -23,6 +26,16 @@ const TranscriptView: React.FC<TranscriptViewProps> = ({ exportBaseName, segment
   const [isExportMenuOpen, setIsExportMenuOpen] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const exportMenuRef = useRef<HTMLDivElement>(null);
+  // 畫面上顯示與編輯的是這份草稿，不是 prop。原本每打一個字就用 prop 組整份段落送出，prop 要等存檔
+  // 後重拉才會變，受控的 textarea 在那之前被還原成舊值，跟 SummaryView 同一個 bug（細節在 services/editSaves.ts）。
+  // 逐字稿這邊每次 PATCH 還會多存一個編輯版本、清掉人名比對結果，一個字一次代價更高
+  const [draft, setDraft] = useState<TranscriptSegment[]>(segments);
+  const [sync] = useState(createDraftSync);
+
+  // server 的版本只在草稿沒有未送出修改、也沒有存檔在路上時才換上來，理由在 createDraftSync
+  useEffect(() => {
+    if (sync.canAdoptServer()) setDraft(segments);
+  }, [segments, sync]);
 
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
@@ -41,17 +54,31 @@ const TranscriptView: React.FC<TranscriptViewProps> = ({ exportBaseName, segment
     return `${h > 0 ? h + ':' : ''}${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
   };
 
+  // 打字只改草稿
   const handleTextChange = (idx: number, newText: string) => {
-    const next = [...segments];
+    const next = [...draft];
     next[idx] = { ...next[idx], text: newText };
-    onUpdate(next);
+    sync.edited();
+    setDraft(next);
+  };
+
+  // 離開那一段才存：一段編輯一次 PATCH，沒改過就不送
+  const finishEditing = async () => {
+    setEditingIdx(null);
+    if (!sync.hasUnsent()) return;
+    sync.saveStarted();
+    const saved = await onUpdate(draft);
+    sync.saveSettled(saved);
   };
 
   const handlePolish = async () => {
     setIsPolishing(true);
     try {
-      const result = await polishTranscript(segments);
-      onSavePolished(result);
+      // 修潤讀的是畫面上的草稿：按修潤之前 textarea 已經失焦，改過的段落已經送出去存
+      const result = await polishTranscript(draft);
+      // 等存完才放掉「修潤中」：修潤稿要等存檔後重拉才出現在 prop，提早放掉的話這段期間畫面又是
+      // 「開始修潤」按鈕，再按一次就是再付一次模型費用。沒存進去的話 App 已經講了原因
+      await onSavePolished(result);
       setViewMode('polished');
     } catch (e: any) {
       onAlert('修潤失敗', e.message);
@@ -77,7 +104,7 @@ const TranscriptView: React.FC<TranscriptViewProps> = ({ exportBaseName, segment
   const handleCopyText = () => {
     let textToCopy = '';
     if (viewMode === 'original') {
-      textToCopy = segments.map(s => `[${formatTime(s.start)}] ${s.speaker ? s.speaker + ': ' : ''}${s.text}`).join('\n');
+      textToCopy = draft.map(s => `[${formatTime(s.start)}] ${s.speaker ? s.speaker + ': ' : ''}${s.text}`).join('\n');
     } else {
       textToCopy = polishedContent || '';
     }
@@ -173,14 +200,14 @@ const TranscriptView: React.FC<TranscriptViewProps> = ({ exportBaseName, segment
                         字幕與時間軸
                       </div>
                       <button 
-                        onClick={() => { exportTranscriptAsSRT(exportBaseName, segments); setIsExportMenuOpen(false); }}
+                        onClick={() => { exportTranscriptAsSRT(exportBaseName, draft); setIsExportMenuOpen(false); }}
                         className="w-full text-left px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 rounded-lg flex items-center gap-2"
                       >
                         <i className="fa-regular fa-file-video text-slate-400 w-4"></i>
                         SRT 字幕檔 (.srt)
                       </button>
                       <button 
-                        onClick={() => { exportTranscriptAsText(exportBaseName, segments, true); setIsExportMenuOpen(false); }}
+                        onClick={() => { exportTranscriptAsText(exportBaseName, draft, true); setIsExportMenuOpen(false); }}
                         className="w-full text-left px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 rounded-lg flex items-center gap-2"
                       >
                          <i className="fa-regular fa-clock text-slate-400 w-4"></i>
@@ -188,7 +215,7 @@ const TranscriptView: React.FC<TranscriptViewProps> = ({ exportBaseName, segment
                       </button>
                       <div className="my-1 border-t border-slate-100"></div>
                       <button 
-                        onClick={() => { exportTranscriptAsText(exportBaseName, segments, false); setIsExportMenuOpen(false); }}
+                        onClick={() => { exportTranscriptAsText(exportBaseName, draft, false); setIsExportMenuOpen(false); }}
                         className="w-full text-left px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 rounded-lg flex items-center gap-2"
                       >
                          <i className="fa-regular fa-file-lines text-slate-400 w-4"></i>
@@ -222,8 +249,8 @@ const TranscriptView: React.FC<TranscriptViewProps> = ({ exportBaseName, segment
         {/* Original View */}
         {viewMode === 'original' && (
           <div className="divide-y divide-slate-50">
-            {segments.map((seg, idx) => {
-              const isSameSpeaker = idx > 0 && segments[idx - 1].speaker === seg.speaker;
+            {draft.map((seg, idx) => {
+              const isSameSpeaker = idx > 0 && draft[idx - 1].speaker === seg.speaker;
               const showSpeaker = !isSameSpeaker || showTimestamps;
               
               return (
@@ -260,7 +287,7 @@ const TranscriptView: React.FC<TranscriptViewProps> = ({ exportBaseName, segment
                         className="w-full text-slate-700 leading-relaxed text-base bg-indigo-50 p-2 rounded-lg border border-indigo-200 outline-none resize-none"
                         value={seg.text}
                         onChange={(e) => handleTextChange(idx, e.target.value)}
-                        onBlur={() => setEditingIdx(null)}
+                        onBlur={finishEditing}
                         rows={Math.max(2, Math.ceil(seg.text.length / 40))}
                       />
                     ) : (

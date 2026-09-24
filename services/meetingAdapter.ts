@@ -219,29 +219,57 @@ export const shouldApplyDetail = (requestedMeetingId: string, current: Selection
   current !== null && current.source === 'server' && current.id === requestedMeetingId;
 
 /**
- * 拉一場會的詳情，只在使用者還停在同一場時才套用。App.tsx 一律用這支，不要自己再寫一次比對。
+ * 同一場會的詳情請求會重疊：存檔後重拉一次，polling 那一拍也在拉。先送出的請求晚回來時，
+ * 它帶的是較舊的資料，套上去會把剛存的內容蓋回舊版；使用者若在那之後接著編輯，舊版會連同新修改
+ * 一起被存回 server。所以只套用同一場會最後送出的那個請求的回應。
+ *
+ * 新舊一場會各算各的：存完 A 就點去 B 的時候，B 的請求先送出、A 存完後的重拉才送出。
+ * 全部共用一個計數的話，A 的重拉會讓 B 的請求變成「不是最後一個」，B 的回應被丟掉，A 的回應
+ * 又因為已經不在 A 被丟掉，B 就一直停在沒有詳情的畫面（2026-09-24 在隔離 server 上實測）。
+ * 別場會的回應本來就由 shouldApplyDetail 擋，這裡只管同一場裡的新舊。
+ *
+ * begin(meetingId) 在送出請求前呼叫，回傳的函式在回應回來時問「我還是這場會最後一個嗎」。
+ */
+export const createLatestRequestGate = () => {
+  const latest = new Map<string, number>();
+  let counter = 0;
+  return {
+    begin: (meetingId: string): (() => boolean) => {
+      const id = ++counter;
+      latest.set(meetingId, id);
+      return () => latest.get(meetingId) === id;
+    },
+  };
+};
+
+/**
+ * 拉一場會的詳情，只在使用者還停在同一場、而且這是最後送出的那個請求時才套用。
+ * App.tsx 一律用這支，不要自己再寫一次比對。
  *
  * readSelection 是函式不是值：要在 await 之後才讀「現在」選中誰，讀 render 當下那份閉包
- * 等於沒有比對。錯誤也要比對，舊請求的失敗蓋掉新畫面一樣是錯的畫面。
+ * 等於沒有比對。isLatestRequest 來自 createLatestRequestGate().begin()，同樣在 await 之後才問。
+ * 錯誤也要比對，舊請求的失敗蓋掉新畫面一樣是錯的畫面。
  */
 export const loadDetailForSelection = async (
   meetingId: string,
   fetchDetail: (id: string) => Promise<MeetingDetailResponse>,
   readSelection: () => SelectionRef,
+  isLatestRequest: () => boolean,
   handlers: {
     onDetail: (detail: MeetingDetailResponse) => void;
     onError: (err: unknown) => void;
   }
 ): Promise<void> => {
+  const stillWanted = () => isLatestRequest() && shouldApplyDetail(meetingId, readSelection());
   let detail: MeetingDetailResponse;
   try {
     detail = await fetchDetail(meetingId);
   } catch (err) {
-    if (!shouldApplyDetail(meetingId, readSelection())) return;
+    if (!stillWanted()) return;
     handlers.onError(err);
     return;
   }
-  if (!shouldApplyDetail(meetingId, readSelection())) return;
+  if (!stillWanted()) return;
   handlers.onDetail(detail);
 };
 

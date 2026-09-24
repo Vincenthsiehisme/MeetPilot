@@ -46,6 +46,7 @@ import {
   audioSubmitFailureMessage,
   buildAudioBackupTargets,
   buildDashboardView,
+  createLatestRequestGate,
   editBlockedReason,
   hasMeetingsInProgress,
   isMeetingInProgress,
@@ -55,6 +56,7 @@ import {
   summarizeImportResponse,
   upgradeLocalJobAnalysis
 } from './services/meetingAdapter';
+import { createSaveQueue } from './services/editSaves';
 import { downloadBlob } from './services/exportUtils';
 import { pickDroppedAudioFile } from './services/droppedFiles';
 import {
@@ -147,6 +149,10 @@ const App: React.FC = () => {
   // 都要看 meeting 的原始狀態，activeServerJob 是轉成 Job 形狀給元件用的顯示版本，缺這些欄位
   const [activeDetail, setActiveDetail] = useState<MeetingDetailResponse | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
+  // 同一場會的詳情請求重疊時（存檔後重拉、polling 那一拍）只套最後送出的那個：先送出的晚回來，帶的是存檔前的舊內容
+  const [detailRequests] = useState(createLatestRequestGate);
+  // 人工編輯的寫回一次一個、照送出的順序。送的是整份快照，兩次重疊時晚到的舊快照會蓋掉新的
+  const [editSaves] = useState(createSaveQueue);
   // 正在跑的長動作（上傳、搬遷）。有值時 header 會顯示，免得使用者以為按鈕沒反應又按一次
   const [busyMessage, setBusyMessage] = useState<string | null>(null);
   // 搬遷之後「被退件、音檔只剩瀏覽器這一份」的那幾場。列在本機那一區給使用者逐筆下載
@@ -228,6 +234,7 @@ const App: React.FC = () => {
       meetingId,
       getMeetingDetail,
       () => selectionRef.current,
+      detailRequests.begin(meetingId),
       {
         onDetail: detail => {
           try {
@@ -247,7 +254,7 @@ const App: React.FC = () => {
           setDetailError(errorText(err));
         }
       }
-    ), []);
+    ), [detailRequests]);
 
   // 開場：server 清單與本機舊紀錄各讀各的，一邊失敗不影響另一邊
   useEffect(() => {
@@ -862,15 +869,20 @@ const App: React.FC = () => {
   };
 
   /**
-   * JobDetail 的編輯寫回 server。
+   * JobDetail 的編輯寫回 server。回傳這次有沒有存進去：沒有的話原因已經用 alert 講了，
+   * SummaryView、TranscriptView 靠它決定草稿要不要留著等下一次送。
    *
    * 寫完重新拉一次 detail，不只更新本地 state：畫面上顯示的要是 server 真的存下來的東西，
    * 不是前端以為它存進去的東西。
+   *
+   * 送出與重拉整段排進 editSaves，前一次結束才開始這一次：送的是整份快照，兩次重疊時晚到的
+   * 舊快照會蓋掉新文字、把刪掉的項目寫回來，而兩次都回 200。meetingId 在排隊前就定下來，
+   * 排隊期間使用者切去別場，寫回的仍然是原本那場。
    */
-  const handleUpdateActiveMeeting = async (updates: Partial<Job>) => {
+  const handleUpdateActiveMeeting = async (updates: Partial<Job>): Promise<boolean> => {
     if (selection === null || selection.source !== 'server') {
       showLocalEditNotice();
-      return;
+      return false;
     }
     const meetingId = selection.id;
 
@@ -878,39 +890,43 @@ const App: React.FC = () => {
     // 擋掉了，這裡是第二道：拿 A 的 analysis 去接 B 的 metadata 不會有任何錯誤訊息
     if (activeDetail !== null && activeDetail.meeting.meeting_id !== meetingId) {
       showAlert('沒有存檔', '畫面上的內容還在切換中，為了不把別場會議的資料寫進來，這次沒有送出。請再試一次。');
-      return;
+      return false;
     }
 
     const blocked = activeDetail === null ? null : editBlockedReason(activeDetail.meeting.status);
     if (blocked !== null) {
       showAlert('現在不能存檔', blocked);
-      return;
+      return false;
     }
 
-    setBusyMessage('正在儲存…');
-    try {
-      if (updates.transcript !== undefined) {
-        await patchTranscript(meetingId, { segments: updates.transcript });
+    return editSaves.run(async () => {
+      setBusyMessage('正在儲存…');
+      try {
+        if (updates.transcript !== undefined) {
+          await patchTranscript(meetingId, { segments: updates.transcript });
+        }
+        if (updates.polishedContent !== undefined) {
+          await patchTranscript(meetingId, { polished_content: updates.polishedContent });
+        }
+        if (updates.analysis !== undefined) {
+          // v3 每筆自帶 metadata（evidence、decided_by、assignee、created_at…），
+          // SummaryView 編輯的就是這份物件，直接送出即可，不用像 v1 字串那樣猜哪一筆是哪一筆
+          await patchAnalysis(meetingId, updates.analysis);
+        }
+        if (updates.title !== undefined) {
+          await patchTitle(meetingId, updates.title);
+        }
+        await refreshActiveDetail(meetingId);
+        await refreshMeetings();
+        return true;
+      } catch (err: any) {
+        console.error('寫回會議內容失敗', err);
+        showAlert('儲存失敗', translateError(errorText(err)));
+        return false;
+      } finally {
+        setBusyMessage(null);
       }
-      if (updates.polishedContent !== undefined) {
-        await patchTranscript(meetingId, { polished_content: updates.polishedContent });
-      }
-      if (updates.analysis !== undefined) {
-        // v3 每筆自帶 metadata（evidence、decided_by、assignee、created_at…），
-        // SummaryView 編輯的就是這份物件，直接送出即可，不用像 v1 字串那樣猜哪一筆是哪一筆
-        await patchAnalysis(meetingId, updates.analysis);
-      }
-      if (updates.title !== undefined) {
-        await patchTitle(meetingId, updates.title);
-      }
-      await refreshActiveDetail(meetingId);
-      await refreshMeetings();
-    } catch (err: any) {
-      console.error('寫回會議內容失敗', err);
-      showAlert('儲存失敗', translateError(errorText(err)));
-    } finally {
-      setBusyMessage(null);
-    }
+    });
   };
 
   /**

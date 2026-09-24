@@ -22,6 +22,7 @@ import {
   hasMeetingsInProgress,
   AUDIO_BACKUP_HINT,
   buildAudioBackupTargets,
+  createLatestRequestGate,
   editBlockedReason,
   audioSubmitFailureMessage,
   isMeetingBusy,
@@ -397,6 +398,8 @@ describe('搬遷結果', () => {
 
 describe('切換會議時的舊回應（C-P1）', () => {
   const selected = (id: string): SelectionRef => ({ source: 'server', id });
+  // 這一組只驗選取比對，請求新舊一律當成最新；新舊的判斷在下一組
+  const alwaysLatest = () => true;
 
   it('回應回來時還停在同一場就套用', () => {
     expect(shouldApplyDetail('m_1', selected('m_1'))).toBe(true);
@@ -427,10 +430,10 @@ describe('切換會議時的舊回應（C-P1）', () => {
       onError: (e: unknown) => { failed.push(String(e)); },
     };
 
-    const runA = loadDetailForSelection('m_A', fetchDetail, () => current, handlers);
+    const runA = loadDetailForSelection('m_A', fetchDetail, () => current, alwaysLatest, handlers);
     // 使用者切到 B，B 的請求也送出去
     current = selected('m_B');
-    const runB = loadDetailForSelection('m_B', fetchDetail, () => current, handlers);
+    const runB = loadDetailForSelection('m_B', fetchDetail, () => current, alwaysLatest, handlers);
 
     resolveB(detailB);
     await runB;
@@ -449,7 +452,7 @@ describe('切換會議時的舊回應（C-P1）', () => {
 
     let current: SelectionRef = selected('m_A');
     const failed: string[] = [];
-    const run = loadDetailForSelection('m_A', fetchDetail, () => current, {
+    const run = loadDetailForSelection('m_A', fetchDetail, () => current, alwaysLatest, {
       onDetail: () => { throw new Error('不該套用'); },
       onError: (e: unknown) => { failed.push(String(e)); },
     });
@@ -464,11 +467,112 @@ describe('切換會議時的舊回應（C-P1）', () => {
   it('還停在同一場時的失敗要報出來，不要一起吞掉', async () => {
     const fetchDetail = vi.fn(() => Promise.reject(new Error('boom')));
     const failed: string[] = [];
-    await loadDetailForSelection('m_A', fetchDetail, () => selected('m_A'), {
+    await loadDetailForSelection('m_A', fetchDetail, () => selected('m_A'), alwaysLatest, {
       onDetail: () => { throw new Error('不該套用'); },
       onError: (e: unknown) => { failed.push(String(e)); },
     });
     expect(failed).toEqual(['Error: boom']);
+  });
+});
+
+describe('同一場會的詳情請求重疊時只套最後送出的那個', () => {
+  const selected = (id: string): SelectionRef => ({ source: 'server', id });
+  const detailWith = (overview: string): MeetingDetailResponse => ({
+    seamReport: null,
+    meeting: makeMeeting({ meeting_id: 'm_A', status: 'READY' }),
+    transcript: null,
+    analysis: { overview } as AnalysisV3,
+    tags: [], topicTags: [], links: [], linkRun: null, participantIds: [], nameMentions: [],
+  });
+
+  it('polling 那一拍在存檔前送出、存檔後的重拉先回來：舊的那份不再蓋上去', async () => {
+    // 先送出的是存檔之前的 polling（server 還是舊文字），後送出的是存檔後的重拉
+    const pending: ((d: MeetingDetailResponse) => void)[] = [];
+    const fetchDetail = vi.fn(() => new Promise<MeetingDetailResponse>(resolve => { pending.push(resolve); }));
+    const gate = createLatestRequestGate();
+    const applied: string[] = [];
+    const handlers = {
+      onDetail: (d: MeetingDetailResponse) => { applied.push(d.analysis!.overview); },
+      onError: () => { throw new Error('不該失敗'); },
+    };
+
+    const poll = loadDetailForSelection('m_A', fetchDetail, () => selected('m_A'), gate.begin('m_A'), handlers);
+    const afterSave = loadDetailForSelection('m_A', fetchDetail, () => selected('m_A'), gate.begin('m_A'), handlers);
+
+    pending[1](detailWith('存檔後'));
+    await afterSave;
+    pending[0](detailWith('存檔前'));
+    await poll;
+
+    expect(applied).toEqual(['存檔後']);
+  });
+
+  it('照順序回來時兩份都套用，最後留下的是較新的那份', async () => {
+    const pending: ((d: MeetingDetailResponse) => void)[] = [];
+    const fetchDetail = vi.fn(() => new Promise<MeetingDetailResponse>(resolve => { pending.push(resolve); }));
+    const gate = createLatestRequestGate();
+    const applied: string[] = [];
+    const handlers = {
+      onDetail: (d: MeetingDetailResponse) => { applied.push(d.analysis!.overview); },
+      onError: () => { throw new Error('不該失敗'); },
+    };
+
+    const first = loadDetailForSelection('m_A', fetchDetail, () => selected('m_A'), gate.begin('m_A'), handlers);
+    pending[0](detailWith('第一份'));
+    await first;
+    const second = loadDetailForSelection('m_A', fetchDetail, () => selected('m_A'), gate.begin('m_A'), handlers);
+    pending[1](detailWith('第二份'));
+    await second;
+
+    expect(applied).toEqual(['第一份', '第二份']);
+  });
+
+  it('較舊請求的失敗在有新請求之後也不報：畫面由新的那個決定', async () => {
+    const settle: { resolve: (d: MeetingDetailResponse) => void; reject: (e: unknown) => void }[] = [];
+    const fetchDetail = vi.fn(() => new Promise<MeetingDetailResponse>((resolve, reject) => { settle.push({ resolve, reject }); }));
+    const gate = createLatestRequestGate();
+    const applied: string[] = [];
+    const failed: string[] = [];
+    const handlers = {
+      onDetail: (d: MeetingDetailResponse) => { applied.push(d.analysis!.overview); },
+      onError: (e: unknown) => { failed.push(String(e)); },
+    };
+
+    const older = loadDetailForSelection('m_A', fetchDetail, () => selected('m_A'), gate.begin('m_A'), handlers);
+    const newer = loadDetailForSelection('m_A', fetchDetail, () => selected('m_A'), gate.begin('m_A'), handlers);
+    settle[0].reject(new Error('boom'));
+    await older;
+    settle[1].resolve(detailWith('新的'));
+    await newer;
+
+    expect(failed).toEqual([]);
+    expect(applied).toEqual(['新的']);
+  });
+
+  it('存完 A 馬上點去 B：A 存完後的重拉比 B 晚送出，也不能讓 B 的回應被當成舊的丟掉', async () => {
+    const pending = new Map<string, (d: MeetingDetailResponse) => void>();
+    const fetchDetail = vi.fn((id: string) => new Promise<MeetingDetailResponse>(resolve => { pending.set(id, resolve); }));
+    const gate = createLatestRequestGate();
+    let current: SelectionRef = selected('m_B');
+    const applied: string[] = [];
+    const handlers = {
+      onDetail: (d: MeetingDetailResponse) => { applied.push(d.meeting.meeting_id); },
+      onError: () => { throw new Error('不該失敗'); },
+    };
+    const detailOf = (id: string): MeetingDetailResponse => ({
+      ...detailWith(''), meeting: makeMeeting({ meeting_id: id, status: 'READY' }),
+    });
+
+    // 使用者已經點到 B，B 的請求先送出；接著 A 的存檔結束，App 重拉 A
+    const openB = loadDetailForSelection('m_B', fetchDetail, () => current, gate.begin('m_B'), handlers);
+    const refreshA = loadDetailForSelection('m_A', fetchDetail, () => current, gate.begin('m_A'), handlers);
+
+    pending.get('m_B')!(detailOf('m_B'));
+    await openB;
+    pending.get('m_A')!(detailOf('m_A'));
+    await refreshA;
+
+    expect(applied).toEqual(['m_B']);
   });
 });
 
