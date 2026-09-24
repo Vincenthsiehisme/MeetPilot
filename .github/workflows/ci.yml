@@ -113,3 +113,27 @@ jobs:
           name: installer-${{ matrix.os }}
           path: ${{ matrix.artifact }}
           retention-days: 14
+
+  # 兩個平台的安裝檔整理成一包更新檔（E5）：安裝檔加 meetpilot-update.json（版本、每個平台的檔名、大小、sha512）。
+  # admin 下載 update-bundle 這個 artifact，整包放進 OneDrive 的 MeetPilot 記錄/_更新/，舊版的檔案刪掉。
+  # 少了任何一個平台、或安裝檔版本跟 package.json 不一樣，這一步就紅，不產半套的清單。
+  update-bundle:
+    needs: desktop
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: installer-*
+          path: installers
+      - run: npx tsx scripts/writeUpdateBundle.ts --out update-bundle installers/installer-macos-latest installers/installer-windows-latest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: update-bundle
+          path: update-bundle/
+          retention-days: 14

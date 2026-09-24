@@ -1,5 +1,5 @@
 /**
- * 主視窗的 preload：設定頁（electron/setup.html，E3）與 server 頁面的錄音狀態（E4）。
+ * 主視窗的 preload：設定頁（electron/setup.html，E3）、server 頁面的錄音狀態（E4）與安裝新版（E5）。
  *
  * 主視窗開著 sandbox，preload 只能用 contextBridge 與 ipcRenderer。這一支掛在主視窗上，所以 server 的頁面
  * 也拿得到 window.meetpilotSetup；主程序的 ipcMain handler 一律驗訊息是不是從設定頁來的，其他頁面叫了會被拒絕。
@@ -10,6 +10,8 @@ import { contextBridge, ipcRenderer } from 'electron';
 // 據此擋系統閒置睡眠、錄音中不開設定頁、結束前先確認
 contextBridge.exposeInMainWorld('meetpilotDesktop', {
   setRecording: (active: boolean) => ipcRenderer.invoke('recording:set', active),
+  // 外殼掛在右上角的新版提示卡（E5）按下去叫的
+  installUpdate: () => ipcRenderer.invoke('update:install'),
 });
 
 contextBridge.exposeInMainWorld('meetpilotSetup', {

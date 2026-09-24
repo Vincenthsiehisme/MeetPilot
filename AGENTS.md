@@ -197,10 +197,16 @@ function f(p: Pick) {
 - **`electron/serverEnv.ts` 不 import electron**，才測得到；呼叫端環境裡 `MEETPILOT_*`、`HOST`、`PORT`、`GEMINI_API_KEY`
   一律不往下傳給 server，值只由外殼決定。
 - 打包後的 app 只有 `scripts/smokeDesktop.mjs` 驗得到（CI 的 `desktop` job 兩平台各跑一次）。Windows 的結果只有 CI 看得到。
-  它起一個假 gateway（`MEETPILOT_DESKTOP_GATEWAY_URL`），用 CDP 操作設定頁，連跑首次設定、離線、資料夾不見了、撤銷四段。
+  它起一個假 gateway（`MEETPILOT_DESKTOP_GATEWAY_URL`），用 CDP 操作設定頁，連跑首次設定、離線、錄音、資料夾不見了、更新、撤銷六段。
   設定頁的 `#invite-code`、`#vault-dir`、`#save`、`#message` 是它操作的把手，改名要一起改。
 - **gateway 回 401 一律當撤銷，不能退回上次存的 key。** 連不上才用上次的。這兩條的分界在
   `electron/gatewayClient.ts`，改之前先看檔頭；冒煙測試的「撤銷」那段守它。
+- **更新（E5）不用 electron-updater**，理由在 `electron/updater.ts` 檔頭。安裝檔檔名是契約：`build.dmg`／`build.nsis` 的
+  `artifactName` 是 `MeetPilot-<版本>-<mac|win>-<架構>.<dmg|exe>`，`electron/updateBundle.ts` 從檔名讀平台與架構產清單，
+  改一邊要改另一邊的 `ARTIFACT_NAME_PATTERN`，不然 CI 的 `update-bundle` job 紅在「少了某個平台」。
+  清單格式只有 `parseUpdateManifest` 一份定義，`updateBundle.test.ts` 拿 app 端的 `checkForUpdate` 讀產出的清單來守；
+  改格式要升 `UPDATE_MANIFEST_SCHEMA`，舊版 app 看到不認得的 schema 會講出來、不安裝。
+  「錄音中不裝」與「按下去真的安裝」在 `main.ts`，沒有自動測試，實際換版在實機驗（AC-7）。
 - **token 與 key 只能經 `safeStorage` 落地。** `electron/desktopStore.ts` 的加解密由呼叫端傳入，不要加「不能用就存明文」的退路。
 - `setupPreload.ts` 掛在主視窗上，server 的頁面也拿得到 `window.meetpilotSetup`；`ipcMain` 那頭一律用
   `isSetupPageUrl` 驗來源，新增的設定頁 handler 也要驗。

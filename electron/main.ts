@@ -16,12 +16,17 @@
  * E3 起，server 啟動前要先有三樣東西：gateway 的 token、Gemini key、投影資料夾。缺任何一樣就顯示外殼自己的
  * 設定頁（electron/setup.html）。三樣都有就每次啟動向 gateway 拿最新的 key 與名單：連不上用上次的、
  * 畫面標示離線；gateway 回 401（被撤銷）就刪掉 token 與 key、回設定頁，不退回上次的。
+ *
+ * E5 起從共享資料夾更新（electron/updater.ts）：啟動時與每 4 小時看一次投影資料夾旁邊的 `_更新/`，
+ * 有驗過的新版就在托盤與畫面右上角提示，使用者按了才裝。錄音中不裝，因為更新要結束 app。
+ * Windows 靜默安裝後自動重開；macOS 沒有簽章不能自動換版，打開 dmg 讓使用者自己拖。
  */
 import {
   app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, powerSaveBlocker, safeStorage, session, shell, Tray, utilityProcess,
 } from 'electron';
 import type { IpcMainInvokeEvent, UtilityProcess } from 'electron';
-import { appendFileSync, mkdirSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { appendFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -31,6 +36,10 @@ import { resolveBundledFfmpeg } from './bundledFfmpeg';
 import { GATEWAY_URL, GatewayError, createGatewayClient, syncWithGateway } from './gatewayClient';
 import { DesktopCredentials, DesktopStoreError, createDesktopStore } from './desktopStore';
 import { VaultFolderError, checkVaultFolder } from './vaultFolder';
+import {
+  PENDING_UPDATE_FILE, PendingUpdate, UpdateCheck, WINDOWS_INSTALL_ARGS, checkForUpdate, describeUpdateCheck, parsePendingUpdate,
+  pendingUpdateDone, stageInstaller, updateFolderFor,
+} from './updater';
 
 // userData 固定叫 MeetPilot，不跟 package.json 的 name 走：資料夾名要穩定，改套件名或產品名不能讓資料「消失」。
 // MEETPILOT_DESKTOP_USER_DATA 只給 scripts/smokeDesktop.mjs 用：冒煙測試要用拋棄式的資料夾，
@@ -512,6 +521,15 @@ function registerSetupHandlers(): void {
     setRecordingActive(active, '頁面回報');
   });
 
+  // 右上角提示卡的「安裝新版」（E5）。跟錄音狀態一樣只收 server 頁面來的
+  ipcMain.handle('update:install', (event) => {
+    if (!isServerUrl(event.senderFrame?.url ?? '')) {
+      writeLog(`--- 拒絕不是從 server 頁面來的安裝請求（${event.senderFrame?.url ?? '未知'}）---\n`);
+      throw new Error('只有 server 的頁面能要求安裝新版');
+    }
+    void installUpdate();
+  });
+
   ipcMain.handle('setup:load', (event) => {
     if (!fromSetupPage(event)) throw new Error('只有設定頁能叫');
     let vaultDir = '';
@@ -625,6 +643,8 @@ async function saveSetup(newCode: string, vaultDir: string): Promise<{ ok: true 
   writeLog(`--- 設定已儲存（邀請碼 ${newCode === '' ? '沿用' : `換成 ${credentials.inviteId}`}，資料夾 ${vaultDir}）---\n`);
   // 回應先送回設定頁，再換 server：換 server 排在這個佇列項目之後，頁面接著會被啟動畫面蓋掉
   void requestBoot({ replaceRunning: true });
+  // 換了投影資料夾，更新資料夾也跟著換
+  void runUpdateCheck('換設定', { recheck: true });
   return { ok: true };
 }
 
@@ -643,6 +663,277 @@ function injectOfflineBanner(): void {
       + 'background:#fef3c7;color:#78350f;border-top:1px solid #f59e0b;font:13px/1.5 -apple-system,"Segoe UI","Microsoft JhengHei",sans-serif';
     document.body.appendChild(bar);
   })()`).catch((err: Error) => writeLog(`--- 離線橫幅掛不上去：${err.message} ---\n`));
+}
+
+// ---- 從共享資料夾更新（E5） ----
+
+const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60_000;
+/** 最近一次檢查的結果；null 是還沒檢查過或這次檢查失敗（失敗原因在 updateProblem） */
+let updateCheck: UpdateCheck | null = null;
+/** 檢查本身失敗（清單讀不懂、這版的版本號不合法）：不是「沒有新版」，要講出來 */
+let updateProblem: string | null = null;
+let updateCheckInFlight: Promise<UpdateCheck | null> | null = null;
+/** 檢查進行中又要求重查（例如換了投影資料夾）：這一輪結束後再跑一次，不拿舊資料夾的結果 */
+let updateRecheckTrigger: string | null = null;
+let installingUpdate = false;
+const pendingUpdatePath = () => join(app.getPath('userData'), PENDING_UPDATE_FILE);
+
+/** 還沒設定過投影資料夾（或設定讀不懂）就沒有更新資料夾可看，回 null */
+function vaultDirForUpdate(): string | null {
+  try {
+    return store.readSettings()?.vaultDir ?? null;
+  } catch (err) {
+    if (!(err instanceof DesktopStoreError)) throw err;
+    return null;
+  }
+}
+
+async function checkUpdateOnce(trigger: string): Promise<UpdateCheck | null> {
+  const vaultDir = vaultDirForUpdate();
+  if (vaultDir === null) {
+    updateCheck = null;
+    updateProblem = null;
+    writeLog(`--- 更新檢查（${trigger}）[not-configured]：還沒設定投影資料夾 ---\n`);
+    return null;
+  }
+  try {
+    updateCheck = await checkForUpdate({
+      folder: updateFolderFor(vaultDir), currentVersion: app.getVersion(), platform: process.platform, arch: process.arch,
+    });
+    updateProblem = null;
+    writeLog(`--- 更新檢查（${trigger}）[${updateCheck.state}]：${describeUpdateCheck(updateCheck)} ---\n`);
+  } catch (err) {
+    updateCheck = null;
+    updateProblem = (err as Error).message;
+    writeLog(`--- 更新檢查（${trigger}）[error]：${updateProblem} ---\n`);
+  }
+  return updateCheck;
+}
+
+/**
+ * 同一時間只跑一次；排程、托盤、安裝前各自叫的話拿到同一次的結果。
+ * recheck：檢查的前提換了（投影資料夾），進行中的那一輪算的是舊資料夾，結束後要再跑一次
+ */
+function runUpdateCheck(trigger: string, opts: { recheck?: boolean } = {}): Promise<UpdateCheck | null> {
+  if (updateCheckInFlight !== null) {
+    if (opts.recheck) updateRecheckTrigger = trigger;
+    return updateCheckInFlight;
+  }
+  updateCheckInFlight = (async () => {
+    let result = await checkUpdateOnce(trigger);
+    while (updateRecheckTrigger !== null) {
+      const again = updateRecheckTrigger;
+      updateRecheckTrigger = null;
+      result = await checkUpdateOnce(again);
+    }
+    return result;
+  })().finally(() => {
+    updateCheckInFlight = null;
+    refreshTrayMenu();
+    injectUpdateBanner();
+  });
+  return updateCheckInFlight;
+}
+
+/** 托盤最上面那行狀態 */
+function updateStatusLine(): string {
+  const version = `版本 ${app.getVersion()}`;
+  if (updateProblem !== null) return `${version}：更新檢查失敗，請通知 admin`;
+  if (updateCheck === null) return version;
+  return `${version}：${describeUpdateCheck(updateCheck)}`;
+}
+
+// 有新版、或安裝檔對不上、或檢查失敗時，在 server 的畫面右上角掛一張提示卡。外殼注入，跟離線橫幅同一種做法
+function injectUpdateBanner(): void {
+  if (!mainWindow || !isServerUrl(mainWindow.webContents.getURL())) return;
+  const spec = updateCheck?.state === 'ready'
+    ? { text: `MeetPilot ${updateCheck.version} 可以安裝了。`, button: '安裝新版', tone: 'info' }
+    : updateProblem !== null
+      ? { text: `更新檢查失敗，不會安裝：${updateProblem}`, button: null, tone: 'warn' }
+      : updateCheck?.state === 'corrupt'
+        ? { text: describeUpdateCheck(updateCheck), button: null, tone: 'warn' }
+        : null;
+  void mainWindow.webContents.executeJavaScript(`(() => {
+    const spec = ${JSON.stringify(spec)};
+    let card = document.getElementById('meetpilot-update-banner');
+    if (spec === null) { card?.remove(); return; }
+    if (!card) {
+      card = document.createElement('div');
+      card.id = 'meetpilot-update-banner';
+      card.setAttribute('role', 'status');
+      document.body.appendChild(card);
+    }
+    card.style.cssText = 'position:fixed;top:12px;right:12px;z-index:2147483647;max-width:380px;padding:10px 14px;border-radius:8px;'
+      + 'box-shadow:0 2px 8px rgba(0,0,0,.15);font:13px/1.5 -apple-system,"Segoe UI","Microsoft JhengHei",sans-serif;'
+      + (spec.tone === 'warn' ? 'background:#fef3c7;color:#78350f;border:1px solid #f59e0b' : 'background:#eff6ff;color:#1e3a8a;border:1px solid #93c5fd');
+    card.replaceChildren();
+    const text = document.createElement('span');
+    text.textContent = spec.text;
+    card.appendChild(text);
+    if (spec.button) {
+      const b = document.createElement('button');
+      b.textContent = spec.button;
+      b.style.cssText = 'margin-left:10px;padding:2px 10px;border-radius:6px;border:1px solid #3b82f6;background:#fff;color:#1d4ed8;cursor:pointer';
+      b.onclick = () => window.meetpilotDesktop.installUpdate();
+      card.appendChild(b);
+    }
+  })()`).catch((err: Error) => writeLog(`--- 更新提示掛不上去：${err.message} ---\n`));
+}
+
+/** detached 起安裝程式，等它真的起來（或起不來）才回傳：起不來的話不能先把 app 結束掉 */
+function launchDetached(file: string, args: readonly string[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(file, [...args], { detached: true, stdio: 'ignore' });
+    child.once('error', reject);
+    child.once('spawn', () => {
+      child.unref();
+      resolve();
+    });
+  });
+}
+
+const refuseWhileRecording = () => dialog.showMessageBox({
+  type: 'info',
+  title: 'MeetPilot',
+  message: '錄音中不能更新',
+  detail: '更新要結束 MeetPilot，錄音會斷掉。先按「停止錄音」，再從系統匣或右上角的提示安裝。',
+});
+
+/** justChecked：呼叫端剛檢查完、拿到 ready，就不再重算一次一百多 MB 的雜湊（複製到暫存後仍會再驗一次） */
+async function installUpdate(justChecked?: Extract<UpdateCheck, { state: 'ready' }>): Promise<void> {
+  if (installingUpdate) {
+    showWindow();
+    return;
+  }
+  // 先佔住：錄音中連按提示卡不會疊出好幾個對話框
+  installingUpdate = true;
+  try {
+    showWindow();
+    if (recordingActive) {
+      await refuseWhileRecording();
+      return;
+    }
+    // 提示可能是幾個小時前的，這段時間 admin 可能換過版本、或檔案被換過，所以重新檢查一次
+    const check = justChecked ?? await runUpdateCheck('安裝前');
+    if (check === null || check.state !== 'ready') {
+      await dialog.showMessageBox({
+        type: 'info',
+        title: 'MeetPilot',
+        message: '現在沒有可以安裝的新版',
+        detail: updateProblem ?? (check === null ? '還沒設定投影資料夾。' : describeUpdateCheck(check)),
+      });
+      return;
+    }
+    const isMac = process.platform === 'darwin';
+    const { response } = await dialog.showMessageBox({
+      type: 'question',
+      title: 'MeetPilot',
+      message: `安裝 MeetPilot ${check.version}？`,
+      detail: isMac
+        ? 'MeetPilot 會打開新版的安裝檔並結束。在打開的視窗裡把 MeetPilot 拖到「應用程式」、選「取代」，再從「應用程式」打開。'
+          + 'macOS 說無法確認開發者的話，照第一次安裝時的放行步驟做一次。'
+        : 'MeetPilot 會結束、在背景安裝新版，裝完自動重新開啟。進行中的轉錄重新開啟後會接著跑。',
+      buttons: [isMac ? '打開安裝檔並結束 MeetPilot' : '安裝並重新開啟', '取消'],
+      defaultId: 0,
+      cancelId: 1,
+    });
+    if (response !== 0) return;
+    const staged = await stageInstaller(check, join(app.getPath('temp'), 'MeetPilot-update'));
+    // 對話框開著、或複製與驗雜湊的那幾秒，都可能已經開始錄音了。Windows 的安裝程式一起來就會把 app 關掉
+    // （更新模式下等不到就強制結束），所以這是最後一次能停的地方
+    if (recordingActive) {
+      await refuseWhileRecording();
+      return;
+    }
+    writeLog(`--- 安裝新版 ${check.version}（${app.getVersion()} → ${check.version}），驗過的安裝檔：${staged} ---\n`);
+    const pending: PendingUpdate = { from: app.getVersion(), to: check.version, startedAt: new Date().toISOString() };
+    writeFileSync(pendingUpdatePath(), JSON.stringify(pending));
+    if (isMac) {
+      const error = await shell.openPath(staged);
+      if (error !== '') {
+        rmSync(pendingUpdatePath(), { force: true });
+        throw new Error(`打不開安裝檔（${staged}）：${error}`);
+      }
+    } else {
+      try {
+        await launchDetached(staged, WINDOWS_INSTALL_ARGS);
+      } catch (err) {
+        rmSync(pendingUpdatePath(), { force: true });
+        throw err;
+      }
+      // 安裝程式已經起來了，接著一定會關掉這個 app：不能再讓 before-quit 的錄音確認擋住
+      quitConfirmed = true;
+    }
+    app.quit();
+  } catch (err) {
+    writeLog(`--- 更新沒有完成：${(err as Error).stack ?? String(err)} ---\n`);
+    await dialog.showMessageBox({
+      type: 'error',
+      title: 'MeetPilot',
+      message: '更新沒有完成，MeetPilot 照舊繼續用',
+      detail: `${(err as Error).message}\n\n完整紀錄：${serverLogPath()}`,
+    });
+  } finally {
+    installingUpdate = false;
+  }
+}
+
+/** 托盤的「檢查更新…」：使用者自己按的，結果一定要回話，包括「已經是最新版」 */
+async function checkUpdatesFromTray(): Promise<void> {
+  if (installingUpdate) {
+    showWindow();
+    await dialog.showMessageBox({ type: 'info', title: 'MeetPilot', message: '正在準備安裝新版，請看 MeetPilot 視窗上的對話框' });
+    return;
+  }
+  const check = await runUpdateCheck('托盤');
+  if (check?.state === 'ready') {
+    await installUpdate(check);
+    return;
+  }
+  const vaultDir = vaultDirForUpdate();
+  await dialog.showMessageBox({
+    type: updateProblem === null ? 'info' : 'warning',
+    title: 'MeetPilot',
+    message: updateStatusLine(),
+    detail: updateProblem ?? (vaultDir === null ? '還沒設定投影資料夾。' : `更新資料夾：${updateFolderFor(vaultDir)}`),
+  });
+}
+
+/**
+ * 上次起了安裝程式、這次啟動版本卻沒變：安裝失敗了（Windows 按掉提權詢問、檔案被占用，macOS 開了 dmg 沒拖），
+ * 而那時 app 已經結束，沒有任何畫面講過。這裡補講一次，標記用完就刪
+ */
+async function reportPendingUpdate(): Promise<void> {
+  let text: string;
+  try {
+    text = readFileSync(pendingUpdatePath(), 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+    writeLog(`--- 讀不到上次更新的標記（${pendingUpdatePath()}）：${(err as Error).message} ---\n`);
+    return;
+  }
+  rmSync(pendingUpdatePath(), { force: true });
+  let pending: PendingUpdate;
+  try {
+    pending = parsePendingUpdate(text, pendingUpdatePath());
+  } catch (err) {
+    writeLog(`--- 上次更新的標記壞了，刪掉：${(err as Error).message} ---\n`);
+    return;
+  }
+  if (pendingUpdateDone(pending, app.getVersion())) {
+    writeLog(`--- 更新完成：${pending.from} → ${app.getVersion()} ---\n`);
+    return;
+  }
+  writeLog(`--- 上次更新沒有完成：要裝 ${pending.to}，現在還是 ${app.getVersion()}（${pending.startedAt} 起的安裝程式）---\n`);
+  await dialog.showMessageBox({
+    type: 'warning',
+    title: 'MeetPilot',
+    message: `上次更新到 ${pending.to} 沒有完成，現在還是 ${app.getVersion()}`,
+    detail: (process.platform === 'darwin'
+      ? '打開的安裝檔裡，要把 MeetPilot 拖到「應用程式」取代舊版，再從「應用程式」打開。'
+      : '安裝程式可能被取消（例如按掉系統的權限詢問），或檔案被別的程式占用。')
+      + `可以從系統匣「檢查更新…」再裝一次，再不行請通知 admin。\n\n完整紀錄：${serverLogPath()}`,
+  });
 }
 
 async function openSettings(): Promise<void> {
@@ -682,6 +973,7 @@ function createWindow(): void {
     },
   });
   mainWindow.webContents.on('did-finish-load', injectOfflineBanner);
+  mainWindow.webContents.on('did-finish-load', injectUpdateBanner);
   // 頁面換掉或當掉，裡面的錄音就沒了：不能繼續擋睡眠、也不該再擋結束。server 那頭留著的是「中斷的錄音」，畫面會給救法
   mainWindow.webContents.on('did-navigate', () => setRecordingActive(false, '頁面換掉了'));
   mainWindow.webContents.on('render-process-gone', (_event, details) => setRecordingActive(false, `頁面程序結束：${details.reason}`));
@@ -734,13 +1026,24 @@ function createTray(): void {
   );
   tray = new Tray(icon);
   tray.setToolTip('MeetPilot');
+  refreshTrayMenu();
+  tray.on('click', showWindow);
+}
+
+// 選單上有更新狀態，每次檢查完重建
+function refreshTrayMenu(): void {
+  if (!tray) return;
+  const ready = updateCheck?.state === 'ready' ? updateCheck : null;
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: '開啟 MeetPilot', click: showWindow },
     { label: '設定…', click: () => void openSettings() },
     { type: 'separator' },
+    { label: updateStatusLine(), enabled: false },
+    ...(ready === null ? [] : [{ label: `安裝新版 ${ready.version}…`, click: () => void installUpdate() }]),
+    { label: '檢查更新…', click: () => void checkUpdatesFromTray() },
+    { type: 'separator' },
     { label: '結束 MeetPilot', click: () => app.quit() },
   ]));
-  tray.on('click', showWindow);
 }
 
 if (!app.requestSingleInstanceLock()) {
@@ -784,5 +1087,8 @@ if (!app.requestSingleInstanceLock()) {
     createWindow();
     createTray();
     await startApp();
+    void reportPendingUpdate();
+    void runUpdateCheck('啟動');
+    setInterval(() => void runUpdateCheck('排程'), UPDATE_CHECK_INTERVAL_MS);
   });
 }
