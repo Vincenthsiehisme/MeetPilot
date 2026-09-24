@@ -25,6 +25,8 @@ import { createLogTail } from './logTail';
 app.setPath('userData', process.env.MEETPILOT_DESKTOP_USER_DATA || join(app.getPath('appData'), 'MeetPilot'));
 
 const SERVER_READY_TIMEOUT_MS = 30_000;
+// 每次健康檢查自己的上限：連接埠被別的程式搶走、對方收了連線卻不回應時，不能卡過整體的就緒上限
+const HEALTH_PROBE_TIMEOUT_MS = 2_000;
 const LOG_TAIL_LINES = 40;
 
 let mainWindow: BrowserWindow | null = null;
@@ -42,6 +44,18 @@ class ServerStartupError extends Error {
 
 const logDir = () => join(app.getPath('userData'), 'logs');
 const serverLogPath = () => join(logDir(), 'server.log');
+
+// log 寫不進去（磁碟滿、權限、同名目錄）不能讓錯誤視窗跟著出不來：寫入失敗只記下原因，
+// 在錯誤視窗裡講出來，不往上拋（Codex review 2026-09-24）
+let logWriteError: string | null = null;
+function writeLog(text: string): void {
+  try {
+    mkdirSync(logDir(), { recursive: true });
+    appendFileSync(serverLogPath(), text);
+  } catch (err) {
+    logWriteError ??= (err as Error).message;
+  }
+}
 
 function pickFreePort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -64,10 +78,13 @@ async function waitForServer(origin: string, child: UtilityProcess): Promise<voi
   while (Date.now() < deadline) {
     if (exited) throw new Error('server 在就緒之前就結束了');
     try {
-      const res = await fetch(`${origin}/api/health`);
+      const remaining = Math.max(1, deadline - Date.now());
+      const res = await fetch(`${origin}/api/health`, {
+        signal: AbortSignal.timeout(Math.min(HEALTH_PROBE_TIMEOUT_MS, remaining)),
+      });
       if (res.ok) return;
     } catch {
-      // 還沒 listen，連線被拒是等待中的正常狀態
+      // 還沒 listen（連線被拒）或這次沒在時限內回應，都是等待中的正常狀態，下一輪再試
     }
     await new Promise((r) => setTimeout(r, 300));
   }
@@ -83,7 +100,6 @@ const statusPage = (title: string, body: string) =>
 
 async function startServer(): Promise<void> {
   const logTail = createLogTail(LOG_TAIL_LINES);
-  mkdirSync(logDir(), { recursive: true });
   const port = await pickFreePort();
   const origin = `http://127.0.0.1:${port}`;
   const appPath = app.getAppPath();
@@ -102,11 +118,11 @@ async function startServer(): Promise<void> {
   const onOutput = (chunk: Buffer) => {
     const text = chunk.toString('utf8');
     logTail.push(text);
-    appendFileSync(serverLogPath(), text);
+    writeLog(text);
   };
   child.stdout?.on('data', onOutput);
   child.stderr?.on('data', onOutput);
-  appendFileSync(serverLogPath(), `\n--- ${new Date().toISOString()} 啟動 server（port ${port}）---\n`);
+  writeLog(`\n--- ${new Date().toISOString()} 啟動 server（port ${port}）---\n`);
 
   // 就緒之前的結束不在這裡處理：waitForServer 會拋，由 bootServerIntoWindow 的 catch 負責，
   // 只有一個地方跳錯誤視窗。兩邊都處理的話，使用者按兩次「重新啟動」就會起兩個 server 搶同一個 DB
@@ -132,18 +148,21 @@ async function startServer(): Promise<void> {
 async function onServerExit(code: number, lines: string[]): Promise<void> {
   serverOrigin = null;
   // 寫進同一份 log：事後查的時候看得出 server 什麼時候、以什麼結束碼停的，以及使用者看到了錯誤視窗
-  appendFileSync(serverLogPath(), `--- ${new Date().toISOString()} server 結束（結束碼 ${code}），顯示錯誤視窗 ---\n`);
+  writeLog(`--- ${new Date().toISOString()} server 結束（結束碼 ${code}），顯示錯誤視窗 ---\n`);
+  const logNote = logWriteError === null
+    ? `完整紀錄：${serverLogPath()}`
+    : `紀錄檔寫不進去（${logWriteError}），這次沒有完整紀錄：${serverLogPath()}`;
   mainWindow?.loadURL(statusPage('MeetPilot 的背景程式停止了', `結束碼 ${code}。完整紀錄在 ${serverLogPath()}`));
   const { response } = await dialog.showMessageBox({
     type: 'error',
     title: 'MeetPilot',
     message: `MeetPilot 的背景程式停止了（結束碼 ${code}）`,
-    detail: `最後幾行輸出：\n${lines.join('\n') || '（沒有輸出）'}\n\n完整紀錄：${serverLogPath()}`,
+    detail: `最後幾行輸出：\n${lines.join('\n') || '（沒有輸出）'}\n\n${logNote}`,
     buttons: ['重新啟動', '結束 MeetPilot'],
     defaultId: 0,
     cancelId: 1,
   });
-  appendFileSync(serverLogPath(), `--- 使用者選擇：${response === 0 ? '重新啟動' : '結束'} ---\n`);
+  writeLog(`--- 使用者選擇：${response === 0 ? '重新啟動' : '結束'} ---\n`);
   if (response === 0) await bootServerIntoWindow();
   else app.quit();
 }
