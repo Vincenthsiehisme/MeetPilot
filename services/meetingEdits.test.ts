@@ -12,6 +12,7 @@ const T1 = T0 + 5_000;
 let db: DatabaseSync;
 let store: MeetingStore;
 let present: Set<string>;
+let recordingsRemoved: string[] = [];
 
 const audioStore = (removeFails = false): AudioFileStore => ({
   dir: '/fake/audio',
@@ -25,6 +26,10 @@ const audioStore = (removeFails = false): AudioFileStore => ({
     if (removeFails) throw new Error('EACCES: permission denied');
     present.delete(id);
   },
+  recordingPathFor: (id: string) => `/fake/audio/${id}.recording`,
+  appendRecordingChunk: () => { throw new Error('這支測試用不到 app 內錄音'); },
+  promoteRecording: () => { throw new Error('這支測試用不到 app 內錄音'); },
+  removeRecording: (id: string) => { recordingsRemoved.push(id); },
 });
 
 const fakeQueue = (cancelled: string[] = []) => ({

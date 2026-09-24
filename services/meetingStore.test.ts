@@ -91,6 +91,35 @@ describe('openMeetingDb', () => {
     }
   });
 
+  it('升級前的語音備忘錄起訖紀錄搬進 recordings，來源標成 voice_memo、段數是 0（E4）', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'meetpilot-db-'));
+    const path = join(dir, 'old.db');
+    try {
+      // 造一個停在上一版的檔：表還叫 voice_memo_recordings、沒有 method 與段數欄位
+      const old = openMeetingDb(path);
+      old.exec(`
+        DROP TABLE recordings;
+        CREATE TABLE voice_memo_recordings (
+          meeting_id TEXT PRIMARY KEY REFERENCES meetings(meeting_id) ON DELETE CASCADE,
+          started_at INTEGER NOT NULL,
+          stopped_at INTEGER
+        );
+        PRAGMA user_version = ${SCHEMA_VERSION - 1};
+      `);
+      createMeetingStore(old).createMeeting({ meeting_id: 'old-1', created_at: T0, participant_ids: [] });
+      old.prepare('INSERT INTO voice_memo_recordings (meeting_id, started_at, stopped_at) VALUES (?, ?, ?)').run('old-1', T0, T0 + 5);
+      old.close();
+
+      const upgraded = openMeetingDb(path);
+      expect(createMeetingStore(upgraded).getRecording('old-1')).toEqual({
+        meeting_id: 'old-1', started_at: T0, stopped_at: T0 + 5, method: 'voice_memo', received_chunks: 0, received_bytes: 0,
+      });
+      upgraded.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('外鍵有打開：transcripts 指向不存在的 meeting 會被擋', () => {
     expect(() => db.prepare('INSERT INTO transcripts (meeting_id, segments, created_at) VALUES (?, ?, ?)')
       .run('nope', '[]', T0)).toThrow();
@@ -866,22 +895,24 @@ describe('setTitle', () => {
 describe('語音備忘錄錄音的起訖紀錄（vault plan「MeetPilot · 網頁錄音」）', () => {
   it('開始錄音：狀態進 RECORDING、開始時間落地，兩件事一起發生', () => {
     newMeeting();
-    const meeting = store.startRecording('m-1', T0 + 1000);
+    const meeting = store.startRecording('m-1', T0 + 1000, 'voice_memo');
     expect(meeting.status).toBe('RECORDING');
-    expect(store.getRecording('m-1')).toEqual({ meeting_id: 'm-1', started_at: T0 + 1000, stopped_at: null });
+    expect(store.getRecording('m-1')).toEqual({
+      meeting_id: 'm-1', started_at: T0 + 1000, stopped_at: null, method: 'voice_memo', received_chunks: 0, received_bytes: 0,
+    });
     expect(store.listRecordingMeetings().map(m => m.meeting_id)).toEqual(['m-1']);
   });
 
   it('不是 CREATED 不能開始錄，而且不會留下半筆起訖紀錄', () => {
     newMeeting();
     store.setStatus('m-1', 'TRANSCRIBING', T0);
-    expect(() => store.startRecording('m-1', T0)).toThrow(/不能從 TRANSCRIBING 轉到 RECORDING/);
+    expect(() => store.startRecording('m-1', T0, 'voice_memo')).toThrow(/不能從 TRANSCRIBING 轉到 RECORDING/);
     expect(store.getRecording('m-1')).toBeNull();
   });
 
   it('開始失敗退回 CREATED：起訖紀錄一起刪掉，不留一筆看起來還在錄的列', () => {
     newMeeting();
-    store.startRecording('m-1', T0);
+    store.startRecording('m-1', T0, 'voice_memo');
     const meeting = store.abortRecording('m-1', T0 + 5);
     expect(meeting.status).toBe('CREATED');
     expect(store.getRecording('m-1')).toBeNull();
@@ -890,16 +921,28 @@ describe('語音備忘錄錄音的起訖紀錄（vault plan「MeetPilot · 網�
 
   it('退回 CREATED 之後重新開始：開始時間換成這一次的，不留上一次的', () => {
     newMeeting();
-    store.startRecording('m-1', T0);
+    store.startRecording('m-1', T0, 'voice_memo');
     store.markRecordingStopped('m-1', T0 + 10_000);
     store.setStatus('m-1', 'CREATED', T0 + 11_000);
-    store.startRecording('m-1', T0 + 60_000);
-    expect(store.getRecording('m-1')).toEqual({ meeting_id: 'm-1', started_at: T0 + 60_000, stopped_at: null });
+    store.startRecording('m-1', T0 + 60_000, 'voice_memo');
+    expect(store.getRecording('m-1')).toEqual({
+      meeting_id: 'm-1', started_at: T0 + 60_000, stopped_at: null, method: 'voice_memo', received_chunks: 0, received_bytes: 0,
+    });
+  });
+
+  it('重新開始時換成這一次的方式、段數歸零：留著上一次的段數，第一段就會被當成跳號擋掉', () => {
+    newMeeting();
+    store.startRecording('m-1', T0, 'in_app');
+    store.recordChunkReceived('m-1', 0, 100);
+    store.markRecordingStopped('m-1', T0 + 10_000);
+    store.setStatus('m-1', 'CREATED', T0 + 11_000);
+    store.startRecording('m-1', T0 + 60_000, 'in_app');
+    expect(store.getRecording('m-1')).toMatchObject({ method: 'in_app', received_chunks: 0, received_bytes: 0, stopped_at: null });
   });
 
   it('停止時間只能記一次：第二次寫會蓋掉第一次的終點，一律拋錯', () => {
     newMeeting();
-    store.startRecording('m-1', T0);
+    store.startRecording('m-1', T0, 'voice_memo');
     store.markRecordingStopped('m-1', T0 + 10_000);
     expect(store.getRecording('m-1')?.stopped_at).toBe(T0 + 10_000);
     expect(() => store.markRecordingStopped('m-1', T0 + 20_000)).toThrow(/沒有進行中的錄音紀錄/);
@@ -913,9 +956,40 @@ describe('語音備忘錄錄音的起訖紀錄（vault plan「MeetPilot · 網�
 
   it('刪除會議時起訖紀錄跟著刪（外鍵 cascade）', () => {
     newMeeting();
-    store.startRecording('m-1', T0);
+    store.startRecording('m-1', T0, 'voice_memo');
     store.deleteMeeting('m-1');
     expect(store.getRecording('m-1')).toBeNull();
+  });
+
+  it('app 內錄音的段落只收下一段：段號對上才加一，記下寫完之後的總長度', () => {
+    newMeeting();
+    store.startRecording('m-1', T0, 'in_app');
+    expect(store.recordChunkReceived('m-1', 0, 800)).toMatchObject({ received_chunks: 1, received_bytes: 800 });
+    expect(store.recordChunkReceived('m-1', 1, 1500)).toMatchObject({ received_chunks: 2, received_bytes: 1500 });
+    // 重送同一段、跳號都寫不進去：當成功的話 DB 的進度會跟檔案對不上
+    expect(() => store.recordChunkReceived('m-1', 1, 2200)).toThrow(/段號跟已收到的對不上/);
+    expect(() => store.recordChunkReceived('m-1', 3, 2200)).toThrow(/段號跟已收到的對不上/);
+    expect(store.getRecording('m-1')).toMatchObject({ received_chunks: 2, received_bytes: 1500 });
+  });
+
+  it('語音備忘錄的錄音、已經停止的錄音都不收段落', () => {
+    newMeeting();
+    store.startRecording('m-1', T0, 'voice_memo');
+    expect(() => store.recordChunkReceived('m-1', 0, 800)).toThrow(/沒有進行中的 app 內錄音/);
+    store.setStatus('m-1', 'CREATED', T0 + 1);
+    store.startRecording('m-1', T0 + 2, 'in_app');
+    store.markRecordingStopped('m-1', T0 + 3);
+    expect(() => store.recordChunkReceived('m-1', 0, 800)).toThrow(/沒有進行中的 app 內錄音/);
+  });
+
+  it('資料庫裡的錄音來源被改成認不得的值：拋錯，不當成語音備忘錄', () => {
+    newMeeting();
+    store.startRecording('m-1', T0, 'in_app');
+    // CHECK 擋得住正常寫入，所以關掉 CHECK 模擬「被別的東西改過的檔案」
+    db.exec('PRAGMA ignore_check_constraints = ON');
+    db.prepare("UPDATE recordings SET method = 'tape' WHERE meeting_id = 'm-1'").run();
+    db.exec('PRAGMA ignore_check_constraints = OFF');
+    expect(() => store.getRecording('m-1')).toThrow(/錄音來源是 "tape"/);
   });
 
   it('補寫實際音檔大小', () => {

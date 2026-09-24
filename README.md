@@ -25,8 +25,8 @@ npm install
 npm run dev
 ```
 
-Windows 上沒有語音備忘錄錄音：錄音按鍵不會出現，空狀態會顯示一行「語音備忘錄錄音目前不能用」加原因，
-只能拖檔或選檔上傳（見〈用語音備忘錄錄音〉）。
+網頁版在 Windows 上沒有語音備忘錄錄音：錄音按鍵不會出現，空狀態會顯示一行「錄音目前不能用」加原因，
+只能拖檔或選檔上傳（見〈用語音備忘錄錄音〉）。Windows 上要錄音用桌面 app（見〈桌面 app〉的 app 內錄音）。
 repo 的 `.gitattributes` 強制所有文字檔以 LF 取出，不要在本機另外設 `core.autocrlf` 去蓋它：規範檔換成
 CRLF 會讓 `prompt_version` 跟 macOS 算出來的不一樣。
 
@@ -110,7 +110,7 @@ server 行程自己讀不到（`Operation not permitted`），授權是捷徑 Ap
 ## 桌面 app（開發中）
 
 多位記錄人各自在 Mac 或 Windows 上用的版本，Electron 包一層，裡面跑的就是上面這個 server（vault plan
-`MeetPilot · 跨平台打包部署`）。目前做到外殼（E1）、隨附 ffmpeg（E2）與邀請碼設定畫面（E3）：還沒有 app 內錄音。
+`MeetPilot · 跨平台打包部署`）。目前做到外殼（E1）、隨附 ffmpeg（E2）、邀請碼設定畫面（E3）與 app 內錄音（E4）。
 
 ```bash
 npm run ffmpeg:build -- mac-arm64   # 先編隨附的 ffmpeg（mac-arm64、mac-x64、win-x64），輸出到 vendor/ffmpeg/
@@ -153,6 +153,18 @@ node scripts/smokeDesktop.mjs <打包後的執行檔>   # 啟動打包後的 app
   server 的畫面底部掛一條離線橫幅說哪一樣是舊的；gateway 回 401（邀請碼被撤銷）就刪掉 token、key、名單，
   回設定頁講原因，不退回上次的。撤銷只在啟動時檢查，app 一直開著不會中途停。
 - 啟動 app 的環境變數 `GEMINI_API_KEY` 不再使用。
+- **app 內錄音（E4）。** 桌面版的「開始錄音」用這台電腦的麥克風錄，不叫語音備忘錄（外殼給 server 設
+  `MEETPILOT_RECORDER=in-app`）。選與會者的畫面下面選麥克風，上次選的記在這台電腦上。開始前會確認瀏覽器把
+  回音消除、噪音抑制、自動增益三項前處理都關了，關不掉就不開始（這三項會壓掉會議室裡遠一點的人聲）。
+  - 每 10 秒一段送到 server，接在 userData `audio/<meeting_id>.recording` 後面；按「停止錄音」時等所有段落送到，
+    整支變成這場會的音檔進轉錄。格式是 webm／opus（64 kbps 單聲道，100 分鐘約 48 MB），隨附的 ffmpeg 解得開。
+  - **關掉視窗會縮到系統匣繼續錄**，錄音中電腦不會閒置睡眠（`powerSaveBlocker`）；**筆電闔上、結束 MeetPilot、
+    重新整理會中斷**。錄音中從托盤按「結束」會先問一次；托盤的「設定…」錄音中不開。
+  - 錄音中的橫幅有音量條與「已送出幾段」；段落送不到（網路或 server 暫時出問題）會一直自動重送並顯示原因；
+    連續一分鐘幾乎沒聲音會警告；麥克風被拔掉會停下來講出來，已錄的照樣可以送。
+  - 中斷之後（app 被結束、當掉、重新整理）那場會停在「錄音中斷了」，server 已經收到的段落都在，按「送出已錄的部分」
+    就轉錄那一段；中斷之後的內容沒有錄到，不能接著錄，要另開一場。
+  - 還沒驗證：Windows 實機（E6）、跟語音備忘錄同場對照的品質（AC-8）、長時間（100 分鐘）錄音、闔蓋再打開的行為。
 
 ## 驗證
 
@@ -189,13 +201,19 @@ IndexedDB。側邊欄雙讀，兩區分開顯示：「伺服器上的會議」�
 ```
 POST   /api/meetings              建立 Meeting（CREATED）
 PUT    /api/meetings/:id/audio    上傳音檔，立刻回 202，轉錄在 server 背景跑（TRANSCRIBING）
-POST   /api/meetings/:id/recording/start  改由語音備忘錄錄音（CREATED → RECORDING），只收本機請求
-POST   /api/meetings/:id/recording/stop   停止、取回錄音、比對，對得上回 202 進轉錄（TRANSCRIBING），對不上 422 退回 CREATED
+POST   /api/meetings/:id/recording/start  開始錄音（CREATED → RECORDING），只收本機請求。語音備忘錄模式叫它開始錄；
+                                          app 內錄音模式只記開始時間（麥克風在頁面手上）
+PUT    /api/meetings/:id/recording/chunks/:seq  app 內錄音的一段（原始位元組，不經 body parser）。只收下一段：
+                                          重送已收到的回 200 目前進度，跳號 409，上一段還在寫 503
+POST   /api/meetings/:id/recording/stop   語音備忘錄：停止、取回錄音、比對，對得上回 202 進轉錄（TRANSCRIBING），
+                                          對不上 422 退回 CREATED。app 內錄音：body 帶 {"chunks":N}（段數對不上 409）
+                                          或 {"partial":true}（救回中斷的錄音），一段都沒收到 422 退回 CREATED
 GET    /api/recording/availability        這台 server 能不能錄，不能的話帶原因
 GET    /api/meetings/:id          每 3 秒查一次進度（processed_slices / total_slices / status / error）
 POST   /api/meetings/:id/retry    FAILED 重跑轉錄（音檔還在才行），或 TRANSCRIBED 重跑分析（不用重新轉錄）
 POST   /api/meetings/:id/link     重算跨會議關聯（READY / LINKED / LINK_FAILED 才行，同步等它跑完）
-DELETE /api/meetings/:id          刪掉；正在跑的回 409，等它結束或失敗再刪；錄音中的先叫語音備忘錄停止，停不下來就不刪
+DELETE /api/meetings/:id          刪掉；正在跑的回 409，等它結束或失敗再刪；語音備忘錄錄音中的先叫它停止，停不下來就不刪；
+                                  app 內錄音的段落跟著刪
 PATCH  /api/meetings/:id/transcript   改逐字稿或存潤稿
 PATCH  /api/meetings/:id/analysis     改會議記錄
 PATCH  /api/meetings/:id/title        改標題；畫面上的名字與下載檔名用它，分析完成時模型先填一個建議（只填還沒有標題的會）
@@ -203,7 +221,8 @@ PATCH  /api/meetings/:id/title        改標題；畫面上的名字與下載檔
 
 回 meeting 的路（`POST`、`PUT`、`GET`、錄音的 start／stop）送出來的不是資料庫裡的 `Meeting`，而是 `MeetingView`：多一個
 `has_audio`，server 當下去看檔案系統的結果，不是資料庫欄位；另一個 `recording_started_at` 只有 `RECORDING` 時有值，
-畫面上的錄音計時從它接回來（存在 `voice_memo_recordings` 表）。需要它是因為 **`CREATED` 是兩種相反處境合用
+畫面上的錄音計時從它接回來（存在 `recordings` 表）；`recording_method`（`voice_memo`／`in_app`）與
+`recording_received_chunks`（app 內錄音已收到的段數）同樣只有 `RECORDING` 時有值。需要它是因為 **`CREATED` 是兩種相反處境合用
 一個狀態**——「建立了還沒上傳，等使用者給音檔」與「retry 之後在佇列裡排隊，音檔好好地在 server 上」。光看
 狀態分不出來，而兩者該做的事相反：前者要顯示上傳入口，對後者顯示上傳入口是假話（下面那張表與 409 規則都
 建立在這個區分上）。型別正本在 `services/meetingApi.ts`。
@@ -241,7 +260,7 @@ base64**：base64 會先把整個檔案變成一條字串留在記憶體裡還�
 | `CREATED`，音檔不在 | **維持 `CREATED` 等上傳。** 它根本還沒開始跑，狀態本來就對，缺的只是音檔；轉成 FAILED 會變成死路（`PUT` 與 `retry` 都只收 CREATED 或有音檔的會） |
 | `CREATED`，音檔在，沒有 active 轉錄 job | 補一個轉錄 job；游標是空就從頭跑，游標不為空就是 retry 之後還在排隊，從游標**續跑**（保留游標是刻意的——retry 的用意就是不要為了重跑分析而連帶重跑兩小時的轉錄） |
 | `ANALYZING` 或 `TRANSCRIBED`，沒有 active 分析 job | 補一個分析 job，讀「目前顯示的版本」（`getCurrentTranscript`）決定 payload |
-| `RECORDING` | **不動。** 錄音在語音備忘錄裡，server 重啟不影響它；開始時間在 SQLite，重開頁面照樣看得到計時與停止按鍵 |
+| `RECORDING` | **不動。** 語音備忘錄的錄音在語音備忘錄裡，server 重啟不影響它；開始時間在 SQLite，重開頁面照樣看得到計時與停止按鍵。app 內錄音的 `<id>.recording` 不是 `.part`，啟動清理不會刪它 |
 
 沒上傳完的暫存檔（`<meeting_id>.audio.<uuid>.part`）也在啟動時清掉。檔名帶 uuid 是因為同一場會
 可能有兩個上傳同時在飛——雖然 server 端有 in-flight 鎖擋住第二個，唯一命名是跨 process 時的第二道防線。
@@ -470,6 +489,8 @@ POST /api/meetings/import   { jobs: Job[], blobIds: string[] }
 見 `.env.example`。`MEETPILOT_AUDIO_DIR` 是上傳音檔的落地位置；`MEETPILOT_FFMPEG` 與
 `MEETPILOT_FFPROBE` 指定那兩支執行檔的路徑，不設就走 PATH。`MEETPILOT_DB` 是 SQLite 的位置，路徑不可寫時 server 直接起不來；
 資料庫的 schema 版本比程式碼新時也拒絕開啟，不用舊程式碼往裡面寫。`npm run dev` 與 `npm start` 用 Node 的 `--env-file-if-exists=.env` 讀 `.env`，沒有那個檔就只吃 shell 環境變數。`HOST` 不是本機位址時必須設 `MEETPILOT_BASIC_AUTH_USER` 與 `MEETPILOT_BASIC_AUTH_PASSWORD`，server 才會啟動。`/api/*` 每個 IP 每分鐘最多 `MEETPILOT_API_RATE_LIMIT` 次（預設 60）。放在反向代理後面時所有使用者會共用同一個 IP 的額度，Express 沒設 `trust proxy`，這是刻意的：設了又沒限定代理位址，`X-Forwarded-For` 就能繞過限流。同機反向代理另有兩個問題：`HOST` 是本機位址所以不要求 Basic Auth，而且語音備忘錄錄音的「只收本機請求」會失效，見〈用語音備忘錄錄音〉。
+
+`MEETPILOT_RECORDER` 決定新的錄音怎麼開始：`voice-memo`（預設，叫本機語音備忘錄）或 `in-app`（頁面自己用麥克風錄、分段送上來，桌面 app 用這個）。寫錯值 server 起不來。已經在錄的那場照它開始時的方式收尾，不看現在的設定。
 
 `MEETPILOT_LINKING=off` 關掉跨會議關聯（預設開啟），關掉時會議停在 `READY`。
 

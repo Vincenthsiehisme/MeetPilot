@@ -232,6 +232,83 @@ const startUploadApp = async (store: AudioFileStore, options: { limit: number })
   return { server, url: `http://127.0.0.1:${port}` };
 };
 
+describe('app 內錄音的段落（E4）', () => {
+  const chunk = (text: string) => Buffer.from(text);
+
+  it('依序接起來，回傳的長度就是檔案長度', () => {
+    expect(store.appendRecordingChunk('m-1', 0, chunk('aaa'))).toBe(3);
+    expect(store.appendRecordingChunk('m-1', 3, chunk('bbbb'))).toBe(7);
+    expect(readFileSync(store.recordingPathFor('m-1'), 'utf8')).toBe('aaabbbb');
+  });
+
+  it('上一次寫到一半或沒記進資料庫就斷了：多出來的先截掉，重送的那段不會跟殘留混在一起', () => {
+    store.appendRecordingChunk('m-1', 0, chunk('aaa'));
+    // 資料庫還記著 3，檔案後面卻多了一截（server 在寫檔途中、或寫完檔還沒更新進度時掛掉）。
+    // 殘留比重送的那段長：只靠「同一個位置再寫一次」蓋不掉尾巴
+    writeFileSync(store.recordingPathFor('m-1'), 'aaa-torn-write-leftover');
+    expect(store.appendRecordingChunk('m-1', 3, chunk('bbbb'))).toBe(7);
+    expect(readFileSync(store.recordingPathFor('m-1'), 'utf8')).toBe('aaabbbb');
+  });
+
+  it('檔案比已收到的短（被刪掉一截）就拋錯，不接出一個缺了中間的檔', () => {
+    store.appendRecordingChunk('m-1', 0, chunk('aaa'));
+    expect(() => store.appendRecordingChunk('m-1', 10, chunk('bbbb'))).toThrow(/比已經收到的 10 bytes 短/);
+    expect(readFileSync(store.recordingPathFor('m-1'), 'utf8')).toBe('aaa');
+  });
+
+  it('已經收過段落、檔案卻不見了：拋錯，不從頭建一個新檔', () => {
+    expect(() => store.appendRecordingChunk('m-1', 3, chunk('bbbb'))).toThrow(/錄音檔不見了/);
+    expect(existsSync(store.recordingPathFor('m-1'))).toBe(false);
+  });
+
+  it('第 0 段蓋掉同名的舊檔（上一次開始又被退回的殘留）', () => {
+    writeFileSync(store.recordingPathFor('m-1'), 'stale-bytes');
+    store.appendRecordingChunk('m-1', 0, chunk('aaa'));
+    expect(readFileSync(store.recordingPathFor('m-1'), 'utf8')).toBe('aaa');
+  });
+
+  it('收尾：截到確定收到的長度再改名成音檔，錄音中的檔不留', () => {
+    store.appendRecordingChunk('m-1', 0, chunk('aaa'));
+    store.appendRecordingChunk('m-1', 3, chunk('bbbb'));
+    // 多出來的是最後一段寫進檔案、沒記進資料庫的那一次
+    expect(store.promoteRecording('m-1', 3)).toEqual({ path: store.pathFor('m-1'), bytes: 3 });
+    expect(readFileSync(store.pathFor('m-1'), 'utf8')).toBe('aaa');
+    expect(existsSync(store.recordingPathFor('m-1'))).toBe(false);
+  });
+
+  it('收尾時檔案比收到的短或不見了：拋錯，不送一個缺一截的檔去轉錄', () => {
+    expect(() => store.promoteRecording('m-1', 3)).toThrow(/錄音檔不見了/);
+    store.appendRecordingChunk('m-1', 0, chunk('aa'));
+    expect(() => store.promoteRecording('m-1', 3)).toThrow(/比已經收到的 3 bytes 短/);
+    expect(store.exists('m-1')).toBe(false);
+  });
+
+  it('收尾可以重跑：上一次改名成功、資料庫還沒更新就斷了，這次直接用已經改好名的音檔', () => {
+    store.appendRecordingChunk('m-1', 0, chunk('aaa'));
+    store.promoteRecording('m-1', 3);
+    expect(store.promoteRecording('m-1', 3)).toEqual({ path: store.pathFor('m-1'), bytes: 3 });
+    // 長度對不上的音檔不算：那不是這一次收尾改名過來的
+    expect(() => store.promoteRecording('m-1', 5)).toThrow(/錄音檔不見了/);
+  });
+
+  it('啟動清理不碰錄音中的檔：server 重啟時已經送到的段落要留著', () => {
+    store.appendRecordingChunk('m-1', 0, chunk('aaa'));
+    expect(store.removePartialUploads()).toEqual([]);
+    expect(existsSync(store.recordingPathFor('m-1'))).toBe(true);
+  });
+
+  it('removeRecording 刪掉錄音中的檔，不在也不拋錯', () => {
+    store.appendRecordingChunk('m-1', 0, chunk('aaa'));
+    store.removeRecording('m-1');
+    expect(existsSync(store.recordingPathFor('m-1'))).toBe(false);
+    expect(() => store.removeRecording('m-1')).not.toThrow();
+  });
+
+  it('不合法的 meeting_id 一樣拋錯', () => {
+    expect(() => store.recordingPathFor('../x')).toThrow(/不能當成檔名/);
+  });
+});
+
 describe('PUT /api/meetings/:id/audio 的 middleware 順序', () => {
   let server: Server;
   let url: string;

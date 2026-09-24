@@ -11,6 +11,9 @@
 // 四段，同一份 userData 接著跑（E3）：
 //   1. 首次設定：出現設定頁 → 經 CDP 填邀請碼與資料夾、按儲存 → server 起來，拿到 gateway 的 key 與名單。
 //   2. 離線：gateway 連不上 → server 用上次存的 key 照樣起來，畫面底部有離線橫幅。
+//   2a. 錄音（E4）：經 CDP 按「開始錄音」、選人、確認 → 把視窗關到系統匣 → 段落照常送到 server →
+//       按「停止錄音」→ 收到的段落變成音檔進轉錄，隨附的 ffmpeg 解得出 opus、長度對得上。
+//       麥克風用 Chromium 的假裝置（--use-fake-device-for-media-stream），不碰真的麥克風、不跳系統權限詢問。
 //   2b. 資料夾不見了：上次選的投影資料夾被刪掉 → 回設定頁講原因，不起 server、不重建資料夾。
 //   3. 撤銷：gateway 回 401 → 不起 server，回到設定頁講原因，存著的 token、key、名單都刪掉。
 // gateway 是這支自己起的假的（MEETPILOT_DESKTOP_GATEWAY_URL），不用真的邀請碼。設定頁用 CDP
@@ -21,17 +24,17 @@
 // userData 一律用拋棄式暫存目錄（MEETPILOT_DESKTOP_USER_DATA），跑完刪掉。不能用正式的：
 // server 一啟動就 migrate、回收上次沒跑完的 job、開始跑 worker，冒煙測試又會把它強制關掉，
 // 在用過桌面版的電腦上會動到真的會議狀態（Codex review 2026-09-24）。
-import { spawn, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { createServer as createHttpServer } from 'node:http';
 import { createServer as createNetServer } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 const TIMEOUT_MS = 60_000;
 // 整支腳本的硬上限：收尾時 app 卡住不結束（例如 macOS 的錯誤對話框卡住主程序）也不能讓 CI 無限等下去。
 // 2026-09-24 CI 的 macOS 那格就這樣卡了 40 分鐘以上
-const WATCHDOG_MS = 5 * 60_000;
+const WATCHDOG_MS = 6 * 60_000;
 setTimeout(() => {
   console.error(`[desktop-smoke] 失敗：超過 ${WATCHDOG_MS / 1000} 秒還沒結束，強制退出`);
   process.exit(1);
@@ -109,15 +112,21 @@ const freePort = () => new Promise((resolve, reject) => {
 });
 
 // ---- 啟動與收掉 app ----
-let app = null; // { child, exited, cdpPort }
+let app = null; // { child, exited, cdpPort, inspectPort }
 const launch = async () => {
   const cdpPort = await freePort();
-  const child = spawn(exe, [`--remote-debugging-port=${cdpPort}`], {
+  // 主程序的 Node inspector：錄音段要從主程序關視窗（頁面裡的 window.close() 會被 Chromium 擋掉，
+  // 不是使用者按關閉鈕那條路）。假麥克風的兩個旗標每一段都帶：沒錄音的段落用不到，也不影響別的行為
+  const inspectPort = await freePort();
+  const child = spawn(exe, [
+    `--remote-debugging-port=${cdpPort}`, `--inspect=${inspectPort}`,
+    '--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream',
+  ], {
     stdio: 'ignore',
     detached: process.platform !== 'win32',
     env: { ...process.env, MEETPILOT_DESKTOP_USER_DATA: userData, MEETPILOT_DESKTOP_GATEWAY_URL: gatewayUrl },
   });
-  app = { child, exited: null, cdpPort };
+  app = { child, exited: null, cdpPort, inspectPort };
   const current = app;
   child.on('exit', (code) => { current.exited = code; });
 };
@@ -176,6 +185,13 @@ function evaluate(target, expression) {
       else resolve(msg.result?.result?.value);
     };
   });
+}
+
+/** 在主程序裡跑一段 JS（Node inspector）。process.mainModule 是 dist/electron/main.cjs，拿得到 electron 模組 */
+async function evaluateMain(expression) {
+  const res = await fetch(`http://127.0.0.1:${app.inspectPort}/json/list`, { signal: AbortSignal.timeout(2000) });
+  const [target] = await res.json();
+  return evaluate(target, `(() => { const electron = process.mainModule.require('electron'); return (${expression}); })()`);
 }
 
 /** 一直試到 check 回有內容的值，或時間到 */
@@ -310,6 +326,97 @@ if (!offlineLog.includes('啟動時匯入 gateway 名單')) await fail(phase, '�
 await stop();
 console.log(`[desktop-smoke] ${phase}通過：gateway 斷線時 server 用上次的 key 起來，橫幅：${banner}`);
 
+// ======== 2a. 錄音 ========
+phase = '錄音';
+gatewayMode = 'ok';
+const beforeRecording = startCount();
+await launch();
+const rec = await waitForServer(phase, beforeRecording);
+const api = (path) => fetch(`http://127.0.0.1:${rec.port}${path}`, { signal: AbortSignal.timeout(5000) }).then((r) => r.json());
+const recPage = await waitFor(phase, '主視窗換到 server 的頁面', () => findPage((u) => u.startsWith(`http://127.0.0.1:${rec.port}/`)));
+const availability = await api('/api/recording/availability');
+if (availability.available !== true || availability.method !== 'in_app') {
+  await fail(phase, `桌面版應該是 app 內錄音，availability 回 ${JSON.stringify(availability)}`);
+}
+const clickButton = (text) => `(() => {
+  const b = [...document.querySelectorAll('button')].find((x) => x.textContent.trim() === ${JSON.stringify(text)} && !x.disabled);
+  if (!b) return false;
+  b.click();
+  return true;
+})()`;
+await waitFor(phase, '按下「開始錄音」', () => evaluate(recPage, clickButton('開始錄音')));
+await waitFor(phase, '選一位與會者', () => evaluate(recPage, `(() => {
+  const box = document.querySelector('input[type=checkbox]');
+  if (!box) return false;
+  if (!box.checked) box.click();
+  return box.checked;
+})()`));
+// 麥克風清單讀到之後確認按鈕才會啟用；讀不到的話按鈕寫「麥克風還沒準備好」，這裡會逾時並印出畫面上的原因
+await waitFor(phase, '按下確認開始錄音', () => evaluate(recPage, `(() => {
+  const b = [...document.querySelectorAll('button')].find((x) => x.textContent.trim().startsWith('開始錄音（已選') && !x.disabled);
+  if (!b) return false;
+  b.click();
+  return true;
+})()`));
+const recording = await waitFor(phase, '會議進入錄音中', async () => {
+  // 開始失敗時畫面會跳「沒有開始錄音」加原因（麥克風打不開、前處理關不掉），直接帶出來，不要只等到逾時
+  const bodyText = await evaluate(recPage, 'document.body.innerText').catch(() => '');
+  if (bodyText.includes('沒有開始錄音')) await fail(phase, `畫面說沒有開始錄音：${bodyText.slice(bodyText.indexOf('沒有開始錄音'), bodyText.indexOf('沒有開始錄音') + 300)}`);
+  const { meetings } = await api('/api/meetings');
+  return meetings.find((m) => m.status === 'RECORDING') ?? null;
+});
+if (recording.recording_method !== 'in_app') await fail(phase, `錄音方式是 ${recording.recording_method}，不是 in_app`);
+if (!readLog().includes('錄音開始（頁面回報）')) await fail(phase, '頁面沒有告訴外殼錄音開始了（擋睡眠、結束前確認都靠它）');
+
+// 關到系統匣：頁面還活著，段落照常送
+// 跟使用者按視窗的關閉鈕同一條路（BrowserWindow.close() → close 事件 → 外殼藏起視窗）
+await waitFor(phase, '從主程序關掉視窗', () => evaluateMain(`(electron.BrowserWindow.getAllWindows()[0].close(), true)`));
+await waitFor(phase, '視窗關到系統匣', () => readLog().includes('視窗關到系統匣（錄音中）'), 10_000);
+if (await evaluateMain(`electron.BrowserWindow.getAllWindows()[0].isVisible()`)) await fail(phase, '關掉之後視窗還看得到，不是藏到系統匣');
+const chunksAtHide = (await api('/api/meetings')).meetings.find((m) => m.meeting_id === recording.meeting_id).recording_received_chunks;
+const chunksHidden = await waitFor(phase, '關到系統匣之後還收到兩段以上', async () => {
+  const m = (await api('/api/meetings')).meetings.find((x) => x.meeting_id === recording.meeting_id);
+  return m.recording_received_chunks >= chunksAtHide + 2 ? m.recording_received_chunks : null;
+}, 40_000);
+
+await waitFor(phase, '按下「停止錄音」', () => evaluate(recPage, clickButton('停止錄音')));
+const stopped = await waitFor(phase, '錄音變成音檔進轉錄', async () => {
+  const m = (await api('/api/meetings')).meetings.find((x) => x.meeting_id === recording.meeting_id);
+  return m.status !== 'RECORDING' && m.has_audio ? m : null;
+});
+if (stopped.status === 'CREATED') await fail(phase, '停止之後退回 CREATED，沒有進轉錄');
+// 假 gateway 給的 Gemini key 是假的，轉錄一定會在打 Gemini 時失敗；要確認失敗在那裡，不是音檔讀不了、切不了
+const settled = await waitFor(phase, '轉錄跑到打 Gemini', async () => {
+  const m = (await api('/api/meetings')).meetings.find((x) => x.meeting_id === recording.meeting_id);
+  return m.status === 'FAILED' || (m.processed_slices ?? 0) > 0 ? m : null;
+});
+if (settled.status === 'FAILED' && /ffmpeg|ffprobe|長度|切片|remux|音訊/i.test(settled.error ?? '')) {
+  await fail(phase, `轉錄在處理音檔時就失敗了，不是在打 Gemini：${settled.error}`);
+}
+if (!readLog().includes('錄音結束（頁面回報）')) await fail(phase, '頁面沒有告訴外殼錄音結束了');
+// 用隨附的 ffmpeg 整支解一次：MediaRecorder 的 webm 沒寫長度，只能解碼算；同時證明隨附的最小版解得開 opus
+const audioPath = join(userData, 'audio', `${recording.meeting_id}.audio`);
+const bundledFfmpeg = readLog().match(/^ffmpeg：(.*)$/m)?.[1];
+const ffprobePath = join(dirname(bundledFfmpeg), process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe');
+let codec;
+let decodedSeconds;
+try {
+  codec = execFileSync(ffprobePath, ['-v', 'error', '-select_streams', 'a:0', '-show_entries', 'stream=codec_name', '-of', 'csv=p=0', audioPath], { encoding: 'utf8' }).trim();
+  // 隨附的最小版沒有 null muxer，解成 16kHz 單聲道 WAV 從長度算秒數（跟 server 切片同一種輸出）
+  const wav = execFileSync(bundledFfmpeg, ['-v', 'error', '-i', audioPath, '-ac', '1', '-ar', '16000', '-f', 'wav', '-'], { maxBuffer: 64 * 1024 * 1024 });
+  decodedSeconds = (wav.length - 44) / (16000 * 2);
+} catch (err) {
+  await fail(phase, `讀不了錄下的音檔（${audioPath}）：${err.message}`);
+}
+if (codec !== 'opus') await fail(phase, `錄下的音檔編碼是 ${codec}，不是 opus`);
+// 每段 10 秒；送到幾段就至少有 (段數 - 1) × 10 秒（最後一段可能不滿 10 秒）
+const minSeconds = (chunksHidden - 1) * 10;
+if (!(decodedSeconds >= minSeconds)) {
+  await fail(phase, `錄下的音檔解出來 ${decodedSeconds} 秒，至少應該有 ${minSeconds} 秒（收到 ${chunksHidden} 段以上）`);
+}
+await stop();
+console.log(`[desktop-smoke] ${phase}通過：關到系統匣後段落從 ${chunksAtHide} 段送到 ${chunksHidden} 段以上，停止後進 ${stopped.status}（轉錄停在：${settled.status} ${(settled.error ?? '').slice(0, 80)}），音檔 opus、解出 ${decodedSeconds.toFixed(1)} 秒`);
+
 // ======== 2b. 資料夾不見了 ========
 // 共享資料夾被取消同步或刪掉：要回設定頁講原因，不能讓 server 自己建一個不會同步的本機資料夾
 phase = '資料夾不見了';
@@ -345,5 +452,5 @@ console.log(`[desktop-smoke] ${phase}通過：gateway 回 401 時不起 server�
 gatewayServer.close();
 await sleep(1500);
 cleanup();
-console.log('[desktop-smoke] 通過：首次設定、離線、資料夾不見了、撤銷四段都對');
+console.log('[desktop-smoke] 通過：首次設定、離線、錄音、資料夾不見了、撤銷五段都對');
 process.exit(0);

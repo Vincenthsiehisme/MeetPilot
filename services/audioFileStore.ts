@@ -7,7 +7,10 @@
  *
  * 音檔只在「分析成功」之後才刪（SDD 1.4）。轉錄或分析失敗時留著，重跑才有東西可跑。
  */
-import { createWriteStream, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs';
+import {
+  closeSync, createWriteStream, existsSync, fsyncSync, ftruncateSync, fstatSync, mkdirSync, openSync, readdirSync,
+  renameSync, rmSync, statSync, writeSync,
+} from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
@@ -39,6 +42,11 @@ export function createAudioFileStore(dir: string) {
       throw new Error(`meeting_id ${JSON.stringify(meetingId)} 不能當成檔名（只允許英數、底線與連字號）`);
     }
     return join(dir, `${meetingId}.audio`);
+  };
+
+  const recordingPathFor = (meetingId: string): string => {
+    pathFor(meetingId); // 同一條檔名規則：不合法的 meeting_id 在這裡就拋錯
+    return join(dir, `${meetingId}.recording`);
   };
 
   return {
@@ -115,6 +123,83 @@ export function createAudioFileStore(dir: string) {
     /** 刪掉音檔。已經不在就當作已完成，不拋錯：呼叫端要的是「之後不會再佔著空間」 */
     remove: (meetingId: string): void => {
       rmSync(pathFor(meetingId), { force: true });
+    },
+
+    // ---- 桌面 app 自己錄音的分段（vault plan「MeetPilot · 跨平台打包部署」E4） ----
+    //
+    // 錄音中的檔叫 `<id>.recording`，不是 `.part`：removePartialUploads 會在 server 啟動時清掉 `.part`，
+    // 而錄到一半 server 重啟時，已經送到的段落正是要留下來的東西（停止或「送出已錄的部分」時才轉成音檔）。
+
+    recordingPathFor,
+
+    /**
+     * 把一段錄音接在 `<id>.recording` 後面，寫到磁碟才回傳新的總長度。
+     *
+     * `committedBytes` 是資料庫記的「已經確定收到」的長度。檔案比它長代表上一次寫完檔、還沒記進資料庫就斷了
+     * （server 掛掉、請求中斷），那一段前端會重送，所以先截回 committedBytes 再寫，不然同一段會出現兩次。
+     * 檔案比它短代表已經收到的段落不見了（被刪掉、磁碟出錯），接下去寫只會得到一個缺了中間的檔，直接拋錯。
+     * 第 0 段（committedBytes 是 0）才准建新檔。
+     */
+    appendRecordingChunk: (meetingId: string, committedBytes: number, data: Buffer): number => {
+      const target = recordingPathFor(meetingId);
+      if (committedBytes > 0 && !existsSync(target)) {
+        throw new Error(`Meeting ${meetingId} 的錄音檔不見了（已經收到 ${committedBytes} bytes），接不下去`);
+      }
+      const fd = openSync(target, committedBytes === 0 ? 'w' : 'r+');
+      try {
+        const size = fstatSync(fd).size;
+        if (size < committedBytes) {
+          throw new Error(`Meeting ${meetingId} 的錄音檔只有 ${size} bytes，比已經收到的 ${committedBytes} bytes 短，接不下去`);
+        }
+        if (size > committedBytes) ftruncateSync(fd, committedBytes);
+        let written = 0;
+        while (written < data.length) {
+          written += writeSync(fd, data, written, data.length - written, committedBytes + written);
+        }
+        // 回應送出去之前要真的在磁碟上：前端收到 200 就會丟掉這段，斷電時留在快取裡的就沒了
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      return committedBytes + data.length;
+    },
+
+    /**
+     * 錄音結束：`<id>.recording` 截到 committedBytes 後改名成這場會的音檔。
+     *
+     * 截的理由同 appendRecordingChunk：比資料庫記的長，多出來的是沒有確認收到的半段。
+     * 比它短就拋錯，不把缺了一截的檔當成完整錄音送去轉錄。
+     *
+     * 可以重跑：上一次改名成功、之後更新資料庫之前就斷了的話，`<id>.recording` 已經不在、音檔在而且長度對，
+     * 這次就直接用它，不然這場會會永遠停在錄音中、每次收尾都說錄音檔不見了（Codex review）
+     */
+    promoteRecording: (meetingId: string, committedBytes: number): SavedAudio => {
+      const finalPath = pathFor(meetingId);
+      const source = recordingPathFor(meetingId);
+      if (!existsSync(source)) {
+        if (existsSync(finalPath) && statSync(finalPath).size === committedBytes) return { path: finalPath, bytes: committedBytes };
+        throw new Error(`Meeting ${meetingId} 的錄音檔不見了（應該有 ${committedBytes} bytes）`);
+      }
+      const size = statSync(source).size;
+      if (size < committedBytes) {
+        throw new Error(`Meeting ${meetingId} 的錄音檔只有 ${size} bytes，比已經收到的 ${committedBytes} bytes 短`);
+      }
+      if (size > committedBytes) {
+        const fd = openSync(source, 'r+');
+        try {
+          ftruncateSync(fd, committedBytes);
+          fsyncSync(fd);
+        } finally {
+          closeSync(fd);
+        }
+      }
+      renameSync(source, finalPath);
+      return { path: finalPath, bytes: committedBytes };
+    },
+
+    /** 刪掉錄音中的檔（刪除會議時）。不在就當作已完成，理由同 remove */
+    removeRecording: (meetingId: string): void => {
+      rmSync(recordingPathFor(meetingId), { force: true });
     },
   };
 }

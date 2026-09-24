@@ -28,6 +28,8 @@ import {
   PeopleListResponse,
   PersonSummary,
   RecordingAvailabilityResponse,
+  RecordingChunkResponse,
+  StopInAppRecordingRequest,
 } from './meetingApi';
 
 async function requestJson<T>(endpoint: string, init: RequestInit): Promise<T> {
@@ -218,10 +220,27 @@ export const startRecording = async (meetingId: string): Promise<MeetingView> =>
 };
 
 /**
- * 叫語音備忘錄停止、取回錄音、送進轉錄。要等取檔與比對跑完才回，錄音越長越久。
- * 取回的不是這場會的錄音時 server 回 422，訊息裡帶原因與退路（從語音備忘錄把檔拖進來），原樣顯示
+ * 停止錄音、送進轉錄。
+ *
+ * 語音備忘錄（不帶 body）：server 叫它停止、取回錄音、比對，要等取檔跑完才回，錄音越長越久。
+ * 取回的不是這場會的錄音時回 422，訊息裡帶原因與退路（從語音備忘錄把檔拖進來），原樣顯示。
+ *
+ * app 內錄音（帶 body，契約見 StopInAppRecordingRequest）：段落都送到之後才呼叫，server 把收到的段落變成音檔。
  */
-export const stopRecording = async (meetingId: string): Promise<MeetingView> => {
-  const data = await requestJson<MeetingResponse>(meetingPath(meetingId, '/recording/stop'), { method: 'POST' });
+export const stopRecording = async (meetingId: string, inApp?: StopInAppRecordingRequest): Promise<MeetingView> => {
+  const data = await requestJson<MeetingResponse>(meetingPath(meetingId, '/recording/stop'), inApp === undefined
+    ? { method: 'POST' }
+    : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(inApp) });
   return data.meeting;
 };
+
+/**
+ * 送一段 app 內錄音（E4）。body 是原始位元組，跟 uploadAudio 同一個理由不包 JSON。
+ * 失敗照樣拋 HttpError（帶狀態碼與 Retry-After），要不要重送由分段上傳那一層照狀態碼決定
+ */
+export const uploadRecordingChunk = (meetingId: string, seq: number, chunk: Blob): Promise<RecordingChunkResponse> =>
+  requestJson<RecordingChunkResponse>(meetingPath(meetingId, `/recording/chunks/${seq}`), {
+    method: 'PUT',
+    headers: { 'Content-Type': AUDIO_CONTENT_TYPE },
+    body: chunk,
+  });

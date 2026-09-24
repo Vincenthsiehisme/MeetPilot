@@ -41,6 +41,19 @@ function resolveJobConcurrency(env: NodeJS.ProcessEnv, key: string): number {
   return Number(raw);
 }
 
+/**
+ * 新的錄音用哪一種方式開始（`MEETPILOT_RECORDER`）。沒設是 `voice-memo`（網頁版叫本機語音備忘錄）；
+ * 桌面 app 的外殼設 `in-app`，由頁面自己用麥克風錄、分段送上來（vault plan「MeetPilot · 跨平台打包部署」E4）。
+ * 寫錯值在啟動時就爆：默默退回語音備忘錄的話，Windows 上的錄音按鍵會安靜地消失
+ */
+function resolveRecordingMethod(env: NodeJS.ProcessEnv): 'voice_memo' | 'in_app' {
+  const raw = (env.MEETPILOT_RECORDER ?? '').trim();
+  if (raw === '' || raw === 'voice-memo') return 'voice_memo';
+  if (raw === 'in-app') return 'in_app';
+  throw new Error(`MEETPILOT_RECORDER="${raw}" 只能是 voice-memo 或 in-app，請修正 .env`);
+}
+const recordingMethod = resolveRecordingMethod(process.env);
+
 // 監聽設定在啟動時就解析：HOST 不是本機位址又沒設 Basic Auth 會在這裡直接拋錯，不進 listen
 const listenConfig = resolveListenConfig(process.env);
 
@@ -210,7 +223,8 @@ const analysisQueue = {
   has: (meetingId: string): boolean => jobStore.hasActive(meetingId, 'analysis'),
 };
 
-// 語音備忘錄錄音（vault plan「MeetPilot · 網頁錄音」）。一律建起來、不設 off 開關：
+// 語音備忘錄錄音（vault plan「MeetPilot · 網頁錄音」）。一律建起來、不設 off 開關（in-app 模式也建：
+// 換模式之前還沒停的那一場語音備忘錄錄音，要照它開始時的方式收尾）：
 // 能不能錄（是不是 macOS、三個捷徑在不在）每次由 GET /api/recording/availability 當下去查，
 // 前端靠它決定錄音按鍵要不要出現，這裡不先判斷一次就記住
 const voiceMemoRecorder = createVoiceMemoRecorder({
@@ -232,6 +246,7 @@ const app = createApp({
   topicLinker,
   vaultProjector,
   voiceMemoRecorder,
+  recordingMethod,
 });
 
 // Vite middleware & Production static serving

@@ -53,7 +53,7 @@ const STATUS_VIEW: Record<MeetingStatus, StatusView> = {
     jobStatus: JobStatus.RUNNING,
     stageStatuses: [StepStatus.PROCESSING, StepStatus.IDLE, StepStatus.IDLE],
     currentStep: 0,
-    note: '語音備忘錄錄音中，按「停止錄音」後會自動取回音檔開始轉錄',
+    note: '錄音中，按「停止錄音」後會自動送進轉錄',
   },
   TRANSCRIBING: {
     jobStatus: JobStatus.RUNNING,
@@ -169,6 +169,7 @@ export const meetingToJob = (meeting: MeetingView): Job => {
     totalSlices: meeting.total_slices ?? undefined,
     meetingContext: meeting.meeting_context ?? undefined,
     recordingStartedAt: meeting.recording_started_at ?? undefined,
+    recordingMethod: meeting.recording_method ?? undefined,
     steps: buildSteps(meeting, view),
   };
 };

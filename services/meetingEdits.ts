@@ -76,6 +76,8 @@ export function deleteMeetingRequest(
   // （retry 之後佇列正忙就是這個狀態），不取消的話等一下會印一行看起來像故障的 log
   deps.queue?.cancel(meetingId);
   deps.audioStore.remove(meetingId);
+  // app 內錄音錄到一半的段落（E4）。它不叫 `.part`，啟動清理不會碰它，這裡不刪就一直佔著空間
+  deps.audioStore.removeRecording(meetingId);
   deps.store.deleteMeeting(meetingId);
   return { status: 200, body: { deleted: true, meetingId } };
 }

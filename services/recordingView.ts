@@ -27,8 +27,8 @@ export const formatRecordingElapsed = (startedAt: number, now: number): string =
  * 錄音按鍵建立的會議要填的「原始檔名」。這時還沒有檔案，但 `POST /api/meetings` 要一個非空的
  * fileName，而清單上在分析出標題之前顯示的就是它，所以寫成人看得懂的「哪一天幾點錄的」
  */
-export const recordingMeetingFileName = (at: Date): string =>
-  `語音備忘錄錄音 ${at.getFullYear()}-${pad2(at.getMonth() + 1)}-${pad2(at.getDate())} ${pad2(at.getHours())}:${pad2(at.getMinutes())}`;
+export const recordingMeetingFileName = (at: Date, method: 'voice_memo' | 'in_app'): string =>
+  `${method === 'in_app' ? 'MeetPilot 錄音' : '語音備忘錄錄音'} ${at.getFullYear()}-${pad2(at.getMonth() + 1)}-${pad2(at.getDate())} ${pad2(at.getHours())}:${pad2(at.getMinutes())}`;
 
 /**
  * 現在正在錄的那一場。語音備忘錄一次只錄一支，server 擋掉了第二場，所以最多一場。
@@ -40,7 +40,7 @@ export const findRecordingMeeting = (meetings: MeetingView[] | null): MeetingVie
   if (meetings === null) return null;
   const recording = meetings.filter(m => m.status === 'RECORDING');
   if (recording.length > 1) {
-    throw new Error(`同時有 ${recording.length} 場會在錄音（${recording.map(m => m.meeting_id).join('、')}），語音備忘錄一次只能錄一支`);
+    throw new Error(`同時有 ${recording.length} 場會在錄音（${recording.map(m => m.meeting_id).join('、')}），一次只能錄一場`);
   }
   return recording[0] ?? null;
 };

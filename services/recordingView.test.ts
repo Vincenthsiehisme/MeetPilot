@@ -19,6 +19,8 @@ const view = (overrides: Partial<MeetingView>): MeetingView => ({
   topic_extraction_error: null,
   has_audio: false,
   recording_started_at: null,
+  recording_method: null,
+  recording_received_chunks: null,
   ...overrides,
 });
 
@@ -42,7 +44,9 @@ describe('formatRecordingElapsed', () => {
 
 describe('recordingMeetingFileName', () => {
   it('寫成哪一天幾點錄的，補零', () => {
-    expect(recordingMeetingFileName(new Date(2026, 8, 3, 9, 5))).toBe('語音備忘錄錄音 2026-09-03 09:05');
+    expect(recordingMeetingFileName(new Date(2026, 8, 3, 9, 5), 'voice_memo')).toBe('語音備忘錄錄音 2026-09-03 09:05');
+    // app 內錄音不叫語音備忘錄：Windows 上根本沒有語音備忘錄（E4）
+    expect(recordingMeetingFileName(new Date(2026, 8, 3, 9, 5), 'in_app')).toBe('MeetPilot 錄音 2026-09-03 09:05');
   });
 });
 

@@ -22,6 +22,14 @@ describe('buildServerEnv', () => {
     });
   });
 
+  it('錄音走 app 內錄音、限流放寬；使用者 shell 裡的同名變數蓋不掉（E4）', () => {
+    const env = buildServerEnv({
+      baseEnv: { ...base, MEETPILOT_RECORDER: 'voice-memo', MEETPILOT_API_RATE_LIMIT: '5' }, userDataDir: '/d', port: 1,
+    });
+    expect(env.MEETPILOT_RECORDER).toBe('in-app');
+    expect(env.MEETPILOT_API_RATE_LIMIT).toBe('600');
+  });
+
   it('投影資料夾沒指定時不落到 server 預設的 ~/MeetPilot Vault（那是網頁版在用的），指定了就用指定的', () => {
     expect(buildServerEnv({ baseEnv: { MEETPILOT_VAULT: '/Users/u/MeetPilot Vault' }, userDataDir: '/d', port: 1 }).MEETPILOT_VAULT)
       .toBe(join('/d', 'vault'));

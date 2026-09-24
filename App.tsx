@@ -5,8 +5,11 @@ import JobDetail from './components/JobDetail';
 import FileUpload from './components/FileUpload';
 import ConfirmModal from './components/ConfirmModal';
 import ParticipantPicker from './components/ParticipantPicker';
+import MicrophoneSelect from './components/MicrophoneSelect';
 import { HttpError } from './services/httpError';
-import { MEETING_POLL_INTERVAL_MS, MeetingDetailResponse, MeetingView, PersonSummary, RecordingAvailabilityResponse } from './services/meetingApi';
+import {
+  MEETING_POLL_INTERVAL_MS, MeetingDetailResponse, MeetingView, PersonSummary, RECORDING_CHUNK_MS, RecordingAvailabilityResponse,
+} from './services/meetingApi';
 import {
   confirmNameMention,
   createMeeting,
@@ -22,8 +25,20 @@ import {
   retryMeeting,
   startRecording,
   stopRecording,
-  submitAudio
+  submitAudio,
+  uploadRecordingChunk
 } from './services/meetingClient';
+import {
+  ChunkUploader,
+  UploaderAbandonedError,
+  UploaderStatus,
+  classifyChunkFailure,
+  createChunkUploader,
+  isSilentTooLong,
+  levelToPercent,
+  nextSilentSince
+} from './services/inAppRecording';
+import { MicRecording, OpenedMicrophone, isDesktopApp, openMicrophone, startMicRecording } from './services/micRecorder';
 import { decideAfterStartFailure, findRecordingMeeting, formatRecordingElapsed, recordingMeetingFileName } from './services/recordingView';
 import {
   AudioBackupTarget,
@@ -52,6 +67,36 @@ import {
 
 /** 選中的是哪一邊的紀錄。server 的 meeting_id 與本機的 job id 可能長得一樣，來源要自己記 */
 type Selection = NonNullable<SelectionRef>;
+
+/** 這個視窗正在錄的那一場（app 內錄音，E4）。只活在這個頁面裡：重新整理或結束 MeetPilot 就沒了，server 那頭會變成「中斷的錄音」 */
+interface InAppSession {
+  meetingId: string;
+  recording: MicRecording;
+  uploader: ChunkUploader<Blob>;
+  label: string;
+}
+
+/** 錄音中畫面要顯示、會變的那幾樣。音量不在這裡（每 250 毫秒變一次），放在 ref、跟著每秒的計時一起畫 */
+interface InAppView {
+  meetingId: string;
+  label: string;
+  upload: UploaderStatus;
+  /** 錄音自己停了的原因（麥克風被拔掉之類）。已錄的段落照常送 */
+  interrupted: string | null;
+  /** 按過停止、麥克風已經放掉了，還在補送或等再按一次停止。畫面不能再說「正在錄」 */
+  stopped: boolean;
+}
+
+// 桌面 app 的外殼經 preload 掛上的橋（electron/setupPreload.ts）。網頁版沒有，一律當作不存在。
+// 告訴外殼「正在錄」：外殼據此擋系統閒置睡眠、錄音中不讓托盤開設定頁、結束前先確認
+const tellDesktopRecording = (active: boolean): void => {
+  const bridge = (window as any).meetpilotDesktop as { setRecording?: (active: boolean) => Promise<unknown> } | undefined;
+  if (!bridge?.setRecording) return;
+  bridge.setRecording(active).catch((err: unknown) => {
+    // 只影響「擋睡眠、結束前確認」這些保護，錄音本身照常；留在 console 給事後查
+    console.error('通知桌面 app 錄音狀態失敗', err);
+  });
+};
 
 // err 不一定是 Error（IndexedDB 的事件物件、被 reject 的字串都可能），直接內插會印出 [object Object]，
 // 而這些字串全都是要給使用者看的
@@ -124,6 +169,13 @@ const App: React.FC = () => {
   const [recordingOp, setRecordingOp] = useState<string | null>(null);
   // 錄音計時用的「現在」。只在有會正在錄的時候每秒更新，其餘時間不跑計時器
   const [now, setNow] = useState<number>(() => Date.now());
+  // app 內錄音（E4）。session 放 ref：停止、刪除這些非同步流程要拿到「現在」的那一場，不是閉包當時的
+  const inAppRef = useRef<InAppSession | null>(null);
+  const [inAppView, setInAppView] = useState<InAppView | null>(null);
+  const levelRef = useRef<{ level: number; silentSince: number | null }>({ level: 0, silentSince: null });
+  // 開始錄音前在 picker 裡選的麥克風；micBlocked 有值代表還不能開始（清單沒讀到、沒權限）
+  const [micDeviceId, setMicDeviceId] = useState<string | null>(null);
+  const [micBlocked, setMicBlocked] = useState<string | null>(null);
   const [confirmConfig, setConfirmConfig] = useState<{
     isOpen: boolean;
     title: string;
@@ -333,70 +385,271 @@ const App: React.FC = () => {
   // 新建這條先開 picker 選與會者（D-016 必填），選完才真的送出；補送既有會議走 submitAudioFile 原路
   const addMeeting = (file: File) => setPendingNew({ kind: 'file', file });
 
+  /** 這台 server 用哪一種方式錄。問不到或不能錄是 null */
+  const recordingMethod = recordingAvailability !== null && recordingAvailability.available === true
+    ? recordingAvailability.method
+    : null;
+
+  const clearInAppSession = () => {
+    inAppRef.current = null;
+    setInAppView(null);
+    levelRef.current = { level: 0, silentSince: null };
+    tellDesktopRecording(false);
+  };
+
+  /** 麥克風已經打開、server 也記下開始了，接上 MediaRecorder 與分段上傳 */
+  const launchInAppRecording = (meetingId: string, mic: OpenedMicrophone) => {
+    const uploader = createChunkUploader<Blob>({
+      send: async (seq, chunk) => { await uploadRecordingChunk(meetingId, seq, chunk); },
+      classify: classifyChunkFailure,
+      onStatus: (upload) => setInAppView(v => (v !== null && v.meetingId === meetingId ? { ...v, upload } : v)),
+    });
+    levelRef.current = { level: 0, silentSince: null };
+    const recording = startMicRecording(mic, {
+      onChunk: (chunk) => { uploader.push(chunk); },
+      onLevel: (level) => {
+        levelRef.current = { level, silentSince: nextSilentSince(levelRef.current.silentSince, level, Date.now()) };
+      },
+      onInterrupted: (reason) => {
+        console.error(`Meeting ${meetingId} 的錄音中斷`, reason);
+        setInAppView(v => (v !== null && v.meetingId === meetingId ? { ...v, interrupted: reason } : v));
+      },
+    });
+    inAppRef.current = { meetingId, recording, uploader, label: mic.label };
+    setInAppView({ meetingId, label: mic.label, upload: uploader.status(), interrupted: null, stopped: false });
+    tellDesktopRecording(true);
+  };
+
   /**
-   * 建立會議並叫語音備忘錄開始錄。
+   * 建立會議並開始錄。
+   *
+   * app 內錄音先打開麥克風、確認三項前處理關了，才建立會議：麥克風打不開的話不留一場空會議。
    *
    * 開始失敗時先重讀那場會再決定要不要刪（decideAfterStartFailure）：失敗不代表沒在錄，
    * 直接刪會把一支其實已經開始的錄音切掉。確定沒在錄才刪，免得清單上多一筆沒有音檔、
    * 也沒有人會去補的空會議；刪不掉就照實講它還在，讓使用者自己處理，不當作沒事。
    */
   const beginRecording = async (participantIds: string[]) => {
-    setRecordingOp('正在叫語音備忘錄開始錄音…');
+    const method = recordingMethod;
+    if (method === null) return;
+    let mic: OpenedMicrophone | null = null;
+    if (method === 'in_app') {
+      setRecordingOp('正在打開麥克風…');
+      try {
+        mic = await openMicrophone(micDeviceId);
+      } catch (err: any) {
+        console.error('打開麥克風失敗', err);
+        setRecordingOp(null);
+        showAlert('沒有開始錄音', errorText(err));
+        return;
+      }
+    }
+    setRecordingOp(method === 'in_app' ? '正在開始錄音…' : '正在叫語音備忘錄開始錄音…');
     let createdId: string | null = null;
+    // server 那頭是不是已經記下開始了（含「回應丟了但其實開始了」）。只有這個成立才去接本機的錄音
+    let startedOnServer = false;
+    let launched = false;
     try {
-      const created = await createMeeting({
-        fileName: recordingMeetingFileName(new Date()),
-        fileSize: 0,
-        participantIds,
-      });
-      createdId = created.meeting_id;
-      await startRecording(created.meeting_id);
-      selectRecord({ source: 'server', id: created.meeting_id });
+      try {
+        const created = await createMeeting({
+          fileName: recordingMeetingFileName(new Date(), method),
+          fileSize: 0,
+          participantIds,
+        });
+        createdId = created.meeting_id;
+        await startRecording(created.meeting_id);
+        startedOnServer = true;
+      } catch (err: any) {
+        console.error('開始錄音失敗', err);
+        const reason = err instanceof HttpError ? err.message : translateError(errorText(err));
+        if (createdId === null) {
+          showAlert('沒有開始錄音', reason);
+          return;
+        }
+        let current: MeetingView | null = null;
+        let readError: string | null = null;
+        try {
+          current = (await getMeetingDetail(createdId)).meeting;
+        } catch (readErr: any) {
+          console.error('開始錄音失敗後讀取會議狀態也失敗', readErr);
+          readError = errorText(readErr);
+        }
+        const action = decideAfterStartFailure(current, readError);
+        if (action.kind === 'keep-recording') {
+          if (mic === null) {
+            selectRecord({ source: 'server', id: createdId });
+            showAlert('錄音其實已經開始', `開始錄音的回應出錯了（${reason}），但伺服器上這場會已經在錄音中，錄音不受影響。結束時照常按「停止錄音」。`);
+            return;
+          }
+          // 回應丟了但 server 其實已經記下開始：麥克風還在手上，照常往下接本機的錄音
+          startedOnServer = true;
+        } else if (action.kind === 'keep-unknown') {
+          showAlert('沒有確認是否開始錄音', method === 'in_app'
+            ? `${reason}\n\n${action.reason}。麥克風已經關掉，這場會沒有在錄音，可以在清單裡刪掉它。`
+            : `${reason}\n\n${action.reason}。請到語音備忘錄確認有沒有在錄，再決定要不要刪掉清單上這場會。`);
+          return;
+        } else {
+          let cleanup = '';
+          try {
+            await deleteMeeting(createdId);
+          } catch (deleteErr: any) {
+            console.error('開始錄音失敗後刪除空會議也失敗', deleteErr);
+            cleanup = `\n\n剛建立的那場空會議沒有刪掉（${errorText(deleteErr)}），可以在清單裡自己刪除。`;
+          }
+          showAlert('沒有開始錄音', `${reason}${cleanup}`);
+          return;
+        }
+      }
+
+      if (startedOnServer && mic !== null && createdId !== null) {
+        // 本機這一步失敗（MediaRecorder、AudioContext 起不來）跟「server 沒開始」是兩回事，分開處理：
+        // 不重試同一個初始化，server 那頭一段都還沒收，直接刪掉這場會（Codex review）
+        try {
+          launchInAppRecording(createdId, mic);
+          launched = true;
+        } catch (err: any) {
+          console.error('接上本機錄音失敗', err);
+          let cleanup = '';
+          try {
+            await deleteMeeting(createdId);
+          } catch (deleteErr: any) {
+            console.error('本機錄音起不來之後刪除會議也失敗', deleteErr);
+            cleanup = `\n\n這場會停在「錄音中斷了」，沒有刪掉（${errorText(deleteErr)}），可以在清單裡自己刪除。`;
+          }
+          showAlert('沒有開始錄音', `麥克風打開了，但錄音程式起不來（${errorText(err)}）。${cleanup}`);
+          return;
+        }
+      }
+      if (createdId !== null) selectRecord({ source: 'server', id: createdId });
       if (!isSidebarOpen) setIsSidebarOpen(true);
-    } catch (err: any) {
-      console.error('開始錄音失敗', err);
-      const reason = err instanceof HttpError ? err.message : translateError(errorText(err));
-      if (createdId === null) {
-        showAlert('沒有開始錄音', reason);
-        return;
-      }
-      let current: MeetingView | null = null;
-      let readError: string | null = null;
-      try {
-        current = (await getMeetingDetail(createdId)).meeting;
-      } catch (readErr: any) {
-        console.error('開始錄音失敗後讀取會議狀態也失敗', readErr);
-        readError = errorText(readErr);
-      }
-      const action = decideAfterStartFailure(current, readError);
-      if (action.kind === 'keep-recording') {
-        selectRecord({ source: 'server', id: createdId });
-        showAlert('錄音其實已經開始', `開始錄音的回應出錯了（${reason}），但伺服器上這場會已經在錄音中，錄音不受影響。結束時照常按「停止錄音」。`);
-        return;
-      }
-      if (action.kind === 'keep-unknown') {
-        showAlert('沒有確認是否開始錄音', `${reason}\n\n${action.reason}。請到語音備忘錄確認有沒有在錄，再決定要不要刪掉清單上這場會。`);
-        return;
-      }
-      let cleanup = '';
-      try {
-        await deleteMeeting(createdId);
-      } catch (deleteErr: any) {
-        console.error('開始錄音失敗後刪除空會議也失敗', deleteErr);
-        cleanup = `\n\n剛建立的那場空會議沒有刪掉（${errorText(deleteErr)}），可以在清單裡自己刪除。`;
-      }
-      showAlert('沒有開始錄音', `${reason}${cleanup}`);
     } finally {
+      if (mic !== null && !launched) mic.stream.getTracks().forEach(t => t.stop());
       setRecordingOp(null);
       await refreshMeetings();
     }
   };
 
   /**
-   * 叫語音備忘錄停止、取回錄音、送進轉錄。server 的錯誤訊息原樣顯示：422 會講取回的為什麼
-   * 不是這場會的錄音、接下來怎麼補，502 會講是哪個捷徑失敗，套 translateError 會把這些都蓋掉
+   * 停止或送出失敗之後，照 server 現在的狀態決定這個視窗的錄音 session 要不要留（Codex review）。
+   *
+   * 失敗不代表 server 沒收尾：回應在路上丟了、或一段都沒收到而退回「等待音檔」（422），server 那頭都已經不在錄音。
+   * 這時還留著 session 的話，外殼會一直以為在錄（擋睡眠、不開設定、結束要確認），直到重開。
+   * 讀不到 server 就當作還在錄：留著 session 最多是多一個確認，清掉的話可能丟掉還沒送到的段落。回傳清了沒有
+   */
+  const reconcileSessionAfterFailure = async (meetingId: string): Promise<string | null> => {
+    let status: string;
+    try {
+      status = (await getMeetingDetail(meetingId)).meeting.status;
+    } catch (err: any) {
+      // 404 是確定的答案：這場會已經不在了（別的分頁或別的 client 刪掉），當然不在錄（fable review）
+      if (err instanceof HttpError && err.status === 404) {
+        status = '已刪除';
+      } else {
+        console.error('停止失敗後讀取會議狀態也失敗', err);
+        return null;
+      }
+    }
+    if (status === 'RECORDING') return null;
+    const session = inAppRef.current;
+    if (session !== null && session.meetingId === meetingId) {
+      await session.uploader.abandon();
+      session.recording.release();
+      clearInAppSession();
+    }
+    return status;
+  };
+
+  const refreshAfterStop = async (meetingId: string) => {
+    await refreshMeetings();
+    if (selectionRef.current !== null && selectionRef.current.source === 'server' && selectionRef.current.id === meetingId) {
+      await refreshActiveDetail(meetingId);
+    }
+  };
+
+  /**
+   * 停止這個視窗正在錄的那一場：停 MediaRecorder、等所有段落送到，再告訴 server 一共幾段。
+   * 任何一步失敗都保留 session：再按一次停止會從頭再走一次（已經停的不會再停、已經送到的不會再送）
+   */
+  const stopInAppRecording = async (session: InAppSession) => {
+    setRecordingOp('正在停止錄音…');
+    let abandoned = false;
+    try {
+      await session.recording.stop();
+      session.recording.release();
+      // 麥克風放掉了：之後不管補送多久、停止成不成功，畫面都不能再說「正在錄」
+      setInAppView(v => (v !== null && v.meetingId === session.meetingId ? { ...v, stopped: true } : v));
+      setRecordingOp('正在送出最後幾段錄音…');
+      await session.uploader.flush();
+      await stopRecording(session.meetingId, { chunks: session.uploader.total() });
+      clearInAppSession();
+    } catch (err: any) {
+      if (err instanceof UploaderAbandonedError) {
+        // 使用者在補送途中選了「放棄沒送到的段落」，收尾由 submitPartialRecording 接手，這裡不再講話
+        abandoned = true;
+        return;
+      }
+      console.error('停止 app 內錄音失敗', err);
+      const reason = err instanceof HttpError ? err.message : translateError(errorText(err));
+      const serverStatus = await reconcileSessionAfterFailure(session.meetingId);
+      const fatal = session.uploader.status().fatal;
+      showAlert('錄音沒有送出', serverStatus !== null
+        ? `${reason}\n\n伺服器上這場會已經不在錄音中（現在是 ${serverStatus}），這個視窗的錄音也已經結束。`
+        : fatal !== null
+          ? `${fatal}\n\n已經送到的部分還在，可以按「送出已錄的部分」轉錄它們。`
+          : `${reason}\n\n錄音已經停了，沒送出的段落還在這個視窗裡，排除問題後再按一次「停止錄音」。`);
+    } finally {
+      if (!abandoned) {
+        setRecordingOp(null);
+        await refreshAfterStop(session.meetingId);
+      }
+    }
+  };
+
+  /**
+   * 把已經送到 server 的段落送去轉錄，不管還有沒有沒送到的（partial）。兩種情況走這裡：
+   * 這個視窗的錄音送不下去了（server 拒收），或 MeetPilot 關掉、重新整理、當掉之後留下的中斷錄音
+   */
+  const submitPartialRecording = async (meetingId: string) => {
+    const session = inAppRef.current;
+    setRecordingOp('正在送出已錄的部分…');
+    try {
+      if (session !== null && session.meetingId === meetingId) {
+        // 等正在送的那一段結束：server 在它寫完之前不收尾（503），也不讓它在收尾之後才落地
+        await session.uploader.abandon();
+        await session.recording.stop();
+        session.recording.release();
+      }
+      await stopRecording(meetingId, { partial: true });
+      if (session !== null && session.meetingId === meetingId) clearInAppSession();
+    } catch (err: any) {
+      console.error('送出已錄的部分失敗', err);
+      const reason = err instanceof HttpError ? err.message : translateError(errorText(err));
+      const serverStatus = await reconcileSessionAfterFailure(meetingId);
+      showAlert('沒有送出', serverStatus === null
+        ? reason
+        : `${reason}\n\n伺服器上這場會已經不在錄音中（現在是 ${serverStatus}），這個視窗的錄音也已經結束。`);
+    } finally {
+      setRecordingOp(null);
+      await refreshAfterStop(meetingId);
+    }
+  };
+
+  /**
+   * 停止錄音、送進轉錄。這個視窗在錄的走 app 內錄音；server 說是 app 內錄音但不是這個視窗在錄的，
+   * 是中斷的錄音，走「送出已錄的部分」；其餘是語音備忘錄。
+   *
+   * 語音備忘錄：server 的錯誤訊息原樣顯示：422 會講取回的為什麼不是這場會的錄音、接下來怎麼補，
+   * 502 會講是哪個捷徑失敗，套 translateError 會把這些都蓋掉
    */
   const handleStopRecording = async (meetingId: string) => {
+    const session = inAppRef.current;
+    if (session !== null && session.meetingId === meetingId) {
+      if (session.uploader.status().fatal !== null) return submitPartialRecording(meetingId);
+      return stopInAppRecording(session);
+    }
+    if ((meetings ?? []).some(m => m.meeting_id === meetingId && m.recording_method === 'in_app')) {
+      return submitPartialRecording(meetingId);
+    }
     setRecordingOp('正在停止錄音、取回檔案…');
     try {
       await stopRecording(meetingId);
@@ -405,10 +658,7 @@ const App: React.FC = () => {
       showAlert('錄音沒有送出', err instanceof HttpError ? err.message : translateError(errorText(err)));
     } finally {
       setRecordingOp(null);
-      await refreshMeetings();
-      if (selectionRef.current !== null && selectionRef.current.source === 'server' && selectionRef.current.id === meetingId) {
-        await refreshActiveDetail(meetingId);
-      }
+      await refreshAfterStop(meetingId);
     }
   };
 
@@ -535,17 +785,31 @@ const App: React.FC = () => {
     err instanceof HttpError && err.status === 409 ? err.message : translateError(errorText(err));
 
   const handleDeleteMeeting = (meetingId: string) => {
-    const isRecording = (meetings ?? []).some(m => m.meeting_id === meetingId && m.status === 'RECORDING');
+    const target = (meetings ?? []).find(m => m.meeting_id === meetingId);
+    const isRecording = target !== undefined && target.status === 'RECORDING';
     setConfirmConfig({
       isOpen: true,
       title: '刪除這場會議',
-      message: isRecording
-        ? '這場會議還在錄音。刪除會先叫語音備忘錄停止錄音，再刪掉這場會議；語音備忘錄裡已經錄下的那支不會被刪。'
-        : '確定要從任務清單刪除這場會議嗎？這個動作無法復原：伺服器上的逐字稿、分析與音檔都會一起刪掉；vault 裡的會議記錄副本不受影響。',
+      message: !isRecording
+        ? '確定要從任務清單刪除這場會議嗎？這個動作無法復原：伺服器上的逐字稿、分析與音檔都會一起刪掉；vault 裡的會議記錄副本不受影響。'
+        : target.recording_method === 'in_app'
+          ? '這場會議還在錄音（或錄音中斷了還沒送出）。刪除會停止錄音，已經錄下的內容跟著一起刪掉，無法復原。'
+          : '這場會議還在錄音。刪除會先叫語音備忘錄停止錄音，再刪掉這場會議；語音備忘錄裡已經錄下的那支不會被刪。',
       isDestructive: true,
       onConfirm: async () => {
         closeConfirm();
+        let stoppedLocalRecording = false;
         try {
+          // 這個視窗正在錄的就先停掉麥克風、不再送段落：server 刪了會議之後，還在送的段落只會一直被拒收
+          const session = inAppRef.current;
+          if (session !== null && session.meetingId === meetingId) {
+            stoppedLocalRecording = true;
+            // 等正在送的那一段結束再刪：刪到一半它才寫完的話，server 會留下一個沒人認領的錄音檔（Codex review）
+            await session.uploader.abandon();
+            await session.recording.stop();
+            session.recording.release();
+            clearInAppSession();
+          }
           await deleteMeeting(meetingId);
           if (selection !== null && selection.source === 'server' && selection.id === meetingId) {
             selectRecord(null);
@@ -553,7 +817,9 @@ const App: React.FC = () => {
           await refreshMeetings();
         } catch (err: any) {
           console.error('刪除會議失敗', err);
-          showAlert('沒有刪除這場會議', deleteFailureMessage(err));
+          showAlert('沒有刪除這場會議', stoppedLocalRecording
+            ? `${deleteFailureMessage(err)}\n\n這個視窗的錄音已經停止，已送到的段落還在：可以再刪一次，或按「送出已錄的部分」轉錄它們。`
+            : deleteFailureMessage(err));
         }
       }
     });
@@ -695,6 +961,21 @@ const App: React.FC = () => {
   const recordingElapsed = recordingMeeting !== null && recordingMeeting.recording_started_at !== null
     ? formatRecordingElapsed(recordingMeeting.recording_started_at, now)
     : null;
+  // app 內錄音：這個視窗在錄的（live），或 server 說在錄、這個視窗手上卻沒有的（中斷：重新整理、結束、當掉過）
+  const liveInApp = recordingMeeting !== null && inAppView !== null && inAppView.meetingId === recordingMeeting.meeting_id
+    ? inAppView
+    : null;
+  const interruptedInApp = recordingMeeting !== null && recordingMeeting.recording_method === 'in_app' && liveInApp === null;
+  // 音量與靜音跟著每秒的計時一起讀，不另外觸發畫面更新
+  const levelPercent = liveInApp !== null && !liveInApp.stopped ? levelToPercent(levelRef.current.level) : 0;
+  const silentTooLong = liveInApp !== null && !liveInApp.stopped && liveInApp.interrupted === null
+    && isSilentTooLong(levelRef.current.silentSince, now);
+  // 按了停止之後補送卡住（server 一直 5xx、網路斷了）：給一個放棄沒送到段落的出口，不然只能刪會議或重新整理
+  const canGiveUpPending = liveInApp !== null && liveInApp.stopped && liveInApp.upload.waiting > 0
+    && liveInApp.upload.lastError !== null && liveInApp.upload.fatal === null;
+  const recordButtonHint = recordingMethod === 'in_app'
+    ? '用這台電腦的麥克風錄，停止後自動送進轉錄'
+    : '用這台 Mac 的語音備忘錄錄，停止後自動送進轉錄';
   const activeMeeting = activeDetail === null ? null : activeDetail.meeting;
   const activeEditBlockedReason = activeMeeting === null ? null : editBlockedReason(activeMeeting.status);
   const activeNeedsAudio = activeMeeting !== null && needsAudioUpload(activeMeeting);
@@ -798,21 +1079,26 @@ const App: React.FC = () => {
           )}
           {recordingMeeting !== null && (
             <div className="flex items-center gap-2 bg-rose-50 border border-rose-200 rounded-xl pl-3 pr-1 h-10">
-              <span className="w-2 h-2 rounded-full bg-rose-500 animate-pulse"></span>
+              <span className={`w-2 h-2 rounded-full ${interruptedInApp || (liveInApp !== null && liveInApp.stopped) ? 'bg-amber-500' : 'bg-rose-500 animate-pulse'}`}></span>
               <button
                 onClick={() => selectRecord({ source: 'server', id: recordingMeeting.meeting_id })}
                 className="text-xs font-bold text-rose-700 tabular-nums"
                 title="看這場會"
               >
-                錄音中 {recordingElapsed}
+                {interruptedInApp ? '錄音中斷了' : liveInApp !== null && liveInApp.stopped ? '錄音已停止，送出中' : `錄音中 ${recordingElapsed ?? ''}`}
               </button>
+              {liveInApp !== null && !liveInApp.stopped && (
+                <span className="w-12 h-1.5 bg-rose-100 rounded-full overflow-hidden" title="麥克風音量">
+                  <span className="block h-full bg-rose-500 transition-all" style={{ width: `${levelPercent}%` }}></span>
+                </span>
+              )}
               <button
                 onClick={() => handleStopRecording(recordingMeeting.meeting_id)}
                 disabled={recordingOp !== null}
                 className="h-8 px-3 bg-rose-600 hover:bg-rose-700 disabled:bg-rose-300 text-white text-xs font-bold rounded-lg flex items-center gap-1 transition-colors"
               >
-                <i className="fa-solid fa-stop"></i>
-                停止錄音
+                <i className={`fa-solid ${interruptedInApp ? 'fa-paper-plane' : 'fa-stop'}`}></i>
+                {interruptedInApp ? '送出已錄的部分' : '停止錄音'}
               </button>
             </div>
           )}
@@ -821,7 +1107,7 @@ const App: React.FC = () => {
               onClick={() => setPendingNew({ kind: 'recording' })}
               disabled={busyMessage !== null || recordingOp !== null}
               className="h-10 px-4 bg-white hover:bg-rose-50 border border-rose-200 text-rose-600 disabled:opacity-50 rounded-xl font-bold text-sm flex items-center gap-2 transition-colors"
-              title="用這台 Mac 的語音備忘錄錄音，停止後自動送進轉錄"
+              title={recordButtonHint}
             >
               <i className="fa-solid fa-microphone"></i>
               開始錄音
@@ -933,10 +1219,12 @@ const App: React.FC = () => {
               {recordingConflict !== null && (
                 <div className="bg-rose-50 border-b border-rose-200 text-rose-700 text-xs p-3 shrink-0">
                   <i className="fa-solid fa-triangle-exclamation mr-1"></i>
-                  {recordingConflict}。請到語音備忘錄確認實際在錄的是哪一支，再刪掉多出來的那場會議。
+                  {recordingConflict}。{recordingMethod === 'in_app'
+                    ? '這個視窗只會在錄其中一場，刪掉清單上多出來、不是正在錄的那場會議。'
+                    : '請到語音備忘錄確認實際在錄的是哪一支，再刪掉多出來的那場會議。'}
                 </div>
               )}
-              {activeMeeting !== null && activeMeeting.status === 'RECORDING' && (
+              {activeMeeting !== null && activeMeeting.status === 'RECORDING' && activeMeeting.recording_method !== 'in_app' && (
                 <div className="bg-rose-50 border-b border-rose-200 text-rose-900 text-xs p-3 shrink-0 flex flex-wrap items-center gap-3">
                   <span className="flex-1 min-w-[12rem] leading-relaxed">
                     <i className="fa-solid fa-microphone mr-1"></i>
@@ -952,6 +1240,92 @@ const App: React.FC = () => {
                     <i className="fa-solid fa-stop mr-1"></i>
                     停止錄音
                   </button>
+                </div>
+              )}
+              {activeMeeting !== null && activeMeeting.status === 'RECORDING' && activeMeeting.recording_method === 'in_app' && (
+                <div className="bg-rose-50 border-b border-rose-200 text-rose-900 text-xs p-3 shrink-0 flex flex-col gap-2">
+                  <div className="flex flex-wrap items-center gap-3">
+                    <span className="flex-1 min-w-[12rem] leading-relaxed">
+                      <i className="fa-solid fa-microphone mr-1"></i>
+                      {liveInApp !== null && liveInApp.stopped ? (
+                        <>
+                          錄音已經停止，麥克風已經關掉。
+                          {liveInApp.upload.waiting > 0
+                            ? `還有 ${liveInApp.upload.waiting} 段在送，送完才會進轉錄。`
+                            : '段落都送到了，還沒進轉錄：按「停止錄音」再送一次。'}
+                        </>
+                      ) : liveInApp !== null ? (
+                        <>
+                          MeetPilot 正在用「{liveInApp.label}」錄這場會{recordingElapsed !== null && `（${recordingElapsed}）`}。
+                          {isDesktopApp()
+                            ? '關掉視窗會縮到系統匣繼續錄，錄音中電腦不會自動睡眠；筆電闔上、結束 MeetPilot 或重新整理會中斷。'
+                            : '錄音在這個分頁裡，關掉分頁、重新整理或電腦睡眠都會中斷。'}
+                        </>
+                      ) : (
+                        <>
+                          這場錄音中斷了（MeetPilot 被結束、重新整理或當掉過）。server 已經收到
+                          {' '}{activeMeeting.recording_received_chunks ?? 0} 段，約
+                          {' '}{formatRecordingElapsed(0, (activeMeeting.recording_received_chunks ?? 0) * RECORDING_CHUNK_MS)}。
+                          可以把已錄的部分送去轉錄，或從清單刪掉這場會；中斷之後的內容沒有錄到，要接著錄請另開一場。
+                        </>
+                      )}
+                    </span>
+                    <button
+                      onClick={() => handleStopRecording(activeMeeting.meeting_id)}
+                      disabled={recordingOp !== null}
+                      className="shrink-0 bg-rose-600 hover:bg-rose-700 disabled:bg-rose-300 text-white text-xs font-bold px-3 py-1.5 rounded-lg transition-colors"
+                    >
+                      {liveInApp !== null && liveInApp.upload.fatal === null
+                        ? <><i className="fa-solid fa-stop mr-1"></i>停止錄音</>
+                        : <><i className="fa-solid fa-paper-plane mr-1"></i>送出已錄的部分</>}
+                    </button>
+                  </div>
+                  {liveInApp !== null && !liveInApp.stopped && (
+                    <div className="flex flex-wrap items-center gap-3 text-[11px]">
+                      <span className="flex items-center gap-1.5">
+                        音量
+                        <span className="w-24 h-1.5 bg-rose-100 rounded-full overflow-hidden">
+                          <span className="block h-full bg-rose-500 transition-all" style={{ width: `${levelPercent}%` }}></span>
+                        </span>
+                      </span>
+                      <span className="text-rose-700">
+                        已送出 {liveInApp.upload.sent} 段
+                        {liveInApp.upload.waiting > 0 && `，還有 ${liveInApp.upload.waiting} 段在送`}
+                      </span>
+                    </div>
+                  )}
+                  {liveInApp !== null && liveInApp.upload.lastError !== null && liveInApp.upload.fatal === null && (
+                    <p className="text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1">
+                      <i className="fa-solid fa-triangle-exclamation mr-1"></i>
+                      段落送不到 server（{liveInApp.upload.lastError}），{liveInApp.stopped ? '' : '錄音照常進行，'}會自動重送。
+                    </p>
+                  )}
+                  {canGiveUpPending && (
+                    <button
+                      onClick={() => submitPartialRecording(activeMeeting.meeting_id)}
+                      className="self-start bg-white hover:bg-amber-50 border border-amber-300 text-amber-800 text-[11px] font-bold px-3 py-1 rounded-lg transition-colors"
+                    >
+                      放棄沒送到的 {liveInApp.upload.waiting} 段，送出已錄的部分
+                    </button>
+                  )}
+                  {liveInApp !== null && liveInApp.upload.fatal !== null && (
+                    <p className="text-rose-800 bg-white border border-rose-300 rounded px-2 py-1">
+                      <i className="fa-solid fa-circle-exclamation mr-1"></i>
+                      {liveInApp.upload.fatal}。後面的段落不會再送，已經送到的可以按「送出已錄的部分」轉錄。
+                    </p>
+                  )}
+                  {liveInApp !== null && liveInApp.interrupted !== null && !liveInApp.stopped && (
+                    <p className="text-rose-800 bg-white border border-rose-300 rounded px-2 py-1">
+                      <i className="fa-solid fa-circle-exclamation mr-1"></i>
+                      {liveInApp.interrupted}。錄音已經停了，按「停止錄音」把錄到的部分送去轉錄。
+                    </p>
+                  )}
+                  {silentTooLong && (
+                    <p className="text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1">
+                      <i className="fa-solid fa-volume-xmark mr-1"></i>
+                      已經一分鐘以上幾乎沒有收到聲音。確認麥克風沒有靜音、選的是對的那支；錄到的若是空白，轉錄出來也是空的。
+                    </p>
+                  )}
                 </div>
               )}
               {detailError && (
@@ -1036,13 +1410,13 @@ const App: React.FC = () => {
                       className="mt-4 w-full max-w-md bg-white hover:bg-rose-50 border-2 border-rose-200 hover:border-rose-400 text-rose-600 disabled:opacity-50 rounded-2xl px-8 py-5 flex flex-col items-center gap-1 transition-colors"
                     >
                       <span className="text-sm font-bold"><i className="fa-solid fa-microphone mr-2"></i>開始錄音</span>
-                      <span className="text-xs text-slate-500">用這台 Mac 的語音備忘錄錄，停止後自動送進轉錄</span>
+                      <span className="text-xs text-slate-500">{recordButtonHint}</span>
                     </button>
                   )}
                   {recordingAvailability !== null && recordingAvailability.available === false && (
                     <p className="mt-4 max-w-md text-[11px] text-slate-400 leading-relaxed">
                       <i className="fa-solid fa-microphone-slash mr-1"></i>
-                      語音備忘錄錄音目前不能用：{recordingAvailability.reason}
+                      錄音目前不能用：{recordingAvailability.reason}
                     </p>
                   )}
                 </div>
@@ -1065,6 +1439,12 @@ const App: React.FC = () => {
       <ParticipantPicker
         isOpen={pendingNew !== null}
         confirmVerb={pendingNew !== null && pendingNew.kind === 'recording' ? '開始錄音' : '建立會議'}
+        extra={pendingNew !== null && pendingNew.kind === 'recording' && recordingMethod === 'in_app'
+          ? <MicrophoneSelect deviceId={micDeviceId} onChange={setMicDeviceId} onBlockedChange={setMicBlocked} />
+          : undefined}
+        confirmBlockedReason={pendingNew !== null && pendingNew.kind === 'recording' && recordingMethod === 'in_app' && micBlocked !== null
+          ? '麥克風還沒準備好'
+          : null}
         people={people}
         loadError={peopleLoadError}
         onRetry={loadPeople}

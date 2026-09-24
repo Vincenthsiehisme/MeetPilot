@@ -7,6 +7,7 @@ import NameReviewPanel from './NameReviewPanel';
 import { exportJobAsJSON, exportErrorAsJSON } from '../services/exportUtils';
 import { MEETING_TITLE_MAX_LENGTH, checkMeetingTitle, jobDisplayName, jobDownloadBaseName } from '../services/meetingTitle';
 import { NameMentionView, PersonSummary } from '../services/meetingApi';
+import { isDesktopApp } from '../services/micRecorder';
 
 interface JobDetailProps {
   job: Job;
@@ -186,10 +187,15 @@ const JobDetail: React.FC<JobDetailProps> = ({
                           </div>
                           <p className="text-[10px] text-slate-400 mt-2 font-medium flex items-center gap-1">
                             <i className="fa-solid fa-bolt-lightning animate-pulse"></i>
-                            {/* 處理從 W2 起全在 server 跑，錄音在語音備忘錄裡：兩種都不需要這個分頁開著 */}
-                            {job.recordingStartedAt !== undefined
-                              ? '語音備忘錄錄音中，按「停止錄音」後自動取回檔案開始轉錄。這個分頁可以關掉，錄音不會中斷'
-                              : '伺服器正在處理，這個分頁可以關掉，處理不會中斷'}
+                            {/* 處理從 W2 起全在 server 跑、語音備忘錄的錄音在語音備忘錄裡，這兩種不需要這個分頁開著。
+                                app 內錄音（E4）是這個視窗自己在錄：關視窗只是縮到系統匣，重新整理或結束 MeetPilot 就會中斷 */}
+                            {job.recordingMethod === 'in_app'
+                              ? isDesktopApp()
+                                ? 'MeetPilot 正在用麥克風錄音，按「停止錄音」後自動送進轉錄。關掉視窗會縮到系統匣繼續錄；結束 MeetPilot 或重新整理會中斷'
+                                : '這個分頁正在用麥克風錄音，按「停止錄音」後自動送進轉錄。關掉分頁或重新整理會中斷'
+                              : job.recordingStartedAt !== undefined
+                                ? '語音備忘錄錄音中，按「停止錄音」後自動取回檔案開始轉錄。這個分頁可以關掉，錄音不會中斷'
+                                : '伺服器正在處理，這個分頁可以關掉，處理不會中斷'}
                           </p>
                         </div>
                       )}

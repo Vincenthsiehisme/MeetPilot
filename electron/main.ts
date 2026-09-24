@@ -10,11 +10,16 @@
  * - **server 掛了要看得見。** 不安靜重啟：跳視窗顯示 exit code 與最後幾行輸出，讓使用者決定重啟或結束。
  * - **關視窗不等於結束。** 錄音中關掉視窗很常見，app 縮到托盤繼續跑；只有托盤選單的「結束」會停 server。
  *
+ * E4 起錄音在主視窗的頁面裡（MediaRecorder）。視窗藏起來時頁面照常跑（關掉背景節流），錄音中擋系統閒置睡眠；
+ * 會讓頁面消失的動作（結束、托盤「設定…」）在錄音中先確認或拒絕，因為頁面一換掉錄音就斷了。
+ *
  * E3 起，server 啟動前要先有三樣東西：gateway 的 token、Gemini key、投影資料夾。缺任何一樣就顯示外殼自己的
  * 設定頁（electron/setup.html）。三樣都有就每次啟動向 gateway 拿最新的 key 與名單：連不上用上次的、
  * 畫面標示離線；gateway 回 401（被撤銷）就刪掉 token 與 key、回設定頁，不退回上次的。
  */
-import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, safeStorage, session, shell, Tray, utilityProcess } from 'electron';
+import {
+  app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, powerSaveBlocker, safeStorage, session, shell, Tray, utilityProcess,
+} from 'electron';
 import type { IpcMainInvokeEvent, UtilityProcess } from 'electron';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { createServer } from 'node:net';
@@ -58,6 +63,25 @@ let tray: Tray | null = null;
 let server: UtilityProcess | null = null;
 let serverOrigin: string | null = null;
 let quitting = false;
+
+// 錄音中（頁面經 preload 告訴主程序，E4）。powerSaveBlocker 的 id 是 null 代表沒擋
+let recordingActive = false;
+let sleepBlockerId: number | null = null;
+// 錄音中按結束、使用者確認過了：第二次進 before-quit 就放行
+let quitConfirmed = false;
+
+function setRecordingActive(active: boolean, why: string): void {
+  if (recordingActive === active) return;
+  recordingActive = active;
+  writeLog(`--- 錄音${active ? '開始' : '結束'}（${why}）---\n`);
+  // 只擋「閒置睡眠讓 app 被暫停」，不擋螢幕關閉；筆電闔上蓋子擋不了，畫面上有講
+  if (active && sleepBlockerId === null) {
+    sleepBlockerId = powerSaveBlocker.start('prevent-app-suspension');
+  } else if (!active && sleepBlockerId !== null) {
+    powerSaveBlocker.stop(sleepBlockerId);
+    sleepBlockerId = null;
+  }
+}
 
 /** 這一輪 server 用的設定，向 gateway 同步完才有。錯誤視窗按「重新啟動」沿用同一份，不重新同步 */
 interface ServerRuntime {
@@ -479,6 +503,15 @@ function fromSetupPage(event: IpcMainInvokeEvent): boolean {
 }
 
 function registerSetupHandlers(): void {
+  ipcMain.handle('recording:set', (event, active: unknown) => {
+    if (!isServerUrl(event.senderFrame?.url ?? '')) {
+      writeLog(`--- 拒絕不是從 server 頁面來的錄音狀態（${event.senderFrame?.url ?? '未知'}）---\n`);
+      throw new Error('只有 server 的頁面能回報錄音狀態');
+    }
+    if (typeof active !== 'boolean') throw new Error('錄音狀態要是 true 或 false');
+    setRecordingActive(active, '頁面回報');
+  });
+
   ipcMain.handle('setup:load', (event) => {
     if (!fromSetupPage(event)) throw new Error('只有設定頁能叫');
     let vaultDir = '';
@@ -614,6 +647,16 @@ function injectOfflineBanner(): void {
 
 async function openSettings(): Promise<void> {
   showWindow();
+  // 設定頁會蓋掉 server 的頁面，錄音就跟著斷了；存檔還會重啟 server
+  if (recordingActive) {
+    await dialog.showMessageBox({
+      type: 'info',
+      title: 'MeetPilot',
+      message: '錄音中不能開設定',
+      detail: '先在 MeetPilot 按「停止錄音」，再從系統匣開設定。',
+    });
+    return;
+  }
   // 排進佇列：啟動還在跑的話，等它把畫面換完再開設定頁，不然表單會被接著載入的啟動畫面蓋掉（Codex review 第三輪）
   await serialized(async () => { showSetup(null); });
 }
@@ -632,9 +675,16 @@ function createWindow(): void {
       nodeIntegration: false,
       sandbox: true,
       preload: join(__dirname, 'setupPreload.cjs'),
+      // 錄音中視窗會被關到系統匣（其實是藏起來）。藏起來的頁面預設會被節流，分段上傳的重送計時器與音量取樣會被拖慢（E4）
+      backgroundThrottling: false,
+      // 音量取樣用 AudioContext；沒有使用者手勢時它會停在 suspended，取到的永遠是 0，靜音警告就會誤報
+      autoplayPolicy: 'no-user-gesture-required',
     },
   });
   mainWindow.webContents.on('did-finish-load', injectOfflineBanner);
+  // 頁面換掉或當掉，裡面的錄音就沒了：不能繼續擋睡眠、也不該再擋結束。server 那頭留著的是「中斷的錄音」，畫面會給救法
+  mainWindow.webContents.on('did-navigate', () => setRecordingActive(false, '頁面換掉了'));
+  mainWindow.webContents.on('render-process-gone', (_event, details) => setRecordingActive(false, `頁面程序結束：${details.reason}`));
   // 視窗只顯示 server 的頁面；外部連結開系統瀏覽器，不在 app 裡換頁。
   // 唯一放行的新視窗是 about:blank：會議記錄的列印是 window.open('', '_blank') 寫入內容再 print()
   // （components/SummaryView.tsx），全擋的話 window.open 回 null，列印按了沒反應（Codex review 2026-09-24）
@@ -665,6 +715,8 @@ function createWindow(): void {
     if (quitting) return;
     event.preventDefault();
     mainWindow?.hide();
+    // 冒煙測試靠這一行確認「關到系統匣之後錄音還在收段落」；事後查「錄音中關過視窗嗎」也看這裡
+    writeLog(`--- 視窗關到系統匣${recordingActive ? '（錄音中）' : ''} ---\n`);
   });
 }
 
@@ -696,7 +748,27 @@ if (!app.requestSingleInstanceLock()) {
 } else {
   app.on('second-instance', showWindow);
   app.on('activate', showWindow);
-  app.on('before-quit', () => {
+  app.on('before-quit', (event) => {
+    // 錄音中結束會切掉錄音。先問一次；確認了才真的結束，已送到的段落留在 server，下次打開可以送出
+    if (recordingActive && !quitConfirmed) {
+      event.preventDefault();
+      showWindow();
+      void dialog.showMessageBox({
+        type: 'warning',
+        title: 'MeetPilot',
+        message: '正在錄音，要結束 MeetPilot 嗎？',
+        detail: '結束會中斷錄音。已經送出的部分會留著，下次打開 MeetPilot 可以把它送去轉錄；最後幾秒可能沒送到。',
+        buttons: ['繼續錄音', '結束 MeetPilot'],
+        defaultId: 0,
+        cancelId: 0,
+      }).then(({ response }) => {
+        if (response !== 1) return;
+        quitConfirmed = true;
+        writeLog('--- 錄音中使用者確認結束 ---\n');
+        app.quit();
+      });
+      return;
+    }
     quitting = true;
     server?.kill();
   });
