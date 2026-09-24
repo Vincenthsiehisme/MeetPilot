@@ -40,11 +40,14 @@ if command -v gpg >/dev/null; then
   trap 'rm -rf "$GNUPGHOME"' EXIT
   curl -sSfL https://ffmpeg.org/ffmpeg-devel.asc | gpg --batch --quiet --import
   # 狀態先存進變數再比對：gpg 直接 pipe 給 grep -q 的話，grep 提早結束會讓 gpg 吃到 SIGPIPE，pipefail 當成失敗
-  status=$(gpg --batch --quiet --verify --status-fd 1 "$TARBALL.asc" "$TARBALL" 2>/dev/null || true)
+  # gpg 自己的錯誤訊息另存：網路、匯入或簽章錯誤時要看得到原因，不能只剩一句「不是金鑰簽的」
+  gpg_err="$GNUPGHOME/verify.err"
+  status=$(gpg --batch --quiet --verify --status-fd 1 "$TARBALL.asc" "$TARBALL" 2>"$gpg_err" || true)
   # 比對要錨定在 VALIDSIG 那一行的指紋欄位：GOODSIG 那行帶簽章者的 user ID，UID 裡夾著這串指紋的假金鑰
   # 用沒錨定的 grep 也會過。金鑰被撤銷或過期時 gpg 仍可能印 VALIDSIG，所以另外拒絕這兩種
   if ! printf '%s\n' "$status" | grep -q "^\[GNUPG:\] VALIDSIG ${KEY_FINGERPRINT} "; then
-    echo "ffmpeg-${VERSION} 的簽章不是金鑰 ${KEY_FINGERPRINT} 簽的，拒絕編譯" >&2
+    echo "ffmpeg-${VERSION} 的簽章不是金鑰 ${KEY_FINGERPRINT} 簽的，拒絕編譯。gpg 的輸出：" >&2
+    cat "$gpg_err" >&2
     exit 1
   fi
   if printf '%s\n' "$status" | grep -qE "^\[GNUPG:\] (REVKEYSIG|EXPKEYSIG|EXPSIG|BADSIG|ERRSIG) "; then
@@ -113,6 +116,8 @@ cp COPYING.LGPLv2.1 "$OUT/LICENSE-ffmpeg.txt"
   printf '  %s\n' "${FLAGS[@]}" ${EXTRA[@]+"${EXTRA[@]}"}
   echo
   echo "以下檔案以 MIT 授權釋出，依授權附上其聲明："
+  # 這三個是 8.1.3 連進執行檔的 MIT 授權檔案（以 nm 確認過）。awk 以 /* … */ 為一段擷取含授權文字的註解，
+  # 註解內剛好出現 */ 字樣時會截短而計數檢查照樣通過；升 ffmpeg 版本時要重新確認清單與擷取結果
   for f in libavformat/oggdec.c libavformat/oggparsevorbis.c libavutil/avsscanf.c; do
     echo
     echo "--- $f ---"
