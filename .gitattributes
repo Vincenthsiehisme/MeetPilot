@@ -4,3 +4,6 @@
 # （services/geminiServerClient.ts 的 hashContent），同一版規範在 Windows 上會算出另一個
 # 版本號，來源標記就對不起來，而且不會有任何錯誤訊息。守著這條的是 lineEndings.test.ts。
 * text=auto eol=lf
+
+# 測試音檔是二進位，不做換行轉換
+scripts/ffmpeg-fixtures/** binary

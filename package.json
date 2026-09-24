@@ -14,7 +14,9 @@
     "build:electron": "esbuild electron/main.ts --bundle --platform=node --format=cjs --external:electron --sourcemap --outfile=dist/electron/main.cjs",
     "desktop": "npm run build && npm run build:electron && electron .",
     "package:mac": "npm run build && npm run build:electron && electron-builder --mac --publish never",
-    "package:win": "npm run build && npm run build:electron && electron-builder --win --publish never"
+    "package:win": "npm run build && npm run build:electron && electron-builder --win --publish never",
+    "ffmpeg:build": "bash scripts/ffmpeg/build.sh",
+    "ffmpeg:verify": "tsx scripts/verifyFfmpeg.ts"
   },
   "dependencies": {
     "@google/genai": "^1.38.0",
@@ -48,6 +50,12 @@
       "electron/assets/**",
       "package.json",
       "!dist/**/*.map"
+    ],
+    "extraResources": [
+      {
+        "from": "vendor/ffmpeg/${os}-${arch}",
+        "to": "ffmpeg"
+      }
     ],
     "directories": {
       "output": "release"

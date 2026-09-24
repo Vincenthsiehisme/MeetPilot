@@ -17,6 +17,7 @@ import { createServer } from 'node:net';
 import { join } from 'node:path';
 import { buildServerEnv } from './serverEnv';
 import { createLogTail } from './logTail';
+import { resolveBundledFfmpeg } from './bundledFfmpeg';
 
 // userData 固定叫 MeetPilot，不跟 package.json 的 name 走：資料夾名要穩定，改套件名或產品名不能讓資料「消失」。
 // MEETPILOT_DESKTOP_USER_DATA 只給 scripts/smokeDesktop.mjs 用：冒煙測試要用拋棄式的資料夾，
@@ -105,9 +106,17 @@ async function startServer(): Promise<void> {
   // 寫入錯誤跟著這一輪 server 走：上次磁碟滿、這次空出來了，不該還顯示上次的原因
   logWriteError = null;
   staleServerWarning = null;
+  const appPath = app.getAppPath();
+  // 打包後缺 ffmpeg 在這裡就拋，由 bootServerIntoWindow 跳錯誤視窗，不讓 server 帶著「沒有 ffmpeg」起來
+  const ffmpeg = resolveBundledFfmpeg({
+    isPackaged: app.isPackaged,
+    resourcesPath: process.resourcesPath,
+    appPath,
+    platform: process.platform,
+    arch: process.arch,
+  });
   const port = await pickFreePort();
   const origin = `http://127.0.0.1:${port}`;
-  const appPath = app.getAppPath();
   const child = utilityProcess.fork(join(appPath, 'dist', 'server.cjs'), [], {
     // server 從 cwd 找 dist/（前端）與 prompts/（會議記錄規範），所以 cwd 是 app 目錄，不是 userData
     cwd: appPath,
@@ -116,6 +125,7 @@ async function startServer(): Promise<void> {
       userDataDir: app.getPath('userData'),
       port,
       geminiApiKey: process.env.GEMINI_API_KEY,
+      ffmpeg,
     }),
     stdio: 'pipe',
     serviceName: 'MeetPilot Server',
@@ -128,6 +138,7 @@ async function startServer(): Promise<void> {
   child.stdout?.on('data', onOutput);
   child.stderr?.on('data', onOutput);
   writeLog(`\n--- ${new Date().toISOString()} 啟動 server（port ${port}）---\n`);
+  writeLog(`ffmpeg：${ffmpeg ? ffmpeg.ffmpeg : '沒有隨附，走 PATH（開發模式）'}\n`);
 
   // 就緒之前的結束不在這裡處理：waitForServer 會拋，由 bootServerIntoWindow 的 catch 負責，
   // 只有一個地方跳錯誤視窗。兩邊都處理的話，使用者按兩次「重新啟動」就會起兩個 server 搶同一個 DB

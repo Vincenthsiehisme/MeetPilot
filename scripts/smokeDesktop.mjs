@@ -94,6 +94,12 @@ while (Date.now() < deadline) {
 }
 if (health === null) await fail(port === null ? `${TIMEOUT_MS / 1000} 秒內 server.log 沒出現新的啟動紀錄` : `${TIMEOUT_MS / 1000} 秒內 port ${port} 的 /api/health 沒有回 200`);
 
+// 打包後一定要用隨附的 ffmpeg（E2）：退回 PATH 的話，記錄人電腦上沒有 ffmpeg，每場會都會在轉錄一開始 FAILED
+const ffmpegLine = readLog().match(/^ffmpeg：(.*)$/m)?.[1];
+if (!ffmpegLine || ffmpegLine.includes('沒有隨附') || !/[\\/]ffmpeg[\\/]ffmpeg(\.exe)?$/.test(ffmpegLine)) {
+  await fail(`打包後的 app 沒有用隨附的 ffmpeg（server.log：${ffmpegLine ?? '沒有 ffmpeg 那一行'}）`);
+}
+
 let page;
 let html;
 try {
@@ -108,5 +114,5 @@ if (!page.ok || !html.includes('<div id="root">')) await fail(`GET / 回 ${page.
 await stop();
 await new Promise((r) => setTimeout(r, 1500));
 cleanup();
-console.log(`[desktop-smoke] 通過：打包後的 app 在 port ${port} 啟動 server，/api/health 回 ${JSON.stringify(health)}，前端頁正常`);
+console.log(`[desktop-smoke] 通過：打包後的 app 在 port ${port} 啟動 server，/api/health 回 ${JSON.stringify(health)}，前端頁正常，ffmpeg 用隨附的 ${ffmpegLine}`);
 process.exit(0);

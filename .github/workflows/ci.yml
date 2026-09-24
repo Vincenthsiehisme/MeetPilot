@@ -58,6 +58,43 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
+      # 隨附的最小 ffmpeg（E2）：原始碼固定版本、驗 sha256 與官方簽章，編完用測試音檔跑過才准打包。
+      # 快取鍵是建置腳本與 configure 參數的雜湊，改了參數就重編
+      - uses: actions/cache@v4
+        id: ffmpeg-cache
+        with:
+          path: vendor/ffmpeg
+          key: ffmpeg-${{ matrix.os }}-${{ hashFiles('scripts/ffmpeg/**') }}
+      - name: build ffmpeg (macOS arm64 + x64)
+        if: runner.os == 'macOS' && steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        env:
+          FFMPEG_REQUIRE_SIGNATURE: '1'
+        run: |
+          command -v gpg || brew install gnupg
+          bash scripts/ffmpeg/build.sh mac-arm64
+          bash scripts/ffmpeg/build.sh mac-x64
+      - uses: msys2/setup-msys2@v2
+        if: runner.os == 'Windows' && steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        with:
+          msystem: MINGW64
+          install: >-
+            mingw-w64-x86_64-gcc mingw-w64-x86_64-nasm mingw-w64-x86_64-binutils
+            make diffutils tar xz curl gnupg
+      - name: build ffmpeg (Windows x64)
+        if: runner.os == 'Windows' && steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        shell: msys2 {0}
+        env:
+          FFMPEG_REQUIRE_SIGNATURE: '1'
+        run: bash scripts/ffmpeg/build.sh win-x64
+      - name: verify ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          npx tsx scripts/verifyFfmpeg.ts vendor/ffmpeg/mac-arm64/ffmpeg vendor/ffmpeg/mac-arm64/ffprobe
+          # x64 版在 Apple Silicon 的 runner 上靠 Rosetta 跑；跑不起來就失敗，不跳過
+          npx tsx scripts/verifyFfmpeg.ts vendor/ffmpeg/mac-x64/ffmpeg vendor/ffmpeg/mac-x64/ffprobe
+      - name: verify ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: npx tsx scripts/verifyFfmpeg.ts vendor/ffmpeg/win-x64/ffmpeg.exe vendor/ffmpeg/win-x64/ffprobe.exe
       - run: npm run build
       - run: npm run build:electron
       - run: npx electron-builder ${{ matrix.dir-args }} --publish never
