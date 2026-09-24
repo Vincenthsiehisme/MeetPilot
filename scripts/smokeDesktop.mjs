@@ -94,8 +94,15 @@ while (Date.now() < deadline) {
 }
 if (health === null) await fail(port === null ? `${TIMEOUT_MS / 1000} 秒內 server.log 沒出現新的啟動紀錄` : `${TIMEOUT_MS / 1000} 秒內 port ${port} 的 /api/health 沒有回 200`);
 
-const page = await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(10_000) });
-const html = await page.text();
+let page;
+let html;
+try {
+  page = await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(10_000) });
+  html = await page.text();
+} catch (err) {
+  // 逾時或連線中斷也要走 fail()：收掉 app、刪暫存目錄、印 server.log
+  await fail(`GET / 失敗：${err.message}`);
+}
 if (!page.ok || !html.includes('<div id="root">')) await fail(`GET / 回 ${page.status}，內容不是 build 出來的 index.html`);
 
 await stop();

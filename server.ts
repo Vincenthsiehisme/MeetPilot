@@ -1,5 +1,6 @@
 import express from 'express';
 import path from 'path';
+import { writeSync } from 'node:fs';
 import { resolveListenConfig } from './services/httpGuards';
 import { createLlmLogger, resolveLlmLogPath } from './services/llmTelemetry';
 import { openMeetingDb, resolveDbPath } from './services/meetingDb';
@@ -296,7 +297,8 @@ async function startServer() {
   // 然後因為沒有任何東西撐住事件迴圈而以結束碼 0 安靜退出，看起來像成功（2026-09-24 實測）
   app.listen(port, host, (err?: Error) => {
     if (err) {
-      console.error(`[MeetPilot] 無法在 ${host}:${port} 監聽：${err.message}`);
+      // 同步寫 stderr 再結束：stderr 是 pipe（桌面版）時，console.error 的非同步寫入可能被 process.exit 截掉
+      writeSync(2, `[MeetPilot] 無法在 ${host}:${port} 監聽：${err.message}\n`);
       process.exit(1);
     }
     console.log(`Server running on http://${host}:${port}${basicAuth ? ' (Basic Auth on /api/*)' : ''}`);

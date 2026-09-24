@@ -48,6 +48,8 @@ const serverLogPath = () => join(logDir(), 'server.log');
 // log 寫不進去（磁碟滿、權限、同名目錄）不能讓錯誤視窗跟著出不來：寫入失敗只記下原因，
 // 在錯誤視窗裡講出來，不往上拋（Codex review 2026-09-24）
 let logWriteError: string | null = null;
+// killAndWait 等不到舊 server 結束時的警告，顯示在錯誤視窗裡；下一輪啟動時清掉
+let staleServerWarning: string | null = null;
 function writeLog(text: string): void {
   try {
     mkdirSync(logDir(), { recursive: true });
@@ -102,6 +104,7 @@ async function startServer(): Promise<void> {
   const logTail = createLogTail(LOG_TAIL_LINES);
   // 寫入錯誤跟著這一輪 server 走：上次磁碟滿、這次空出來了，不該還顯示上次的原因
   logWriteError = null;
+  staleServerWarning = null;
   const port = await pickFreePort();
   const origin = `http://127.0.0.1:${port}`;
   const appPath = app.getAppPath();
@@ -164,7 +167,8 @@ async function onServerExit(code: number, lines: string[]): Promise<void> {
     type: 'error',
     title: 'MeetPilot',
     message: `MeetPilot 的背景程式停止了（結束碼 ${code}）`,
-    detail: `最後幾行輸出：\n${lines.join('\n') || '（沒有輸出）'}\n\n${logNote}`,
+    detail: `最後幾行輸出：\n${lines.join('\n') || '（沒有輸出）'}\n\n${logNote}`
+      + (staleServerWarning === null ? '' : `\n\n注意：${staleServerWarning}`),
     buttons: ['重新啟動', '結束 MeetPilot'],
     defaultId: 0,
     cancelId: 1,
@@ -178,16 +182,32 @@ async function onServerExit(code: number, lines: string[]): Promise<void> {
 // 那是預期的，其他失敗寫進 log，不留 unhandled rejection
 function loadInWindow(url: string): void {
   mainWindow?.loadURL(url).catch((err: Error & { code?: string }) => {
-    if (err.code !== 'ERR_ABORTED') writeLog(`--- 視窗載入失敗（${url.slice(0, 80)}）：${err.message} ---\n`);
+    if (err.code === 'ERR_ABORTED') return;
+    writeLog(`--- 視窗載入失敗（${url.slice(0, 80)}）：${err.message} ---\n`);
+    // 不要留一個空白視窗：server 還活著但頁面載不出來時，把原因講在畫面上
+    if (!url.startsWith('data:')) {
+      loadInWindow(statusPage('MeetPilot 的畫面載不出來', `${err.message}。完整紀錄：${serverLogPath()}`));
+    }
   });
 }
 
 // 殺掉子程序之後等它真的結束，才讓使用者按「重新啟動」：同一個 userData 只能有一個 server，
 // 不能靠「SIGTERM 通常很快」這種時間差成立
 function killAndWait(child: UtilityProcess | null, timeoutMs = 5_000): Promise<void> {
-  if (!child || child.pid === undefined) return Promise.resolve();
+  if (!child) return Promise.resolve();
+  // pid 是 undefined 有兩種情況：還沒 spawn 完成，或 exit 已經發出。兩種都先呼叫一次 kill()（結束後是 no-op），
+  // 已經結束的就不用等
+  if (child.pid === undefined) {
+    child.kill();
+    return Promise.resolve();
+  }
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, timeoutMs);
+    const timer = setTimeout(() => {
+      // 這是「一個 userData 一個 server」唯一可能失守的時刻，不能安靜往下走
+      staleServerWarning = `上一個背景程式（pid ${child.pid}）${timeoutMs / 1000} 秒內沒有結束，重新啟動前請先確認它已經停了`;
+      writeLog(`--- ${staleServerWarning} ---\n`);
+      resolve();
+    }, timeoutMs);
     child.once('exit', () => { clearTimeout(timer); resolve(); });
     child.kill();
   });
