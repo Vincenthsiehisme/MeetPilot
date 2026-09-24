@@ -193,6 +193,13 @@ function f(p: Pick) {
 - **`electron/serverEnv.ts` 不 import electron**，才測得到；呼叫端環境裡 `MEETPILOT_*`、`HOST`、`PORT`、`GEMINI_API_KEY`
   一律不往下傳給 server，值只由外殼決定。
 - 打包後的 app 只有 `scripts/smokeDesktop.mjs` 驗得到（CI 的 `desktop` job 兩平台各跑一次）。Windows 的結果只有 CI 看得到。
+  它起一個假 gateway（`MEETPILOT_DESKTOP_GATEWAY_URL`），用 CDP 操作設定頁，連跑首次設定、離線、資料夾不見了、撤銷四段。
+  設定頁的 `#invite-code`、`#vault-dir`、`#save`、`#message` 是它操作的把手，改名要一起改。
+- **gateway 回 401 一律當撤銷，不能退回上次存的 key。** 連不上才用上次的。這兩條的分界在
+  `electron/gatewayClient.ts`，改之前先看檔頭；冒煙測試的「撤銷」那段守它。
+- **token 與 key 只能經 `safeStorage` 落地。** `electron/desktopStore.ts` 的加解密由呼叫端傳入，不要加「不能用就存明文」的退路。
+- `setupPreload.ts` 掛在主視窗上，server 的頁面也拿得到 `window.meetpilotSetup`；`ipcMain` 那頭一律用
+  `isSetupPageUrl` 驗來源，新增的設定頁 handler 也要驗。
 - **隨附的 ffmpeg 只開了 server 用得到的元件**（`scripts/ffmpeg/configure-flags.txt`）。server 改用新的 ffmpeg 功能
   （新的濾鏡、編碼器、容器）時，開發機上的完整版 ffmpeg 照樣能跑、三條 gate 照樣綠，打包後才壞。改 `audioSlicer.ts`
   的 ffmpeg 參數時，同一個 PR 要在 flags 加元件並跑 `npm run ffmpeg:verify`；新格式要加一支 fixture。

@@ -78,6 +78,13 @@ describe('buildServerEnv', () => {
     expect(env.Path).toBe('C:\\bin');
   });
 
+  it('名單文件有給才設 MEETPILOT_ROSTER_DOCUMENT；使用者 shell 裡的同名變數不會漏進去', () => {
+    expect(buildServerEnv({ baseEnv: {}, userDataDir: '/d', port: 1, rosterDocument: '/d/roster.json' }).MEETPILOT_ROSTER_DOCUMENT)
+      .toBe('/d/roster.json');
+    expect(buildServerEnv({ baseEnv: { MEETPILOT_ROSTER_DOCUMENT: '/x.json' }, userDataDir: '/d', port: 1 }))
+      .not.toHaveProperty('MEETPILOT_ROSTER_DOCUMENT');
+  });
+
   it('有給 Gemini key 才帶；空白的 key 不帶，不拿空字串頂替', () => {
     expect(buildServerEnv({ baseEnv: {}, userDataDir: '/d', port: 1, geminiApiKey: ' k ' }).GEMINI_API_KEY).toBe('k');
     expect(buildServerEnv({ baseEnv: {}, userDataDir: '/d', port: 1, geminiApiKey: '  ' })).not.toHaveProperty('GEMINI_API_KEY');

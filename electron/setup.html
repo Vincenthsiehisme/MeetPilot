@@ -1,0 +1,122 @@
+<!doctype html>
+<!--
+  桌面 app 的設定頁（vault plan「MeetPilot · 跨平台打包部署」E3）。由外殼自己提供，不是 server 的前端：
+  server 啟動前就要有 Gemini key，而 key 要先用邀請碼向 gateway 換。
+  跟主程序只經 setupPreload.ts 暴露的 window.meetpilotSetup 講話；主程序那頭會驗訊息是不是從這一頁來的。
+  scripts/smokeDesktop.mjs 靠 #invite-code、#vault-dir、#save、#message 這幾個 id 操作這一頁，改名要一起改。
+-->
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+<title>設定 MeetPilot</title>
+<style>
+  :root { color-scheme: light dark; --fg: #1e293b; --muted: #64748b; --bg: #f8fafc; --card: #ffffff; --line: #cbd5e1;
+          --accent: #2563eb; --error-bg: #fef2f2; --error-fg: #b91c1c; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg: #e2e8f0; --muted: #94a3b8; --bg: #0f172a; --card: #1e293b; --line: #334155;
+            --accent: #60a5fa; --error-bg: #450a0a; --error-fg: #fecaca; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font-family: -apple-system, 'Segoe UI', 'Microsoft JhengHei', 'PingFang TC', sans-serif; }
+  main { max-width: 560px; margin: 64px auto; padding: 32px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; }
+  h1 { margin: 0 0 8px; font-size: 22px; }
+  p.lead { margin: 0 0 24px; color: var(--muted); line-height: 1.6; }
+  label { display: block; font-weight: 600; margin: 20px 0 6px; }
+  .hint { color: var(--muted); font-size: 13px; margin: 6px 0 0; line-height: 1.5; }
+  input { width: 100%; padding: 10px 12px; font-size: 15px; border: 1px solid var(--line); border-radius: 8px;
+          background: var(--bg); color: var(--fg); }
+  .row { display: flex; gap: 8px; }
+  .row input { flex: 1; }
+  button { padding: 10px 16px; font-size: 15px; border-radius: 8px; border: 1px solid var(--line);
+           background: var(--card); color: var(--fg); cursor: pointer; white-space: nowrap; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 28px; }
+  #message { display: none; margin: 0 0 16px; padding: 12px 14px; border-radius: 8px; background: var(--error-bg);
+             color: var(--error-fg); line-height: 1.6; white-space: pre-wrap; }
+  #message.show { display: block; }
+  #status { color: var(--muted); margin-right: auto; align-self: center; }
+</style>
+</head>
+<body>
+<main>
+  <h1>設定 MeetPilot</h1>
+  <p class="lead">輸入 admin 給你的邀請碼，再選會議記錄要放的資料夾。設定一次就好，之後打開 MeetPilot 會自動更新 Gemini key 與人員名單。</p>
+  <div id="message" role="alert"></div>
+
+  <label for="invite-code">邀請碼</label>
+  <input id="invite-code" autocomplete="off" spellcheck="false">
+  <p class="hint" id="invite-hint">邀請碼只在這台電腦用來換一次登入資料，不會存起來。</p>
+
+  <label for="vault-dir">會議記錄資料夾</label>
+  <div class="row">
+    <input id="vault-dir" spellcheck="false" placeholder="按「選擇資料夾…」">
+    <button id="choose" type="button">選擇資料夾…</button>
+  </div>
+  <p class="hint">每場會的記錄會寫成一份 markdown 放在這裡。要給其他人看的話，選公司的共享資料夾（OneDrive、Google Drive 這類同步資料夾）。</p>
+
+  <div class="actions">
+    <span id="status"></span>
+    <button id="cancel" type="button" hidden>取消</button>
+    <button id="save" type="button" class="primary">儲存並開始</button>
+  </div>
+</main>
+<script>
+  const api = window.meetpilotSetup;
+  const $ = (id) => document.getElementById(id);
+  const code = $('invite-code');
+  const vault = $('vault-dir');
+  const buttons = [$('save'), $('choose'), $('cancel')];
+
+  function showMessage(text) {
+    $('message').textContent = text || '';
+    $('message').classList.toggle('show', Boolean(text));
+  }
+  function setBusy(busy, text) {
+    for (const b of buttons) b.disabled = busy;
+    code.disabled = busy;
+    vault.disabled = busy;
+    $('status').textContent = text || '';
+  }
+
+  async function init() {
+    if (!api) {
+      showMessage('設定頁跟 MeetPilot 的連線沒有建立起來（preload 沒載入），請結束後重新打開。');
+      setBusy(true);
+      return;
+    }
+    const state = await api.load();
+    vault.value = state.vaultDir || '';
+    showMessage(state.message);
+    if (state.hasCredentials) {
+      code.placeholder = '已設定過；要換邀請碼才填';
+      $('invite-hint').textContent = '留空就沿用目前的登入資料，只更新資料夾。';
+    }
+    $('cancel').hidden = !state.canCancel;
+    code.focus();
+  }
+
+  $('choose').addEventListener('click', async () => {
+    const picked = await api.chooseFolder(vault.value);
+    if (picked) vault.value = picked;
+  });
+  $('cancel').addEventListener('click', () => api.cancel());
+  $('save').addEventListener('click', async () => {
+    showMessage('');
+    setBusy(true, '正在向 gateway 確認…');
+    const result = await api.submit({ code: code.value, vaultDir: vault.value });
+    if (result.ok) {
+      setBusy(true, '設定好了，正在啟動…');
+      return;
+    }
+    setBusy(false);
+    showMessage(result.error);
+  });
+  code.addEventListener('keydown', (e) => { if (e.key === 'Enter') $('save').click(); });
+
+  init();
+</script>
+</body>
+</html>

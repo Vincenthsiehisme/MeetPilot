@@ -11,7 +11,7 @@
     "preview": "vite preview",
     "lint": "tsc --noEmit",
     "test": "vitest run",
-    "build:electron": "esbuild electron/main.ts --bundle --platform=node --format=cjs --external:electron --sourcemap --outfile=dist/electron/main.cjs",
+    "build:electron": "esbuild electron/main.ts electron/setupPreload.ts --bundle --platform=node --format=cjs --external:electron --sourcemap --outdir=dist/electron --out-extension:.js=.cjs",
     "desktop": "npm run build && npm run build:electron && electron .",
     "package:mac": "npm run build && npm run build:electron && electron-builder --mac --publish never",
     "package:win": "npm run build && npm run build:electron && electron-builder --win --publish never",
@@ -48,6 +48,7 @@
       "dist/**",
       "prompts/**",
       "electron/assets/**",
+      "electron/setup.html",
       "package.json",
       "!dist/**/*.map"
     ],
