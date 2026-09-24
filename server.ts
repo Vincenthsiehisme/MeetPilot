@@ -7,6 +7,7 @@ import { openMeetingDb, resolveDbPath } from './services/meetingDb';
 import { createMeetingStore } from './services/meetingStore';
 import { createPeopleStore } from './services/peopleStore';
 import { importRosterFromFile, resolveRosterCsvPath } from './services/rosterImportRunner';
+import { importRosterDocumentFromFile, resolveRosterDocumentPath } from './services/rosterDocument';
 import { createNameResolver } from './services/nameResolver';
 import { createGeminiServerClient } from './services/geminiServerClient';
 import { createAudioFileStore, resolveAudioDir } from './services/audioFileStore';
@@ -52,12 +53,28 @@ const meetingDb = openMeetingDb(resolveDbPath(process.env));
 const meetingStore = createMeetingStore(meetingDb);
 // 人員名單（人名校正 N1／N2）。同一個 DB 檔案，跟 meetingStore 共用交易與備份邊界，
 // 手動匯入仍是 scripts/importRoster.ts 的事（CLI 而非 API，2026-09-21 決策不變）。
-// 這裡只是啟動時的方便：people 表還是空的、且設了 MEETPILOT_ROSTER_CSV 時自動補一次
-// 同一套匯入邏輯，省得每次重建資料庫都要記得手動下指令（2026-09-22 決策）。
-// CSV 格式錯誤要在這裡爆，不要吞掉讓 server 帶著沒匯入名單的假象繼續跑。
+// 啟動時的自動匯入有兩個來源，只能設一個：
+// - MEETPILOT_ROSTER_DOCUMENT（桌面 app，E3）：外殼每次啟動從 gateway 拿名單寫成這個檔，
+//   server 每次啟動都匯入（upsert），admin 發布新名單後各台 app 下次啟動就跟上。
+// - MEETPILOT_ROSTER_CSV（網頁版）：people 表還是空的時候補一次（2026-09-22 決策）。
+// 兩個都設的話不默默挑一個：挑錯的那個看起來完全正常，只是名單不是你以為的那份。
+// 格式錯誤要在這裡爆，不要吞掉讓 server 帶著沒匯入名單的假象繼續跑。
 const peopleStore = createPeopleStore(meetingDb);
+const rosterDocumentPath = resolveRosterDocumentPath(process.env);
 const rosterCsvPath = resolveRosterCsvPath(process.env);
-if (peopleStore.listPeople().length === 0) {
+if (rosterDocumentPath && rosterCsvPath) {
+  throw new Error(
+    'MEETPILOT_ROSTER_DOCUMENT 與 MEETPILOT_ROSTER_CSV 只能設一個：前者是桌面 app 從 gateway 拿的名單，'
+    + '後者是網頁版的本機 CSV',
+  );
+}
+if (rosterDocumentPath) {
+  const outcome = importRosterDocumentFromFile(rosterDocumentPath, peopleStore, Date.now());
+  console.log(
+    `[MeetPilot] 啟動時匯入 gateway 名單（${rosterDocumentPath}）：`
+    + `people ${outcome.peopleWritten} 筆，person_aliases 新增 ${outcome.aliasesAdded} 筆`,
+  );
+} else if (peopleStore.listPeople().length === 0) {
   if (rosterCsvPath) {
     const outcome = importRosterFromFile(rosterCsvPath, peopleStore, Date.now());
     console.log(

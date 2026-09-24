@@ -7,9 +7,10 @@
  * - 資料一律放 userData（macOS `~/Library/Application Support/MeetPilot`、Windows `%APPDATA%\MeetPilot`），
  *   不放安裝目錄：安裝目錄在更新時會被整個換掉，而且 Windows 的 Program Files 一般使用者寫不進去。
  * - 只綁 127.0.0.1：桌面 app 只給本機的視窗用，不對區網開。
- * - 投影資料夾沒指定時也放 userData，不用 server 的預設 `~/MeetPilot Vault`：同一台機器上跑著網頁版的話，
- *   兩個各有資料庫的 server 會寫進同一個資料夾，投影器處理檔名衝突時會改名既有檔案。E3 的設定畫面讓
- *   記錄人自己選（通常是共享資料夾）。
+ * - 投影資料夾由 E3 的設定頁讓記錄人自己選（通常是共享資料夾）。沒指定時放 userData，不用 server 的預設
+ *   `~/MeetPilot Vault`：同一台機器上跑著網頁版的話，兩個各有資料庫的 server 會寫進同一個資料夾，
+ *   投影器處理檔名衝突時會改名既有檔案。
+ * - 名單由外殼從 gateway 拿、寫成 userData 的 roster.json，以 `MEETPILOT_ROSTER_DOCUMENT` 交給 server 每次啟動匯入。
  * - 呼叫端環境裡跟 server 設定同名的變數（使用者機器上剛好設了 PORT、HOST、MEETPILOT_DB 之類）
  *   一律不往下傳：桌面 app 的行為不能因為使用者的 shell 設定而改變，而且那種錯很難從畫面上看出來。
  */
@@ -20,10 +21,12 @@ export interface ServerEnvInput {
   baseEnv: Record<string, string | undefined>;
   userDataDir: string;
   port: number;
-  /** E3 之前先吃呼叫端的 GEMINI_API_KEY；E3 之後改由 gateway 拿、safeStorage 存 */
+  /** 外殼向 gateway 拿的那一把（E3）；呼叫端環境裡的 GEMINI_API_KEY 不用 */
   geminiApiKey?: string;
   /** 會議 markdown 投影到哪；沒給就是 userData/vault */
   vaultDir?: string;
+  /** gateway 名單的本機副本（E3）；沒給就不設，server 不自動匯入 */
+  rosterDocument?: string;
   /** 隨附的 ffmpeg／ffprobe（E2）。沒給就不設，server 走 PATH 上的（開發時） */
   ffmpeg?: { ffmpeg: string; ffprobe: string };
 }
@@ -52,6 +55,7 @@ export function buildServerEnv(input: ServerEnvInput): Record<string, string> {
     MEETPILOT_LLM_LOG: join(input.userDataDir, 'logs', 'llm.jsonl'),
     MEETPILOT_VAULT: input.vaultDir ?? join(input.userDataDir, 'vault'),
   });
+  if (input.rosterDocument !== undefined) env.MEETPILOT_ROSTER_DOCUMENT = input.rosterDocument;
   if (input.ffmpeg !== undefined) {
     env.MEETPILOT_FFMPEG = input.ffmpeg.ffmpeg;
     env.MEETPILOT_FFPROBE = input.ffmpeg.ffprobe;

@@ -60,7 +60,13 @@ macOS 與 Windows 同一行。腳本先驗 CSV，驗過才提示貼上 Blob toke
 先用跟 CLI 匯入同一套 `parseRosterCsv` 整份驗過，有任何一列錯就整批不發；通過才上傳到 gateway
 私有 Blob store 的 `roster/people.json`（`{ version: 1, rows }`，形狀在 `services/rosterDocument.ts`）。
 名單是 PII，只放 Blob，不進任何 git repo。token 不要寫進 `.env`，也不要用 `BLOB_READ_WRITE_TOKEN=... 指令`
-的寫法帶（會留在 shell history）；那個環境變數只給非互動環境（CI）用。app 端從 gateway 拿名單的那一段屬於之後的桌面 app 工作，還沒做。
+的寫法帶（會留在 shell history）；那個環境變數只給非互動環境（CI）用。
+
+桌面 app 每次啟動向 gateway 拿名單，驗過（`parseRosterDocument`，欄位規則對齊 `parseRosterCsv` 的輸出）才寫成
+userData 的 `roster.json`，server 以 `MEETPILOT_ROSTER_DOCUMENT` 指到它、**每次啟動都匯入**（upsert，跟 CSV 的
+「people 表空的才補」不同）。所以 admin 發布新名單後，各台 app 下次啟動就拿到新增的人與改過的欄位；
+**從名單拿掉的人不會從 app 裡消失**（upsert 不刪，跟「離職不刪除、只標 `active`」同一條規則，標記方式還沒做）。`MEETPILOT_ROSTER_DOCUMENT` 與
+`MEETPILOT_ROSTER_CSV` 只能設一個，兩個都設 server 起不來。
 
 ### 用語音備忘錄錄音
 
@@ -104,7 +110,7 @@ server 行程自己讀不到（`Operation not permitted`），授權是捷徑 Ap
 ## 桌面 app（開發中）
 
 多位記錄人各自在 Mac 或 Windows 上用的版本，Electron 包一層，裡面跑的就是上面這個 server（vault plan
-`MeetPilot · 跨平台打包部署`）。目前做到外殼（E1）與隨附 ffmpeg（E2）：還沒有邀請碼設定畫面、沒有 app 內錄音。
+`MeetPilot · 跨平台打包部署`）。目前做到外殼（E1）、隨附 ffmpeg（E2）與邀請碼設定畫面（E3）：還沒有 app 內錄音。
 
 ```bash
 npm run ffmpeg:build -- mac-arm64   # 先編隨附的 ffmpeg（mac-arm64、mac-x64、win-x64），輸出到 vendor/ffmpeg/
@@ -116,8 +122,7 @@ node scripts/smokeDesktop.mjs <打包後的執行檔>   # 啟動打包後的 app
 
 - server 跑在 Electron 的 `utilityProcess` 裡（`electron/main.ts`），動態 port、只綁 `127.0.0.1`，主視窗載它。
 - 資料全部在 userData：macOS `~/Library/Application Support/MeetPilot`，Windows `%APPDATA%\MeetPilot`。
-  會議 markdown 在設定畫面做好之前先投影到 userData 的 `vault/`，不碰網頁版預設的 `~/MeetPilot Vault`。
-  server 的輸出寫在 userData 的 `logs/server.log`。
+  會議 markdown 投影到設定頁選的資料夾。server 的輸出寫在 userData 的 `logs/server.log`。
 - 關掉視窗只是縮到托盤，托盤選單的「結束 MeetPilot」才會停 server。同時只能開一個。
 - server 掛掉會跳錯誤視窗，顯示結束碼與最後幾行輸出，由使用者選重新啟動或結束，不會安靜重啟。
 - **隨附的 ffmpeg 是自己從官方原始碼編的最小版本**（`scripts/ffmpeg/build.sh`，參數在 `configure-flags.txt`）：
@@ -136,8 +141,16 @@ node scripts/smokeDesktop.mjs <打包後的執行檔>   # 啟動打包後的 app
 - 打包後找不到隨附的 ffmpeg 會跳錯誤視窗，不退回 PATH（記錄人電腦上本來就沒有 ffmpeg）。
 - 安裝檔沒有簽章，第一次打開 macOS 要到「系統設定 → 隱私權與安全性」按「仍要打開」，Windows 的 SmartScreen
   要按「其他資訊 → 仍要執行」。
-- 目前 Gemini key 只從啟動 app 的環境變數 `GEMINI_API_KEY` 讀；從 Finder 或開始選單打開時沒有 key，轉錄會失敗並講原因。
-  改由邀請碼向 gateway 拿是下一步（E3）。
+- **第一次打開是設定頁**（外殼自己的 `electron/setup.html`，server 還沒起來）：輸入 admin 給的邀請碼、選會議記錄資料夾。
+  邀請碼向 gateway（`https://meetpilot-gateway.vercel.app`，repo `meetpilot-gateway`）換成 token，再拿 Gemini key 與名單；
+  兩樣都到手才存設定、起 server。邀請碼本身不存。之後要換資料夾或邀請碼，從托盤選單的「設定…」。
+- token 與 Gemini key 用 Electron `safeStorage` 加密後存在 userData 的 `credentials.json`（macOS 鑰匙圈的
+  「MeetPilot Safe Storage」、Windows DPAPI）；安全儲存不能用的電腦不存，不退回明文。名單存 `roster.json`，
+  投影資料夾存 `desktop-settings.json`，這兩個不加密：名單匯入後本來就以明文存在 SQLite。
+- **每次啟動都向 gateway 更新 key 與名單。** 連不上（網路、逾時、5xx、回應內容不對）就用上次存的繼續，
+  server 的畫面底部掛一條離線橫幅說哪一樣是舊的；gateway 回 401（邀請碼被撤銷）就刪掉 token、key、名單，
+  回設定頁講原因，不退回上次的。撤銷只在啟動時檢查，app 一直開著不會中途停。
+- 啟動 app 的環境變數 `GEMINI_API_KEY` 不再使用。
 
 ## 驗證
 
