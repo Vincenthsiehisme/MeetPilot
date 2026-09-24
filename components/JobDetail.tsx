@@ -11,7 +11,8 @@ import { isDesktopApp } from '../services/micRecorder';
 
 interface JobDetailProps {
   job: Job;
-  onUpdateJob: (updates: Partial<Job>) => void;
+  /** 回傳這次有沒有存進去（沒有的話原因已經講給使用者了）。SummaryView 靠它決定草稿要不要留著 */
+  onUpdateJob: (updates: Partial<Job>) => Promise<boolean>;
   onAlert: (title: string, message: string) => void;
   onRetry?: (id: string) => void;
   /** 這場會的與會者（人名校正 N2）。本機舊紀錄沒有這個概念，傳空陣列 */
@@ -248,9 +249,11 @@ const JobDetail: React.FC<JobDetailProps> = ({
           />
         )}
         
+        {/* key：草稿是一場會一份，換會議一定重新掛載，不讓上一場沒送出的草稿留到下一場 */}
         {activeTab === 'summary' && job.analysis && (
-          <SummaryView 
-            analysis={job.analysis} 
+          <SummaryView
+            key={job.id}
+            analysis={job.analysis}
             jobMetadata={job} 
             onUpdate={(analysis) => onUpdateJob({ analysis })}
           />
