@@ -1,6 +1,6 @@
 # 三條 gate 加正式版冒煙測試，在 macOS 與 Windows 各跑一次。
 # 記錄人用的電腦兩個平台都有，只在 macOS 上驗等於每次改碼都在猜 Windows。
-# Node 24 對齊之後要打包的 Electron 內建的 Node（Electron 46 帶 Node 24.21）。
+# Node 24 對齊桌面 app 打包的 Electron 內建的 Node（Electron 44.4.5 帶 Node 24.21）。
 name: CI
 
 on:
@@ -28,3 +28,43 @@ jobs:
       # 拿掉 devDependencies 之後再啟動一次，守 dist/server.cjs 不依賴 vite 這類開發工具
       - run: npm prune --omit=dev
       - run: node scripts/smokeProduction.mjs
+
+  # 桌面 app：兩個平台各自打包、真的把 app 啟動起來確認裡面的 server 有回應，再產出安裝檔。
+  # Windows 上的外殼（utilityProcess、檔案佈局、cwd）能不能跑，只有這一步驗得到。
+  # 安裝檔沒有簽章（vault plan 的裁定），macOS 要關掉自動找簽章身分，不然 electron-builder 會去翻 keychain。
+  desktop:
+    needs: gate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            dir-args: --mac dir --arm64
+            exe: release/mac-arm64/MeetPilot.app/Contents/MacOS/MeetPilot
+            dist-args: --mac
+            artifact: release/*.dmg
+          - os: windows-latest
+            dir-args: --win dir --x64
+            exe: release/win-unpacked/MeetPilot.exe
+            dist-args: --win
+            artifact: release/*.exe
+    runs-on: ${{ matrix.os }}
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run build:electron
+      - run: npx electron-builder ${{ matrix.dir-args }} --publish never
+      - run: node scripts/smokeDesktop.mjs ${{ matrix.exe }}
+      - run: npx electron-builder ${{ matrix.dist-args }} --publish never
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-${{ matrix.os }}
+          path: ${{ matrix.artifact }}
+          retention-days: 14

@@ -1,0 +1,214 @@
+/**
+ * MeetPilot 桌面 app 的主程序（vault plan「MeetPilot · 跨平台打包部署」E1）。
+ *
+ * 外殼刻意很薄：現有的 server（dist/server.cjs）原樣跑在 utilityProcess 裡，主視窗載它的網址。
+ * server 用的是同步的 node:sqlite，放主程序會把視窗與托盤一起凍住，所以一定要是獨立程序。
+ *
+ * 三條不能退的規則：
+ * - **只能有一個實例。** job table 的回收邏輯建立在「同一個 DB 只有一個 process」上
+ *   （jobStore.reclaimAllActive），開兩個 app 會讓兩個 worker 搶同一場會。
+ * - **server 掛了要看得見。** 不安靜重啟：跳視窗顯示 exit code 與最後幾行輸出，讓使用者決定重啟或結束。
+ * - **關視窗不等於結束。** 錄音中關掉視窗很常見，app 縮到托盤繼續跑；只有托盤選單的「結束」會停 server。
+ */
+import { app, BrowserWindow, dialog, Menu, nativeImage, session, shell, Tray, utilityProcess } from 'electron';
+import type { UtilityProcess } from 'electron';
+import { appendFileSync, mkdirSync } from 'node:fs';
+import { createServer } from 'node:net';
+import { join } from 'node:path';
+import { buildServerEnv } from './serverEnv';
+import { createLogTail } from './logTail';
+
+// userData 固定叫 MeetPilot，不跟 package.json 的 name 走：資料夾名要穩定，改套件名或產品名不能讓資料「消失」
+app.setPath('userData', join(app.getPath('appData'), 'MeetPilot'));
+
+const SERVER_READY_TIMEOUT_MS = 30_000;
+const LOG_TAIL_LINES = 40;
+
+let mainWindow: BrowserWindow | null = null;
+let tray: Tray | null = null;
+let server: UtilityProcess | null = null;
+let serverOrigin: string | null = null;
+let quitting = false;
+
+const logDir = () => join(app.getPath('userData'), 'logs');
+const serverLogPath = () => join(logDir(), 'server.log');
+
+function pickFreePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const probe = createServer();
+    probe.once('error', reject);
+    probe.listen(0, '127.0.0.1', () => {
+      const address = probe.address();
+      probe.close(() => {
+        if (address && typeof address === 'object') resolve(address.port);
+        else reject(new Error('拿不到可用的連接埠'));
+      });
+    });
+  });
+}
+
+async function waitForServer(origin: string, child: UtilityProcess): Promise<void> {
+  const deadline = Date.now() + SERVER_READY_TIMEOUT_MS;
+  let exited = false;
+  child.once('exit', () => { exited = true; });
+  while (Date.now() < deadline) {
+    if (exited) throw new Error('server 在就緒之前就結束了');
+    try {
+      const res = await fetch(`${origin}/api/health`);
+      if (res.ok) return;
+    } catch {
+      // 還沒 listen，連線被拒是等待中的正常狀態
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  throw new Error(`${SERVER_READY_TIMEOUT_MS / 1000} 秒內 server 沒有就緒`);
+}
+
+const statusPage = (title: string, body: string) =>
+  `data:text/html;charset=utf-8,${encodeURIComponent(
+    `<!doctype html><meta charset="utf-8"><title>MeetPilot</title>
+     <body style="font-family:-apple-system,'Segoe UI','Microsoft JhengHei',sans-serif;padding:48px;color:#334155">
+     <h2 style="margin:0 0 12px">${title}</h2><p style="color:#64748b">${body}</p></body>`,
+  )}`;
+
+async function startServer(): Promise<void> {
+  const logTail = createLogTail(LOG_TAIL_LINES);
+  mkdirSync(logDir(), { recursive: true });
+  const port = await pickFreePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const appPath = app.getAppPath();
+  const child = utilityProcess.fork(join(appPath, 'dist', 'server.cjs'), [], {
+    // server 從 cwd 找 dist/（前端）與 prompts/（會議記錄規範），所以 cwd 是 app 目錄，不是 userData
+    cwd: appPath,
+    env: buildServerEnv({
+      baseEnv: process.env,
+      userDataDir: app.getPath('userData'),
+      port,
+      geminiApiKey: process.env.GEMINI_API_KEY,
+    }),
+    stdio: 'pipe',
+    serviceName: 'MeetPilot Server',
+  });
+  const onOutput = (chunk: Buffer) => {
+    const text = chunk.toString('utf8');
+    logTail.push(text);
+    appendFileSync(serverLogPath(), text);
+  };
+  child.stdout?.on('data', onOutput);
+  child.stderr?.on('data', onOutput);
+  appendFileSync(serverLogPath(), `\n--- ${new Date().toISOString()} 啟動 server（port ${port}）---\n`);
+
+  child.once('exit', (code) => {
+    if (server === child) server = null;
+    if (quitting) return;
+    void onServerExit(code, logTail.lines());
+  });
+  server = child;
+  await waitForServer(origin, child);
+  serverOrigin = origin;
+}
+
+async function onServerExit(code: number, lines: string[]): Promise<void> {
+  serverOrigin = null;
+  // 寫進同一份 log：事後查的時候看得出 server 什麼時候、以什麼結束碼停的，以及使用者看到了錯誤視窗
+  appendFileSync(serverLogPath(), `--- ${new Date().toISOString()} server 結束（結束碼 ${code}），顯示錯誤視窗 ---\n`);
+  mainWindow?.loadURL(statusPage('MeetPilot 的背景程式停止了', `結束碼 ${code}。完整紀錄在 ${serverLogPath()}`));
+  const { response } = await dialog.showMessageBox({
+    type: 'error',
+    title: 'MeetPilot',
+    message: `MeetPilot 的背景程式停止了（結束碼 ${code}）`,
+    detail: `最後幾行輸出：\n${lines.join('\n') || '（沒有輸出）'}\n\n完整紀錄：${serverLogPath()}`,
+    buttons: ['重新啟動', '結束 MeetPilot'],
+    defaultId: 0,
+    cancelId: 1,
+  });
+  appendFileSync(serverLogPath(), `--- 使用者選擇：${response === 0 ? '重新啟動' : '結束'} ---\n`);
+  if (response === 0) await bootServerIntoWindow();
+  else app.quit();
+}
+
+async function bootServerIntoWindow(): Promise<void> {
+  mainWindow?.loadURL(statusPage('MeetPilot 啟動中…', '正在準備資料庫與背景程式。'));
+  try {
+    await startServer();
+  } catch (err) {
+    // 就緒失敗時子程序可能還活著（例如卡在啟動），先收掉，再交給跟崩潰同一條路處理
+    const child = server;
+    server = null;
+    child?.kill();
+    await onServerExit(-1, [(err as Error).message]);
+    return;
+  }
+  await mainWindow?.loadURL(`${serverOrigin}/`);
+}
+
+function isServerUrl(url: string): boolean {
+  return serverOrigin !== null && (url === serverOrigin || url.startsWith(`${serverOrigin}/`));
+}
+
+function createWindow(): void {
+  mainWindow = new BrowserWindow({
+    width: 1280,
+    height: 820,
+    title: 'MeetPilot',
+    webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
+  });
+  // 視窗只顯示 server 的頁面；外部連結開系統瀏覽器，不在 app 裡換頁
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//.test(url) && !isServerUrl(url)) void shell.openExternal(url);
+    return { action: 'deny' };
+  });
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (!isServerUrl(url)) event.preventDefault();
+  });
+  mainWindow.on('close', (event) => {
+    if (quitting) return;
+    event.preventDefault();
+    mainWindow?.hide();
+  });
+}
+
+function showWindow(): void {
+  if (!mainWindow) return;
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+function createTray(): void {
+  const assets = join(app.getAppPath(), 'electron', 'assets');
+  // macOS 用 template 圖（系統依深淺色自動上色），Windows 用彩色圖
+  const icon = nativeImage.createFromPath(
+    join(assets, process.platform === 'darwin' ? 'trayTemplate.png' : 'tray.png'),
+  );
+  tray = new Tray(icon);
+  tray.setToolTip('MeetPilot');
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: '開啟 MeetPilot', click: showWindow },
+    { type: 'separator' },
+    { label: '結束 MeetPilot', click: () => app.quit() },
+  ]));
+  tray.on('click', showWindow);
+}
+
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on('second-instance', showWindow);
+  app.on('activate', showWindow);
+  app.on('before-quit', () => {
+    quitting = true;
+    server?.kill();
+  });
+  // 托盤常駐：所有視窗關掉（其實是藏起來）不結束
+  app.on('window-all-closed', () => {});
+
+  void app.whenReady().then(async () => {
+    // 只有 server 自己的頁面能要麥克風（E4 的 app 內錄音），其他權限一律拒絕
+    session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
+      callback(permission === 'media' && isServerUrl(webContents.getURL()));
+    });
+    createWindow();
+    createTray();
+    await bootServerIntoWindow();
+  });
+}
