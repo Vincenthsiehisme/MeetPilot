@@ -133,7 +133,7 @@ describe('buildAnalysisV3FromModelOutput', () => {
   const baseOutput: AnalysisModelOutput = {
     title: '標題',
     overview: '主旨',
-    topics: [{ title: 'T', content: 'C' }],
+    topics: [{ title: 'T', content: 'C', points: [{ text: '要點', segment_from: 2, segment_to: 3 }] }],
     decisions: [{ text: '決議', segment_from: 1, segment_to: 2, decided_by: '小美' }],
     action_items: [{ text: '待辦', segment_from: 2, segment_to: 2, assignee: null, due: '下週三' }],
     open_questions: [{ text: '未決', segment_from: 3, segment_to: 3 }],
@@ -153,11 +153,22 @@ describe('buildAnalysisV3FromModelOutput', () => {
     });
   });
 
-  it('contract_version 標成 3，overview／topics 原樣帶過去', () => {
+  it('contract_version 標成 3，overview 原樣帶過去；議題的要點段落編號換成秒數（SDD v0.9）', () => {
     const v3 = buildAnalysisV3FromModelOutput(baseOutput, transcript, 'm-1', 999);
     expect(v3.contract_version).toBe(3);
     expect(v3.overview).toBe('主旨');
-    expect(v3.topics).toEqual(baseOutput.topics);
+    expect(v3.topics).toEqual([{ title: 'T', content: 'C', points: [{ text: '要點', evidence: { start: 10, end: 30 } }] }]);
+  });
+
+  it('議題要點的段落編號超出範圍時也拋錯，訊息講出是哪個議題的第幾點', () => {
+    const bad: AnalysisModelOutput = {
+      ...baseOutput,
+      topics: [
+        { title: 'T1', content: 'C', points: [] },
+        { title: 'T2', content: 'C', points: [{ text: 'ok', segment_from: 1, segment_to: 1 }, { text: '壞', segment_from: 2, segment_to: 9 }] },
+      ],
+    };
+    expect(() => buildAnalysisV3FromModelOutput(bad, transcript, 'm-1', 999)).toThrow(/第 2 個議題的第 2 點的段落編號超出逐字稿範圍/);
   });
 
   it('segment_from／segment_to 超出逐字稿範圍時拋錯，帶明細不裁切', () => {
@@ -188,7 +199,7 @@ describe('assertAnalysisModelOutput', () => {
   const valid: AnalysisModelOutput = {
     title: '標題',
     overview: 'x',
-    topics: [{ title: 'T', content: 'C' }],
+    topics: [{ title: 'T', content: 'C', points: [{ text: '要點', segment_from: 2, segment_to: 3 }] }],
     decisions: [{ text: 'd', segment_from: 1, segment_to: 1, decided_by: null }],
     action_items: [{ text: 'a', segment_from: 1, segment_to: 1, assignee: null, due: null }],
     open_questions: [{ text: 'q', segment_from: 1, segment_to: 1 }],
@@ -200,6 +211,12 @@ describe('assertAnalysisModelOutput', () => {
 
   it('不是物件時拋錯', () => {
     expect(() => assertAnalysisModelOutput('不是物件')).toThrow(/不是物件/);
+  });
+
+  it('議題缺 points、或要點缺出處時拋錯（SDD v0.9：每點都要附出處）', () => {
+    expect(() => assertAnalysisModelOutput({ ...valid, topics: [{ title: 'T', content: 'C' }] })).toThrow(/topics/);
+    expect(() => assertAnalysisModelOutput({ ...valid, topics: [{ title: 'T', content: 'C', points: [{ text: 'p' }] }] })).toThrow(/topics/);
+    expect(() => assertAnalysisModelOutput({ ...valid, topics: [{ title: 'T', content: 'C', points: [{ segment_from: 1, segment_to: 1 }] }] })).toThrow(/topics/);
   });
 
   it('overview 不是字串時拋錯', () => {

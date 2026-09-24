@@ -7,7 +7,7 @@ import { openMeetingDb } from './meetingDb';
 import { createMeetingStore, MeetingStore } from './meetingStore';
 import { createPeopleStore, PeopleStore } from './peopleStore';
 import { createNameResolver, NameResolver } from './nameResolver';
-import { DecisionV3, Evidence } from './analysisContract';
+import { DecisionV3, Evidence, TopicV3 } from './analysisContract';
 import {
   buildFileName,
   computeChecksum,
@@ -52,7 +52,7 @@ interface ReadyMeetingInput {
    * 要測 evidence／decided_by 本身的測試直接用 decisionObjects */
   decisions?: string[];
   decisionObjects?: DecisionV3[];
-  topics?: { title: string; content: string }[];
+  topics?: TopicV3[];
   actionItems?: { text: string; source_meeting_id: string; created_at: number; status: 'unknown' | 'open' | 'done'; assignee?: string | null; due?: string | null; evidence?: Evidence | null }[];
   openQuestions?: string[];
   segments?: { start: number; end: number; text: string; speaker?: string }[];
@@ -321,6 +321,28 @@ describe('project：AC-2 系統區內容', () => {
     expect(raw).toContain('## 未決事項\n- 要不要外包');
     expect(raw).toContain('### 報價\n討論 Q4 報價策略');
     expect(raw).toContain('- 供應商報價的付款條件');
+  });
+
+  it('討論題目有要點時：小標、走到哪、條列要點，每點後面接行內程式碼的時間標籤（SDD v0.9）', () => {
+    const id = makeReadyMeeting({
+      overview: '定價會議',
+      topics: [
+        {
+          title: '報價',
+          content: '兩家報價已對齊',
+          points: [
+            { text: 'A 廠報價每套 1,200 元', evidence: { start: 195, end: 220 } },
+            { text: '人工改過、沒有出處的要點', evidence: null },
+          ],
+        },
+        { title: '交期', content: '還在比較', points: [] },
+      ],
+    });
+    projector.project(id);
+    const raw = readOnlyFile(vaultDir);
+    expect(raw).toContain('### 報價\n走到哪：兩家報價已對齊\n- A 廠報價每套 1,200 元 `03:15–03:40`\n- 人工改過、沒有出處的要點\n');
+    // 有 points 但是空的：照新格式只印走到哪；沒有 points 的舊資料在上一條測試（原樣印 content）
+    expect(raw).toContain('### 交期\n走到哪：還在比較\n');
   });
 
   it('人工修正的題目標籤標上來源', () => {

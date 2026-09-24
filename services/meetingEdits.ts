@@ -204,7 +204,10 @@ const isAnalysisV3Shape = (v: unknown): v is AnalysisV3 =>
   && v.contract_version === 3
   && typeof v.overview === 'string'
   && Array.isArray(v.topics)
-  && v.topics.every(t => isObject(t) && typeof t.title === 'string' && typeof t.content === 'string')
+  && v.topics.every(t => isObject(t) && typeof t.title === 'string' && typeof t.content === 'string'
+    // points 選填（SDD v0.9 加的欄位，舊資料沒有）；有的話每點要字串 text 與合法的 evidence
+    && (t.points === undefined
+      || (Array.isArray(t.points) && t.points.every(pt => isObject(pt) && typeof pt.text === 'string' && isEvidence(pt.evidence)))))
   && Array.isArray(v.decisions)
   && v.decisions.every(isDecisionV3)
   && Array.isArray(v.action_items)
@@ -227,7 +230,7 @@ export function patchAnalysisRequest(
     return fail(
       400,
       'analysis 的欄位形狀不是 C-ANALYSIS v3：overview 要字串，topics/decisions/action_items/'
-      + 'open_questions 要陣列，decisions 與 action_items 與 open_questions 每筆的 evidence 要是 '
+      + 'open_questions 要陣列，topics 的 points（有的話）與 decisions、action_items、open_questions 每筆的 evidence 要是 '
       + 'null 或 { start, end }（start <= end），action_items 的 status 是 unknown / open / done 其中之一',
     );
   }

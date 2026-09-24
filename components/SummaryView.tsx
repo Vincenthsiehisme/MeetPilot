@@ -62,6 +62,15 @@ const MetaTags: React.FC<{ parts: (string | null)[] }> = ({ parts }) => {
   );
 };
 
+/** 討論要點的出處：接在文字後面的縮小標籤（vault plan「MeetPilot · 會議記錄結構化與逐點出處」，使用者 2026-09-24 指定） */
+const EvidenceTag: React.FC<{ evidence: Evidence | null }> = ({ evidence }) => {
+  const range = formatEvidence(evidence);
+  if (range === null) return null;
+  return (
+    <span className="shrink-0 mt-1 text-[10px] leading-4 text-slate-500 bg-slate-100 rounded px-1.5 tabular-nums">{range}</span>
+  );
+};
+
 const newDecision = (): DecisionV3 => ({ text: '', evidence: null, decided_by: null });
 
 const newActionItem = (meetingId: string): ActionItemV3 => ({
@@ -113,6 +122,22 @@ const SummaryView: React.FC<SummaryViewProps> = ({ analysis, jobMetadata, onUpda
   const updateTopic = (index: number, key: 'title' | 'content', value: string) => {
     const newTopics = [...analysis.topics];
     newTopics[index] = { ...newTopics[index], [key]: value };
+    updateField('topics', newTopics);
+  };
+  // 要點只改文字、只能刪不能加：出處是唯讀的，新增的要點沒有出處，違反規範「沒出處的不寫」
+  const updateTopicPoint = (topicIndex: number, pointIndex: number, text: string) => {
+    const newTopics = [...analysis.topics];
+    const points = [...(newTopics[topicIndex].points ?? [])];
+    points[pointIndex] = { ...points[pointIndex], text };
+    newTopics[topicIndex] = { ...newTopics[topicIndex], points };
+    updateField('topics', newTopics);
+  };
+  const removeTopicPoint = (topicIndex: number, pointIndex: number) => {
+    const newTopics = [...analysis.topics];
+    newTopics[topicIndex] = {
+      ...newTopics[topicIndex],
+      points: (newTopics[topicIndex].points ?? []).filter((_, j) => j !== pointIndex),
+    };
     updateField('topics', newTopics);
   };
 
@@ -217,8 +242,26 @@ const SummaryView: React.FC<SummaryViewProps> = ({ analysis, jobMetadata, onUpda
                     className="w-full text-slate-600 text-sm leading-7 bg-transparent border-none focus:bg-slate-50 p-2 -ml-2 rounded outline-none whitespace-pre-wrap break-words"
                     value={topic.content}
                     onChange={(e) => updateTopic(i, 'content', e.target.value)}
-                    placeholder="議題內容..."
+                    placeholder={topic.points === undefined ? '議題內容...' : '這個議題走到哪...'}
                   />
+                  {/* 舊資料沒有 points：只有上面那段 content，照原本顯示 */}
+                  {topic.points !== undefined && topic.points.length > 0 && (
+                    <ul className="mt-1 space-y-1.5 topic-points">
+                      {topic.points.map((point, j) => (
+                        <li key={j} className="flex gap-2 items-start group/point">
+                          <span className="text-slate-300 mt-1.5 text-[8px]"><i className="fa-solid fa-circle"></i></span>
+                          <AutoResizeTextarea
+                            rows={1}
+                            className="flex-1 bg-transparent text-slate-700 text-sm leading-relaxed border-b border-transparent focus:border-indigo-200 outline-none rounded-sm px-1 py-0.5 whitespace-pre-wrap break-words"
+                            value={point.text}
+                            onChange={(e) => updateTopicPoint(i, j, e.target.value)}
+                          />
+                          <EvidenceTag evidence={point.evidence} />
+                          <button onClick={() => removeTopicPoint(i, j)} className="opacity-0 group-hover/point:opacity-100 text-slate-300 hover:text-rose-500 pt-1 transition-all" title="刪除這一點"><i className="fa-solid fa-times text-xs"></i></button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
                 </div>
               ))}
               {analysis.topics.length === 0 && <p className="text-xs text-slate-400 italic pl-1">本場沒有討論題目</p>}

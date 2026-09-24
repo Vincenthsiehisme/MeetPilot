@@ -58,7 +58,7 @@ const fakeSlicer = (durationSeconds: number, readSlice?: AudioSlicer['readSlice'
 const analysisOutput: AnalysisModelOutput = {
   title: '預算與時程',
   overview: '一句話主旨',
-  topics: [{ title: '議題 A', content: '內容' }],
+  topics: [{ title: '議題 A', content: '內容', points: [{ text: '要點 A', segment_from: 1, segment_to: 1 }] }],
   decisions: [{ text: '決定 A', segment_from: 1, segment_to: 1, decided_by: null }],
   action_items: [{ text: '待辦 A', segment_from: 1, segment_to: 1, assignee: null, due: null }],
   open_questions: [],
