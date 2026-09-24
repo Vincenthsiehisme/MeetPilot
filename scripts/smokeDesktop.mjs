@@ -8,12 +8,13 @@
 // cwd 對不對、utilityProcess 與 safeStorage 在那個平台能不能用。這支是唯一會真的跑安裝檔內容的檢查，
 // CI 在兩個平台各跑一次；本機只有 macOS，Windows 的結果只有 CI 看得到。
 //
-// 六段，同一份 userData 接著跑（E3 起）：
+// 七段，同一份 userData 接著跑（E3 起）：
 //   1. 首次設定：出現設定頁 → 經 CDP 填邀請碼與資料夾、按儲存 → server 起來，拿到 gateway 的 key 與名單。
 //   2. 離線：gateway 連不上 → server 用上次存的 key 照樣起來，畫面底部有離線橫幅。
 //   2a. 錄音（E4）：經 CDP 按「開始錄音」、選人、確認 → 把視窗關到系統匣 → 段落照常送到 server →
 //       按「停止錄音」→ 收到的段落變成音檔進轉錄，隨附的 ffmpeg 解得出 opus、長度對得上。
 //       麥克風用 Chromium 的假裝置（--use-fake-device-for-media-stream），不碰真的麥克風、不跳系統權限詢問。
+//   2a'. 靜音錄音：假麥克風播一支全是 0 的 WAV → 停止後這場會 FAILED、講「幾乎沒有聲音」，沒有送 Gemini。
 //   2b. 資料夾不見了：上次選的投影資料夾被刪掉 → 回設定頁講原因，不起 server、不重建資料夾。
 //   2c. 更新（E5）：投影資料夾旁邊的 _更新/ 放比這版新的清單與假安裝檔 → 右上角提示安裝新版；
 //       安裝檔改掉一個位元組（大小不變）→ 不給安裝、講出對不上。不真的安裝：假安裝檔不能執行。
@@ -116,14 +117,15 @@ const freePort = () => new Promise((resolve, reject) => {
 
 // ---- 啟動與收掉 app ----
 let app = null; // { child, exited, cdpPort, inspectPort }
-const launch = async () => {
+// extraArgs：靜音錄音段用 --use-file-for-fake-audio-capture 讓假麥克風播一支全是 0 的 WAV
+const launch = async (extraArgs = []) => {
   const cdpPort = await freePort();
   // 主程序的 Node inspector：錄音段要從主程序關視窗（頁面裡的 window.close() 會被 Chromium 擋掉，
   // 不是使用者按關閉鈕那條路）。假麥克風的兩個旗標每一段都帶：沒錄音的段落用不到，也不影響別的行為
   const inspectPort = await freePort();
   const child = spawn(exe, [
     `--remote-debugging-port=${cdpPort}`, `--inspect=${inspectPort}`,
-    '--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream',
+    '--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream', ...extraArgs,
   ], {
     stdio: 'ignore',
     detached: process.platform !== 'win32',
@@ -393,7 +395,8 @@ const settled = await waitFor(phase, '轉錄跑到打 Gemini', async () => {
   const m = (await api('/api/meetings')).meetings.find((x) => x.meeting_id === recording.meeting_id);
   return m.status === 'FAILED' || (m.processed_slices ?? 0) > 0 ? m : null;
 });
-if (settled.status === 'FAILED' && /ffmpeg|ffprobe|長度|切片|remux|音訊/i.test(settled.error ?? '')) {
+// 「沒有聲音」也算：有聲音的錄音被當成靜音擋下來，是這支要抓的誤擋
+if (settled.status === 'FAILED' && /ffmpeg|ffprobe|長度|切片|remux|音訊|沒有聲音/i.test(settled.error ?? '')) {
   await fail(phase, `轉錄在處理音檔時就失敗了，不是在打 Gemini：${settled.error}`);
 }
 if (!readLog().includes('錄音結束（頁面回報）')) await fail(phase, '頁面沒有告訴外殼錄音結束了');
@@ -419,6 +422,58 @@ if (!(decodedSeconds >= minSeconds)) {
 }
 await stop();
 console.log(`[desktop-smoke] ${phase}通過：關到系統匣後段落從 ${chunksAtHide} 段送到 ${chunksHidden} 段以上，停止後進 ${stopped.status}（轉錄停在：${settled.status} ${(settled.error ?? '').slice(0, 80)}），音檔 opus、解出 ${decodedSeconds.toFixed(1)} 秒`);
+
+// ======== 2a'. 靜音錄音 ========
+// 麥克風錄到的全是空白（系統權限沒給、選錯麥克風）：不能送去轉錄，Gemini 會編出不存在的內容（2026-09-24 實機）。
+// 假麥克風播一支全是 0 的 WAV，錄兩段以上、停止 → 這場會要 FAILED 並講「幾乎沒有聲音」
+phase = '靜音錄音';
+const silentWavPath = join(root, 'silence.wav');
+{
+  const seconds = 30;
+  const pcm = Buffer.alloc(16000 * 2 * seconds);
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0, 'ascii'); header.writeUInt32LE(36 + pcm.length, 4); header.write('WAVE', 8, 'ascii');
+  header.write('fmt ', 12, 'ascii'); header.writeUInt32LE(16, 16); header.writeUInt16LE(1, 20); header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(16000, 24); header.writeUInt32LE(32000, 28); header.writeUInt16LE(2, 32); header.writeUInt16LE(16, 34);
+  header.write('data', 36, 'ascii'); header.writeUInt32LE(pcm.length, 40);
+  writeFileSync(silentWavPath, Buffer.concat([header, pcm]));
+}
+const beforeSilent = startCount();
+await launch([`--use-file-for-fake-audio-capture=${silentWavPath}`]);
+const sil = await waitForServer(phase, beforeSilent);
+const silApi = (path) => fetch(`http://127.0.0.1:${sil.port}${path}`, { signal: AbortSignal.timeout(5000) }).then((r) => r.json());
+const silPage = await waitFor(phase, '主視窗換到 server 的頁面', () => findPage((u) => u.startsWith(`http://127.0.0.1:${sil.port}/`)));
+const knownMeetings = new Set((await silApi('/api/meetings')).meetings.map((m) => m.meeting_id));
+await waitFor(phase, '按下「開始錄音」', () => evaluate(silPage, clickButton('開始錄音')));
+await waitFor(phase, '選一位與會者', () => evaluate(silPage, `(() => {
+  const box = document.querySelector('input[type=checkbox]');
+  if (!box) return false;
+  if (!box.checked) box.click();
+  return box.checked;
+})()`));
+await waitFor(phase, '按下確認開始錄音', () => evaluate(silPage, `(() => {
+  const b = [...document.querySelectorAll('button')].find((x) => x.textContent.trim().startsWith('開始錄音（已選') && !x.disabled);
+  if (!b) return false;
+  b.click();
+  return true;
+})()`));
+const silentRec = await waitFor(phase, '收到兩段以上', async () => {
+  const m = (await silApi('/api/meetings')).meetings.find((x) => !knownMeetings.has(x.meeting_id) && x.status === 'RECORDING');
+  return m && m.recording_received_chunks >= 2 ? m : null;
+}, 40_000);
+await waitFor(phase, '按下「停止錄音」', () => evaluate(silPage, clickButton('停止錄音')));
+const silentSettled = await waitFor(phase, '這場會轉錄失敗', async () => {
+  const m = (await silApi('/api/meetings')).meetings.find((x) => x.meeting_id === silentRec.meeting_id);
+  return m.status === 'FAILED' || m.status === 'READY' || m.status === 'LINKED' || (m.processed_slices ?? 0) > 0 ? m : null;
+});
+if (silentSettled.status !== 'FAILED' || !/幾乎沒有聲音/.test(silentSettled.error ?? '')) {
+  await fail(phase, `全是空白的錄音應該在轉錄前就 FAILED、講「幾乎沒有聲音」，實際是 ${silentSettled.status}：${silentSettled.error ?? '（沒有錯誤訊息）'}`);
+}
+if (/"kind":"transcribe"/.test(existsSync(join(userData, 'logs', 'llm.jsonl')) ? readFileSync(join(userData, 'logs', 'llm.jsonl'), 'utf8').split('\n').filter((l) => l.includes(silentRec.meeting_id)).join('\n') : '')) {
+  await fail(phase, '全是空白的錄音還是送去 Gemini 轉錄了');
+}
+await stop();
+console.log(`[desktop-smoke] ${phase}通過：${silentRec.recording_received_chunks} 段空白錄音停在 FAILED：${silentSettled.error.slice(0, 80)}`);
 
 // ======== 2b. 資料夾不見了 ========
 // 共享資料夾被取消同步或刪掉：要回設定頁講原因，不能讓 server 自己建一個不會同步的本機資料夾
@@ -504,5 +559,5 @@ console.log(`[desktop-smoke] ${phase}通過：gateway 回 401 時不起 server�
 gatewayServer.close();
 await sleep(1500);
 cleanup();
-console.log('[desktop-smoke] 通過：首次設定、離線、錄音、資料夾不見了、更新、撤銷六段都對');
+console.log('[desktop-smoke] 通過：首次設定、離線、錄音、靜音錄音、資料夾不見了、更新、撤銷七段都對');
 process.exit(0);
