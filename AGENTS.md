@@ -182,6 +182,19 @@ function f(p: Pick) {
 或 `if (x.ok) {} else {}`**——後兩種在這個 repo 會安靜地把整個 union 留在原地，`tsc` 才會抓到，
 但 `services/` 以外（`App.tsx`、`components/`）沒有 tsc 覆蓋，抓不到就是執行期才炸。
 
+## 桌面 app（`electron/`）
+
+- **打包設定 `asar: false` 是刻意的。** server 用 `process.cwd()` 找 `dist/`（前端）與 `prompts/`（會議記錄規範），
+  外殼把 utilityProcess 的 `cwd` 設成 app 目錄；asar 是虛擬檔案系統，不能當 cwd。要改回 asar，得先讓 server
+  的這兩個路徑改吃環境變數。
+- **Electron 版本釘死（`44.4.5`，不用 `^`）。** `node:sqlite` 能在它的 utilityProcess 裡用是對這一版實測的
+  （Node 24.21.0），升版要重驗。npm 上 44 是最新穩定版，45 還是 alpha。
+- **單一實例不能拿掉。** `jobStore.reclaimAllActive` 建立在同一個 DB 只有一個 process 上。
+- **`electron/serverEnv.ts` 不 import electron**，才測得到；呼叫端環境裡 `MEETPILOT_*`、`HOST`、`PORT`、`GEMINI_API_KEY`
+  一律不往下傳給 server，值只由外殼決定。
+- 打包後的 app 只有 `scripts/smokeDesktop.mjs` 驗得到（CI 的 `desktop` job 兩平台各跑一次）。Windows 的結果只有 CI 看得到。
+- `package.json` 的 `name` 是 `meetpilot`：electron-builder 要求合法的 npm 套件名，中文名不行；產品名在 `build.productName`。
+
 ## 這個 repo 的已知地雷
 
 - `server.ts` 的 middleware 順序有意義：限流 → Basic Auth → **音檔路由** → body parser →

@@ -101,6 +101,29 @@ server 行程自己讀不到（`Operation not permitted`），授權是捷徑 Ap
 
 還沒驗證的：筆電闔上或睡眠時語音備忘錄會不會繼續錄。
 
+## 桌面 app（開發中）
+
+多位記錄人各自在 Mac 或 Windows 上用的版本，Electron 包一層，裡面跑的就是上面這個 server（vault plan
+`MeetPilot · 跨平台打包部署`）。目前做到外殼（E1）：還沒有隨附 ffmpeg、沒有邀請碼設定畫面、沒有 app 內錄音。
+
+```bash
+npm run desktop        # 建置後直接開桌面 app（開發用）
+npm run package:mac    # 產 .dmg（arm64 與 x64），輸出在 release/
+npm run package:win    # 產 .exe 安裝程式（在 Windows 上跑）
+node scripts/smokeDesktop.mjs <打包後的執行檔>   # 啟動打包後的 app，確認裡面的 server 有回應
+```
+
+- server 跑在 Electron 的 `utilityProcess` 裡（`electron/main.ts`），動態 port、只綁 `127.0.0.1`，主視窗載它。
+- 資料全部在 userData：macOS `~/Library/Application Support/MeetPilot`，Windows `%APPDATA%\MeetPilot`。
+  會議 markdown 在設定畫面做好之前先投影到 userData 的 `vault/`，不碰網頁版預設的 `~/MeetPilot Vault`。
+  server 的輸出寫在 userData 的 `logs/server.log`。
+- 關掉視窗只是縮到托盤，托盤選單的「結束 MeetPilot」才會停 server。同時只能開一個。
+- server 掛掉會跳錯誤視窗，顯示結束碼與最後幾行輸出，由使用者選重新啟動或結束，不會安靜重啟。
+- 安裝檔沒有簽章，第一次打開 macOS 要到「系統設定 → 隱私權與安全性」按「仍要打開」，Windows 的 SmartScreen
+  要按「其他資訊 → 仍要執行」。
+- 目前 Gemini key 只從啟動 app 的環境變數 `GEMINI_API_KEY` 讀；從 Finder 或開始選單打開時沒有 key，轉錄會失敗並講原因。
+  改由邀請碼向 gateway 拿是下一步（E3）。
+
 ## 驗證
 
 ```bash

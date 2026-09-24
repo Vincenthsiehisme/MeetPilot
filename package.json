@@ -1,15 +1,20 @@
 {
-  "name": "語音蒟蒻",
+  "name": "meetpilot",
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "main": "dist/electron/main.cjs",
   "scripts": {
     "dev": "tsx --env-file-if-exists=.env server.ts",
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
     "start": "cross-env NODE_ENV=production node --env-file-if-exists=.env dist/server.cjs",
     "preview": "vite preview",
     "lint": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "build:electron": "esbuild electron/main.ts --bundle --platform=node --format=cjs --external:electron --sourcemap --outfile=dist/electron/main.cjs",
+    "desktop": "npm run build && npm run build:electron && electron .",
+    "package:mac": "npm run build && npm run build:electron && electron-builder --mac --publish never",
+    "package:win": "npm run build && npm run build:electron && electron-builder --win --publish never"
   },
   "dependencies": {
     "@google/genai": "^1.38.0",
@@ -25,10 +30,58 @@
     "@types/node": "^22.14.0",
     "@vercel/blob": "^2.8.0",
     "@vitejs/plugin-react": "^5.0.0",
+    "electron": "44.4.5",
+    "electron-builder": "^26.15.3",
     "esbuild": "^0.28.2",
     "tsx": "^4.23.13",
     "typescript": "~5.8.2",
     "vite": "^6.2.0",
     "vitest": "^5.0.0"
+  },
+  "build": {
+    "appId": "com.meetpilot.desktop",
+    "productName": "MeetPilot",
+    "asar": false,
+    "files": [
+      "dist/**",
+      "prompts/**",
+      "electron/assets/**",
+      "package.json",
+      "!dist/**/*.map"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ],
+      "category": "public.app-category.productivity",
+      "identity": null,
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "MeetPilot 需要使用麥克風錄下會議。"
+      }
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
+    }
   }
 }

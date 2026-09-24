@@ -39,3 +39,6 @@ data/
 # 可能含個資的內部資料；從它整理出的題目清單同樣敏感，一律不進版控。
 # 之後要進 repo 的只有去識別化的標註（meeting pair 加黃金答案），屆時用 ! 放行。
 eval-data/
+
+# electron-builder 的輸出（安裝檔），由 CI 產出，不進版控
+release/
