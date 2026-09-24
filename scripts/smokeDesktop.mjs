@@ -19,6 +19,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const TIMEOUT_MS = 60_000;
+// 整支腳本的硬上限：收尾時 app 卡住不結束（例如 macOS 的錯誤對話框卡住主程序）也不能讓 CI 無限等下去。
+// 2026-09-24 CI 的 macOS 那格就這樣卡了 40 分鐘以上
+const WATCHDOG_MS = TIMEOUT_MS + 60_000;
+setTimeout(() => {
+  console.error(`[desktop-smoke] 失敗：超過 ${WATCHDOG_MS / 1000} 秒還沒結束，強制退出`);
+  process.exit(1);
+}, WATCHDOG_MS).unref();
 const exe = process.argv[2];
 if (!exe || !existsSync(exe)) {
   console.error(`[desktop-smoke] 找不到執行檔：${exe}`);
@@ -45,13 +52,24 @@ const child = spawn(exe, [], {
 let exited = null;
 child.on('exit', (code) => { exited = code; });
 
-const stop = () => {
+// 只對主程序送結束訊號，讓它照正常流程（before-quit）先把 server 收掉。對整個行程群組送的話，
+// server 跟主程序同時收到，server 先死，主程序當成崩潰跳錯誤對話框，macOS 的對話框會卡住主程序、
+// 再也處理不到結束訊號。10 秒內沒結束才強制砍整個群組
+const stop = async () => {
   if (exited !== null) return;
-  if (process.platform === 'win32') spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F']);
-  else process.kill(-child.pid, 'SIGTERM');
+  if (process.platform === 'win32') {
+    spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F']);
+    return;
+  }
+  child.kill('SIGTERM');
+  for (let i = 0; i < 20 && exited === null; i += 1) await new Promise((r) => setTimeout(r, 500));
+  if (exited === null) {
+    console.warn('[desktop-smoke] app 10 秒內沒有自己結束，強制砍整個行程群組');
+    try { process.kill(-child.pid, 'SIGKILL'); } catch { /* 已經結束 */ }
+  }
 };
-const fail = (message) => {
-  stop();
+const fail = async (message) => {
+  await stop();
   console.error(`[desktop-smoke] 失敗：${message}\n--- server.log 最後 40 行 ---\n${readLog().split(/\r?\n/).slice(-40).join('\n')}`);
   cleanup();
   process.exit(1);
@@ -61,7 +79,7 @@ const deadline = Date.now() + TIMEOUT_MS;
 let port = null;
 let health = null;
 while (Date.now() < deadline) {
-  if (exited !== null) fail(`app 在 server 就緒之前就結束了（exit ${exited}）`);
+  if (exited !== null) await fail(`app 在 server 就緒之前就結束了（exit ${exited}）`);
   const starts = [...readLog().matchAll(/啟動 server（port (\d+)）/g)];
   if (starts.length > 0) {
     port = starts[starts.length - 1][1];
@@ -74,13 +92,14 @@ while (Date.now() < deadline) {
   }
   await new Promise((r) => setTimeout(r, 1000));
 }
-if (health === null) fail(port === null ? `${TIMEOUT_MS / 1000} 秒內 server.log 沒出現新的啟動紀錄` : `${TIMEOUT_MS / 1000} 秒內 port ${port} 的 /api/health 沒有回 200`);
+if (health === null) await fail(port === null ? `${TIMEOUT_MS / 1000} 秒內 server.log 沒出現新的啟動紀錄` : `${TIMEOUT_MS / 1000} 秒內 port ${port} 的 /api/health 沒有回 200`);
 
 const page = await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(10_000) });
 const html = await page.text();
-if (!page.ok || !html.includes('<div id="root">')) fail(`GET / 回 ${page.status}，內容不是 build 出來的 index.html`);
+if (!page.ok || !html.includes('<div id="root">')) await fail(`GET / 回 ${page.status}，內容不是 build 出來的 index.html`);
 
-stop();
+await stop();
 await new Promise((r) => setTimeout(r, 1500));
 cleanup();
 console.log(`[desktop-smoke] 通過：打包後的 app 在 port ${port} 啟動 server，/api/health 回 ${JSON.stringify(health)}，前端頁正常`);
+process.exit(0);
