@@ -41,11 +41,13 @@ jobs:
           - os: macos-latest
             dir-args: --mac dir --arm64
             exe: release/mac-arm64/MeetPilot.app/Contents/MacOS/MeetPilot
+            bundled-ffmpeg: release/mac-arm64/MeetPilot.app/Contents/Resources/ffmpeg
             dist-args: --mac
             artifact: release/*.dmg
           - os: windows-latest
             dir-args: --win dir --x64
             exe: release/win-unpacked/MeetPilot.exe
+            bundled-ffmpeg: release/win-unpacked/resources/ffmpeg
             dist-args: --win
             artifact: release/*.exe
     runs-on: ${{ matrix.os }}
@@ -64,7 +66,7 @@ jobs:
         id: ffmpeg-cache
         with:
           path: vendor/ffmpeg
-          key: ffmpeg-${{ matrix.os }}-${{ hashFiles('scripts/ffmpeg/**') }}
+          key: ffmpeg-${{ matrix.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ffmpeg/**') }}
       - name: build ffmpeg (macOS arm64 + x64)
         if: runner.os == 'macOS' && steps.ffmpeg-cache.outputs.cache-hit != 'true'
         env:
@@ -99,6 +101,12 @@ jobs:
       - run: npm run build:electron
       - run: npx electron-builder ${{ matrix.dir-args }} --publish never
       - run: node scripts/smokeDesktop.mjs ${{ matrix.exe }}
+      # 打包後那一份 ffmpeg 也實際跑一次：權限、檔案有沒有被完整打進去，只看 log 裡的路徑驗不到
+      - name: verify bundled ffmpeg
+        shell: bash
+        run: |
+          ext=""; [ "$RUNNER_OS" = "Windows" ] && ext=".exe"
+          npx tsx scripts/verifyFfmpeg.ts "${{ matrix.bundled-ffmpeg }}/ffmpeg$ext" "${{ matrix.bundled-ffmpeg }}/ffprobe$ext"
       - run: npx electron-builder ${{ matrix.dist-args }} --publish never
       - uses: actions/upload-artifact@v4
         with:

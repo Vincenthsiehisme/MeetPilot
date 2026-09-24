@@ -236,6 +236,7 @@ async function bootServerIntoWindow(): Promise<void> {
     // 啟動途中使用者按了「結束」：server 是被 before-quit 收掉的，不是壞了，不跳錯誤視窗
     if (quitting) return;
     const failure = err instanceof ServerStartupError ? err : new ServerStartupError(String(err), -1, [String(err)]);
+    writeLog(`--- 啟動失敗：${failure.message} ---\n`);
     await onServerExit(failure.code, failure.lines);
     return;
   }

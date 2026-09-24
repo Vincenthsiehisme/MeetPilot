@@ -57,6 +57,7 @@
         "to": "ffmpeg"
       }
     ],
+    "beforePack": "./scripts/ffmpeg/beforePack.cjs",
     "directories": {
       "output": "release"
     },
