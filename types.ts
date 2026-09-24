@@ -54,8 +54,10 @@ export interface Job {
   processedSlices?: number;
   totalSlices?: number;
   etaSeconds?: number;
-  /** 語音備忘錄開始錄的時間（epoch ms）。只有錄音中的會有值，畫面的錄音計時用它 */
+  /** 開始錄的時間（epoch ms）。只有錄音中的會有值，畫面的錄音計時用它 */
   recordingStartedAt?: number;
+  /** 誰在錄（語音備忘錄或 app 內錄音）。只有錄音中的會有值，畫面講「關掉會不會中斷」要看它 */
+  recordingMethod?: 'voice_memo' | 'in_app';
   steps: {
     name: string;
     status: StepStatus;

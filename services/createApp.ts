@@ -11,10 +11,12 @@
  */
 import express from 'express';
 import { randomUUID } from 'node:crypto';
-import { createReadStream, rmSync } from 'node:fs';
+import { createReadStream, existsSync, rmSync } from 'node:fs';
 import { Readable } from 'node:stream';
 import { Meeting } from '../types';
-import { MeetingView, NameMentionView, audioUploadInFlightError, audioUploadQueuedError } from './meetingApi';
+import {
+  MeetingView, NameMentionView, RECORDING_CHUNK_MAX_BYTES, RecordingMethod, audioUploadInFlightError, audioUploadQueuedError,
+} from './meetingApi';
 import { checkBasicAuth, createRateLimiter, describeBodyParserError, isLoopbackAddress, ListenConfig } from './httpGuards';
 import { LlmLogger } from './llmTelemetry';
 import { MeetingStore } from './meetingStore';
@@ -80,6 +82,12 @@ export interface AppDeps {
    */
   voiceMemoRecorder?: Pick<VoiceMemoRecorder, 'checkAvailability' | 'start' | 'stop' | 'fetchLatestTo' | 'probe'> | null;
   /**
+   * 這台 server 用哪一種方式開始新的錄音（`MEETPILOT_RECORDER`）。預設 `voice_memo`（網頁版）；
+   * 桌面 app 設 `in_app`，錄音由頁面自己用麥克風錄、分段送上來（vault plan「MeetPilot · 跨平台打包部署」E4）。
+   * 只管「開始」：已經在錄的那一場照它開始時的方式收尾，記在 recordings.method
+   */
+  recordingMethod?: RecordingMethod;
+  /**
    * 這個請求是不是從跑 server 的這台機器來（AC-6）。預設看 socket 的來源位址；
    * 測試全部從 127.0.0.1 打進來，注入假的才驗得到「別台電腦」那條
    */
@@ -109,6 +117,7 @@ export function createApp(deps: AppDeps): express.Express {
   const voiceMemoRecorder = deps.voiceMemoRecorder ?? null;
   const isLocalRequest = deps.isLocalRequest ?? ((req: express.Request) => isLoopbackAddress(req.socket.remoteAddress));
   const recordingFetchPolicy = deps.recordingFetchPolicy ?? DEFAULT_RECORDING_FETCH_POLICY;
+  const recordingMethod: RecordingMethod = deps.recordingMethod ?? 'voice_memo';
 
   /**
    * 正在算關聯的會（W4）。同一場會兩個重算請求同時進來時，第二個回 409。
@@ -137,18 +146,25 @@ export function createApp(deps: AppDeps): express.Express {
     } catch {
       hasAudio = false;
     }
-    return { ...meeting, has_audio: hasAudio, recording_started_at: recordingStartedAt(meeting) };
+    const recording = recordingOf(meeting);
+    return {
+      ...meeting,
+      has_audio: hasAudio,
+      recording_started_at: recording?.started_at ?? null,
+      recording_method: recording?.method ?? null,
+      recording_received_chunks: recording !== null && recording.method === 'in_app' ? recording.received_chunks : null,
+    };
   };
 
-  // RECORDING 一定有開始時間：startRecording 在同一個交易裡寫狀態與起訖紀錄。
+  // RECORDING 一定有起訖紀錄：startRecording 在同一個交易裡寫狀態與起訖紀錄。
   // 對不上代表資料庫被別的東西改過，畫面接不回計時、停止時也沒得比對，直接講出來
-  const recordingStartedAt = (meeting: Meeting): number | null => {
+  const recordingOf = (meeting: Meeting) => {
     if (meeting.status !== 'RECORDING') return null;
     const recording = meetingStore.getRecording(meeting.meeting_id);
     if (!recording) {
-      throw new Error(`Meeting ${meeting.meeting_id} 是 RECORDING，但 voice_memo_recordings 沒有它的開始時間`);
+      throw new Error(`Meeting ${meeting.meeting_id} 是 RECORDING，但 recordings 沒有它的開始時間`);
     }
-    return recording.started_at;
+    return recording;
   };
 
   const listNameMentionViews = (meetingId: string): NameMentionView[] => {
@@ -188,6 +204,12 @@ export function createApp(deps: AppDeps): express.Express {
    * 取檔那一步分不出「最新一支」是誰的，所以整台 server 同一時間只准一個開始／停止在跑。
    */
   let recorderBusy: string | null = null;
+
+  /**
+   * 正在寫分段的會（app 內錄音）。前端一次只送一段，但重試時上一個請求可能還在 server 這頭寫；
+   * 兩個寫入同時截檔再寫，同一段會出現兩次或互相蓋掉
+   */
+  const chunkWriting = new Set<string>();
 
   /**
    * 把一條音檔位元組流收成這場會的音檔。PUT audio 與錄音停止共用這一段，
@@ -319,6 +341,62 @@ export function createApp(deps: AppDeps): express.Express {
       res.status(202).json({ meeting: toView(meetingStore.getMeeting(meetingId)!) });
     } catch (err) {
       handleStoreError(err, res);
+    }
+  });
+
+  // app 內錄音的一段（vault plan「MeetPilot · 跨平台打包部署」E4）。跟 PUT audio 同一個理由掛在 body parser 之前：
+  // body 是原始的 webm 位元組，不經 express.json。前端每 10 秒送一段、一次只送一段，送不到就重送同一段。
+  //
+  // 段號是冪等的關鍵：比已收到的小就是重送（上一次其實寫進去了、只是回應沒送到），直接回目前進度；
+  // 比已收到的大代表中間缺段，拒收並講出 server 要的是第幾段，不接一個缺了中間的檔。
+  app.put('/api/meetings/:id/recording/chunks/:seq', async (req, res) => {
+    if (!isLocalRequest(req)) return res.status(403).json({ error: REMOTE_RECORDING_REASON });
+    const meetingId = req.params.id;
+    if (!/^\d+$/.test(req.params.seq)) {
+      return res.status(400).json({ error: `段號必須是非負整數，收到 ${JSON.stringify(req.params.seq)}` });
+    }
+    const seq = Number(req.params.seq);
+    // 這一段到 chunkWriting.add 之間沒有 await，「檢查再加入」是原子的（同 PUT audio 的 uploading）
+    // 503 不是 409：這是「等一下就好」，前端的分段上傳看到 5xx 會照 Retry-After 重送，409 會停下來當成被拒收
+    if (chunkWriting.has(meetingId)) {
+      res.setHeader('Retry-After', '1');
+      return res.status(503).json({ error: `Meeting ${meetingId} 的上一段錄音還在寫，等它寫完再送` });
+    }
+    chunkWriting.add(meetingId);
+    try {
+      const meeting = meetingStore.getMeeting(meetingId);
+      if (!meeting) return res.status(404).json({ error: `找不到 Meeting ${meetingId}` });
+      if (meeting.status !== 'RECORDING') {
+        return res.status(409).json({ error: `Meeting ${meetingId} 目前是 ${meeting.status}，不在錄音中，不收錄音段落` });
+      }
+      const recording = recordingOf(meeting)!;
+      if (recording.method !== 'in_app') {
+        return res.status(409).json({ error: `Meeting ${meetingId} 是語音備忘錄在錄，不收 app 送來的錄音段落` });
+      }
+      if (recording.stopped_at !== null) {
+        return res.status(409).json({ error: `Meeting ${meetingId} 的錄音已經停止，不再收錄音段落` });
+      }
+      if (seq < recording.received_chunks) {
+        return res.json({ received_chunks: recording.received_chunks, received_bytes: recording.received_bytes });
+      }
+      if (seq > recording.received_chunks) {
+        return res.status(409).json({
+          error: `Meeting ${meetingId} 的錄音段落跳號：server 收到 ${recording.received_chunks} 段，`
+            + `下一段應該是第 ${recording.received_chunks} 段，這次送來的是第 ${seq} 段`,
+        });
+      }
+      const body = await readBodyUpTo(req, RECORDING_CHUNK_MAX_BYTES);
+      if (body === null) {
+        return res.status(413).json({ error: `一段錄音超過 ${RECORDING_CHUNK_MAX_BYTES} bytes，不收` });
+      }
+      if (body.length === 0) return res.status(400).json({ error: `第 ${seq} 段錄音是空的` });
+      const bytesAfter = audioStore.appendRecordingChunk(meetingId, recording.received_bytes, body);
+      const updated = meetingStore.recordChunkReceived(meetingId, seq, bytesAfter);
+      res.json({ received_chunks: updated.received_chunks, received_bytes: updated.received_bytes });
+    } catch (err) {
+      handleStoreError(err, res);
+    } finally {
+      chunkWriting.delete(meetingId);
     }
   });
 
@@ -491,6 +569,50 @@ export function createApp(deps: AppDeps): express.Express {
   const wait = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 
   /**
+   * 把請求 body 讀成 Buffer，超過 maxBytes 就回 null（呼叫端回 413）。只給錄音段落用：一段只有幾十 KB，
+   * 讀進記憶體比串流寫檔簡單，而且要先確定整段收完才能截檔、寫入、記進度，收到一半的段落不能寫進去。
+   * 請求中途斷掉要拋錯，不能把收到的一半當成完整的一段
+   */
+  const readBodyUpTo = (req: express.Request, maxBytes: number): Promise<Buffer | null> =>
+    new Promise((resolve, reject) => {
+      const declared = Number(req.headers['content-length']);
+      if (Number.isFinite(declared) && declared > maxBytes) {
+        req.resume();
+        resolve(null);
+        return;
+      }
+      const parts: Buffer[] = [];
+      let total = 0;
+      let settled = false;
+      req.on('data', (chunk: Buffer) => {
+        if (settled) return;
+        total += chunk.length;
+        if (total > maxBytes) {
+          settled = true;
+          req.resume();
+          resolve(null);
+          return;
+        }
+        parts.push(chunk);
+      });
+      req.on('end', () => {
+        if (settled) return;
+        settled = true;
+        resolve(Buffer.concat(parts));
+      });
+      req.on('error', (err) => {
+        if (settled) return;
+        settled = true;
+        reject(err);
+      });
+      req.on('close', () => {
+        if (settled) return;
+        settled = true;
+        reject(new Error('錄音段落的請求沒送完就斷了'));
+      });
+    });
+
+  /**
    * 取檔、讀長度、比對，對不上就等一下再取。最後一次的失敗原因原樣回傳，不改寫成籠統的「失敗」：
    * 使用者要靠那句話判斷是捷徑設錯、檔案還沒寫完，還是最新一支根本不是這場會的。
    */
@@ -520,44 +642,74 @@ export function createApp(deps: AppDeps): express.Express {
     // 這條不回 403：它本來就是用來回答「能不能錄、為什麼不能」的，別台電腦開頁面時
     // 錄音按鍵要能講出原因，而不是一個讀不到狀態的錯誤
     if (!isLocalRequest(req)) return res.json({ available: false, reason: REMOTE_RECORDING_REASON });
+    // app 內錄音的麥克風只有頁面問得到瀏覽器，server 這頭沒有東西可以查
+    if (recordingMethod === 'in_app') return res.json({ available: true, method: 'in_app' });
     if (!voiceMemoRecorder) return res.json({ available: false, reason: '這台 server 沒有接語音備忘錄錄音' });
     try {
-      res.json(await voiceMemoRecorder.checkAvailability());
+      const availability = await voiceMemoRecorder.checkAvailability();
+      res.json(availability.available === true ? { available: true, method: 'voice_memo' } : availability);
     } catch (err) {
       handleStoreError(err, res);
     }
   });
 
+  /**
+   * 這場會現在能不能開始錄，不能就回原因（兩種錄音方式共用）。回 null 代表可以。
+   *
+   * 只有「建立了、還沒有音檔」的會能開始錄。CREATED ＋ 有音檔是 retry 之後在排隊的會，
+   * 在那上面錄音，停止時收檔會把 retry 刻意保留的逐字稿與游標整個清掉。
+   * 一次只能錄一場：語音備忘錄第二場也開始的話，兩場停止時取到的「最新一支」會是同一個檔；
+   * app 內錄音只有一支麥克風、一個錄音按鍵，第二場只可能是另一個視窗誤按
+   */
+  const cannotStartRecording = (meetingId: string, meeting: Meeting): string | null => {
+    if (meeting.status !== 'CREATED' || audioStore.exists(meetingId)
+      || uploading.has(meetingId) || transcriptionQueue.has(meetingId)) {
+      return `Meeting ${meetingId} 目前是 ${meeting.status}，只有剛建立、還沒有音檔的會能開始錄音`;
+    }
+    const others = meetingStore.listRecordingMeetings().filter(m => m.meeting_id !== meetingId);
+    if (others.length > 0) {
+      const who = recordingMethod === 'in_app' ? 'MeetPilot' : '語音備忘錄';
+      return `${who}一次只能錄一場，Meeting ${others[0].meeting_id} 還在錄，先停止它`;
+    }
+    return null;
+  };
+
   app.post('/api/meetings/:id/recording/start', async (req, res) => {
+    const meetingId = req.params.id;
+    if (recordingMethod === 'in_app') {
+      // app 內錄音：麥克風在頁面手上，server 只記開始時間，之後收分段。頁面先拿到麥克風才建會議、呼叫這支，
+      // 所以這裡沒有「叫錄音程式失敗」要退回的情況
+      if (!isLocalRequest(req)) return res.status(403).json({ error: REMOTE_RECORDING_REASON });
+      try {
+        const meeting = meetingStore.getMeeting(meetingId);
+        if (!meeting) return res.status(404).json({ error: `找不到 Meeting ${meetingId}` });
+        const reason = cannotStartRecording(meetingId, meeting);
+        if (reason !== null) return res.status(409).json({ error: reason });
+        // 上一次同一場會開始後又被退回 CREATED 的話可能留著舊段落；第 0 段會整個蓋掉，這裡先清，
+        // 不讓一個跟這次無關的檔在第 0 段送到之前被當成這場的錄音
+        audioStore.removeRecording(meetingId);
+        meetingStore.startRecording(meetingId, Date.now(), 'in_app');
+        return res.json({ meeting: toView(meetingStore.getMeeting(meetingId)!) });
+      } catch (err) {
+        return handleStoreError(err, res);
+      }
+    }
+
     const recorder = recorderFor(req, res);
     if (!recorder) return;
-    const meetingId = req.params.id;
     if (recorderBusy !== null) return res.status(409).json({ error: recorderBusyError() });
 
     try {
       const meeting = meetingStore.getMeeting(meetingId);
       if (!meeting) return res.status(404).json({ error: `找不到 Meeting ${meetingId}` });
-      // 只有「建立了、還沒有音檔」的會能開始錄。CREATED ＋ 有音檔是 retry 之後在排隊的會，
-      // 在那上面錄音，停止時收檔會把 retry 刻意保留的逐字稿與游標整個清掉
-      if (meeting.status !== 'CREATED' || audioStore.exists(meetingId)
-        || uploading.has(meetingId) || transcriptionQueue.has(meetingId)) {
-        return res.status(409).json({
-          error: `Meeting ${meetingId} 目前是 ${meeting.status}，只有剛建立、還沒有音檔的會能開始錄音`,
-        });
-      }
-      // 語音備忘錄一次只錄一支。第二場也開始的話，兩場停止時取到的「最新一支」會是同一個檔
-      const others = meetingStore.listRecordingMeetings().filter(m => m.meeting_id !== meetingId);
-      if (others.length > 0) {
-        return res.status(409).json({
-          error: `語音備忘錄一次只能錄一場，Meeting ${others[0].meeting_id} 還在錄，先停止它`,
-        });
-      }
+      const reason = cannotStartRecording(meetingId, meeting);
+      if (reason !== null) return res.status(409).json({ error: reason });
 
       recorderBusy = meetingId;
       try {
         // 先落地再叫語音備忘錄：反過來的話，叫成功之後寫資料庫失敗，語音備忘錄就在錄一支
         // 沒有任何會議認領的錄音，畫面上也沒有停止按鍵
-        meetingStore.startRecording(meetingId, Date.now());
+        meetingStore.startRecording(meetingId, Date.now(), 'voice_memo');
         try {
           await recorder.start();
         } catch (err) {
@@ -576,11 +728,68 @@ export function createApp(deps: AppDeps): express.Express {
     }
   });
 
+  /**
+   * 收尾一場 app 內錄音：把收到的段落變成這場會的音檔、進轉錄（E4）。
+   *
+   * body 一定要講是哪一種收尾（契約見 meetingApi 的 StopInAppRecordingRequest）：正常停止帶段數，
+   * server 收到的對不上就拒收、狀態不動，前端把沒送到的補送完再停一次；救回中斷的錄音帶 partial，
+   * 收到幾段送幾段。一段都沒有的話沒東西可轉，退回 CREATED 讓使用者刪掉或補音檔。
+   */
+  const finishInAppRecording = (
+    req: express.Request, res: express.Response, meetingId: string,
+    recording: NonNullable<ReturnType<typeof recordingOf>>,
+  ) => {
+    const body = req.body ?? {};
+    const partial = body.partial === true;
+    const expected = body.chunks;
+    if (!partial && !(Number.isInteger(expected) && expected >= 0)) {
+      return res.status(400).json({
+        error: '停止 app 內錄音要帶 chunks（這次一共錄了幾段）或 partial: true（救回中斷的錄音），兩個都沒有',
+      });
+    }
+    if (!partial && expected !== recording.received_chunks) {
+      return res.status(409).json({
+        error: `錄音還沒送完：這次錄了 ${expected} 段，server 只收到 ${recording.received_chunks} 段。`
+          + '沒送到的段落還在這個視窗裡，送完之後再停止一次',
+      });
+    }
+    if (chunkWriting.has(meetingId)) {
+      return res.status(409).json({ error: `Meeting ${meetingId} 的最後一段錄音還在寫，等它寫完再停止` });
+    }
+    // 停止時間只在第一次收尾時記：上一次收尾記下停止時間之後才失敗（例如錄音檔比收到的短）的話，
+    // 再按一次停止要能照常走完或講出同一個原因，不能每次都卡在「已經停過、記不下停止時間」
+    if (recording.stopped_at === null) meetingStore.markRecordingStopped(meetingId, Date.now());
+    if (recording.received_chunks === 0) {
+      meetingStore.setStatus(meetingId, 'CREATED', Date.now());
+      audioStore.removeRecording(meetingId);
+      return res.status(422).json({
+        error: '這場錄音一段都沒有送到 server，沒有東西可以轉錄。這場會已經退回「等待音檔」，'
+          + '可以刪掉它，或用「補上音檔」選一個檔送出',
+      });
+    }
+    // 收過段落、錄音檔跟音檔卻都不在（斷電時新檔的目錄項沒落盤、被人刪掉）：段落已經沒了，救不回來。
+    // 跟一段都沒有同一個出口，不然每次收尾都是 500，這場會只剩刪除一條路（fable review）
+    if (!existsSync(audioStore.recordingPathFor(meetingId)) && !audioStore.exists(meetingId)) {
+      meetingStore.setStatus(meetingId, 'CREATED', Date.now());
+      return res.status(422).json({
+        error: `server 記得收過 ${recording.received_chunks} 段錄音，但錄音檔不見了，這些段落救不回來。`
+          + '這場會已經退回「等待音檔」，可以刪掉它，或用「補上音檔」選一個檔送出',
+      });
+    }
+
+    // 清游標與舊逐字稿在收檔之前，理由同 PUT audio 的註解（saveIncomingAudio）
+    meetingStore.resetTranscriptionProgress(meetingId, Date.now());
+    const saved = audioStore.promoteRecording(meetingId, recording.received_bytes);
+    meetingStore.setSourceFileSize(meetingId, saved.bytes, Date.now());
+    meetingStore.setStatus(meetingId, 'TRANSCRIBING', Date.now());
+    transcriptionQueue.enqueue(meetingId);
+    // 理由同 PUT audio：enqueue 可能已經把狀態往前推，回應前重讀一次
+    return res.status(202).json({ meeting: toView(meetingStore.getMeeting(meetingId)!) });
+  };
+
   app.post('/api/meetings/:id/recording/stop', async (req, res) => {
-    const recorder = recorderFor(req, res);
-    if (!recorder) return;
     const meetingId = req.params.id;
-    if (recorderBusy !== null) return res.status(409).json({ error: recorderBusyError() });
+    if (!isLocalRequest(req)) return res.status(403).json({ error: REMOTE_RECORDING_REASON });
 
     try {
       const meeting = meetingStore.getMeeting(meetingId);
@@ -588,10 +797,14 @@ export function createApp(deps: AppDeps): express.Express {
       if (meeting.status !== 'RECORDING') {
         return res.status(409).json({ error: `Meeting ${meetingId} 目前是 ${meeting.status}，不在錄音中` });
       }
-      const recording = meetingStore.getRecording(meetingId);
-      if (!recording) {
-        throw new Error(`Meeting ${meetingId} 是 RECORDING，但 voice_memo_recordings 沒有它的開始時間`);
-      }
+      const recording = recordingOf(meeting)!;
+      // 照這場開始時的方式收尾，不看 server 現在的設定：換過 MEETPILOT_RECORDER 之後重開，
+      // 上一次沒停的那場還是要照原本的方式收
+      if (recording.method === 'in_app') return finishInAppRecording(req, res, meetingId, recording);
+
+      const recorder = recorderFor(req, res);
+      if (!recorder) return;
+      if (recorderBusy !== null) return res.status(409).json({ error: recorderBusyError() });
 
       recorderBusy = meetingId;
       const tempPath = audioStore.tempPathFor(meetingId);
@@ -897,7 +1110,13 @@ export function createApp(deps: AppDeps): express.Express {
     const meetingId = req.params.id;
     try {
       const meeting = meetingStore.getMeeting(meetingId);
-      if (meeting?.status === 'RECORDING') {
+      // app 內錄音在頁面手上，server 叫不動也不用叫：頁面刪除前自己停掉麥克風，已送到的段落跟著會議一起刪。
+      // 但有一段正在寫就不刪：它寫完會在會議刪掉之後重建 `<id>.recording`，變成沒有任何清理路徑認領的檔（Codex review）
+      if (meeting?.status === 'RECORDING' && chunkWriting.has(meetingId)) {
+        res.setHeader('Retry-After', '1');
+        return res.status(503).json({ error: `Meeting ${meetingId} 有一段錄音正在寫，等它寫完再刪` });
+      }
+      if (meeting?.status === 'RECORDING' && recordingOf(meeting)!.method === 'voice_memo') {
         const recorder = recorderFor(req, res);
         if (!recorder) return;
         if (recorderBusy !== null) return res.status(409).json({ error: recorderBusyError() });

@@ -13,7 +13,7 @@ import { randomUUID } from 'node:crypto';
 import { Meeting, TranscriptSegment } from '../types';
 import { AnalysisV3, isAnalysisV3SemanticallyEmpty, upgradeAnalysisV2ToV3 } from './analysisContract';
 import { MigrationRecord } from './jobMigration';
-import { SeamReportEntry } from './meetingApi';
+import { RecordingMethod, SeamReportEntry } from './meetingApi';
 import { MeetingStatus, assertTransition, isMeetingStatus } from './meetingState';
 import {
   MATCH_KEY_VERSION,
@@ -155,14 +155,18 @@ export interface LinkWriteReport {
 }
 
 /**
- * 一場由錄音按鍵開始的會（`voice_memo_recordings`，vault plan「MeetPilot · 網頁錄音」）。stopped_at 是 null 代表還在錄。
+ * 一場由錄音按鍵開始的會（`recordings`）。stopped_at 是 null 代表還在錄。
+ * received_chunks／received_bytes 只有 in_app 會動，是「已經確定寫進 `<id>.recording`」的進度；voice_memo 一律是 0。
  * 寫成 type 不寫 interface：node:sqlite 回帶 index signature 的 Record，interface 沒有隱式 index signature，
  * 直接轉型會被 tsc 擋（同檔 MeetingRow 的做法）
  */
-export type VoiceMemoRecording = {
+export type Recording = {
   meeting_id: string;
   started_at: number;
   stopped_at: number | null;
+  method: RecordingMethod;
+  received_chunks: number;
+  received_bytes: number;
 };
 
 export interface CreateMeetingInput {
@@ -588,17 +592,20 @@ export const createMeetingStore = (db: DatabaseSync) => {
      * 停止時也沒有東西可以拿來比對取回的檔案長度（AC-3），只能整場當成失敗。
      *
      * 同一場會可能第二次開始錄（上一次叫語音備忘錄失敗、退回 CREATED 之後重按），
-     * 那時舊列要整個換成這一次的：留著上一次的 started_at，長度比對會拿錯的起點算。
+     * 那時舊列要整個換成這一次的：留著上一次的 started_at，長度比對會拿錯的起點算；
+     * 留著上一次的 received_chunks，第一段就會被當成跳號擋掉。
      */
-    startRecording: (id: string, startedAt: number): Meeting => {
+    startRecording: (id: string, startedAt: number, method: RecordingMethod): Meeting => {
       const current = requireMeeting(id);
       assertTransition(id, current.status, 'RECORDING');
       db.exec('BEGIN');
       try {
         db.prepare(`
-          INSERT INTO voice_memo_recordings (meeting_id, started_at, stopped_at) VALUES (?, ?, NULL)
-          ON CONFLICT(meeting_id) DO UPDATE SET started_at = excluded.started_at, stopped_at = NULL
-        `).run(id, startedAt);
+          INSERT INTO recordings (meeting_id, started_at, stopped_at, method, received_chunks, received_bytes)
+          VALUES (?, ?, NULL, ?, 0, 0)
+          ON CONFLICT(meeting_id) DO UPDATE SET started_at = excluded.started_at, stopped_at = NULL,
+            method = excluded.method, received_chunks = 0, received_bytes = 0
+        `).run(id, startedAt, method);
         db.prepare('UPDATE meetings SET status = ?, updated_at = ?, error = NULL WHERE meeting_id = ?')
           .run('RECORDING', startedAt, id);
         db.exec('COMMIT');
@@ -620,7 +627,7 @@ export const createMeetingStore = (db: DatabaseSync) => {
       assertTransition(id, current.status, 'CREATED');
       db.exec('BEGIN');
       try {
-        db.prepare('DELETE FROM voice_memo_recordings WHERE meeting_id = ?').run(id);
+        db.prepare('DELETE FROM recordings WHERE meeting_id = ?').run(id);
         db.prepare('UPDATE meetings SET status = ?, updated_at = ?, error = NULL WHERE meeting_id = ?')
           .run('CREATED', updatedAt, id);
         db.exec('COMMIT');
@@ -631,9 +638,37 @@ export const createMeetingStore = (db: DatabaseSync) => {
       return requireMeeting(id);
     },
 
-    getRecording: (id: string): VoiceMemoRecording | null =>
-      (db.prepare('SELECT meeting_id, started_at, stopped_at FROM voice_memo_recordings WHERE meeting_id = ?')
-        .get(id) as VoiceMemoRecording | undefined) ?? null,
+    getRecording: (id: string): Recording | null => {
+      const row = db.prepare(
+        'SELECT meeting_id, started_at, stopped_at, method, received_chunks, received_bytes FROM recordings WHERE meeting_id = ?',
+      ).get(id) as Recording | undefined;
+      if (!row) return null;
+      // CHECK 擋得住新寫入，擋不住被別的東西改過的檔案；認不得的來源不能當成語音備忘錄，
+      // 停止路由會照它決定要叫語音備忘錄還是收分段
+      if (row.method !== 'voice_memo' && row.method !== 'in_app') {
+        throw new Error(`Meeting ${id} 的錄音來源是 ${JSON.stringify(row.method)}，不是 voice_memo 或 in_app`);
+      }
+      return row;
+    },
+
+    /**
+     * 記下一段錄音已經寫進檔案（in_app）。只接「下一段」：received_chunks 要剛好等於 seq。
+     *
+     * 呼叫端先寫檔、再呼叫這支；寫不到（段號不對、不是 in_app、已經停了）一律拋錯。
+     * 當成功的話 DB 的進度會落後檔案，下一段寫進來前截檔時會把剛寫的那段截掉，而前端以為它送到了。
+     */
+    recordChunkReceived: (id: string, seq: number, bytesAfter: number): Recording => {
+      const result = db.prepare(`
+        UPDATE recordings SET received_chunks = received_chunks + 1, received_bytes = ?
+        WHERE meeting_id = ? AND method = 'in_app' AND stopped_at IS NULL AND received_chunks = ?
+      `).run(bytesAfter, id, seq);
+      if (result.changes !== 1) {
+        throw new Error(`Meeting ${id} 記不下第 ${seq} 段錄音：沒有進行中的 app 內錄音，或段號跟已收到的對不上`);
+      }
+      return (db.prepare(
+        'SELECT meeting_id, started_at, stopped_at, method, received_chunks, received_bytes FROM recordings WHERE meeting_id = ?',
+      ).get(id) as Recording);
+    },
 
     /**
      * 記下停止時間。只收還在錄的那一列：已經停過的再寫一次會把第一次的停止時間蓋掉，
@@ -641,14 +676,14 @@ export const createMeetingStore = (db: DatabaseSync) => {
      */
     markRecordingStopped: (id: string, stoppedAt: number): void => {
       const result = db.prepare(
-        'UPDATE voice_memo_recordings SET stopped_at = ? WHERE meeting_id = ? AND stopped_at IS NULL',
+        'UPDATE recordings SET stopped_at = ? WHERE meeting_id = ? AND stopped_at IS NULL',
       ).run(stoppedAt, id);
       if (result.changes !== 1) {
         throw new Error(`Meeting ${id} 沒有進行中的錄音紀錄，無法記下停止時間`);
       }
     },
 
-    /** 正在錄音的會。語音備忘錄一次只能錄一支，開始錄音前靠它擋掉第二場 */
+    /** 正在錄音的會。麥克風與語音備忘錄一次都只錄一場，開始錄音前靠它擋掉第二場 */
     listRecordingMeetings: (): Meeting[] =>
       (db.prepare("SELECT * FROM meetings WHERE status = 'RECORDING' ORDER BY created_at, meeting_id").all() as MeetingRow[])
         .map(toMeeting),

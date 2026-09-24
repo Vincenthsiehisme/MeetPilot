@@ -40,6 +40,10 @@ const fakeAudioStore = (present: Set<string>): AudioFileStore => ({
   saveFrom: async (id: string) => { present.add(id); return { path: `/fake/audio/${id}.audio`, bytes: 1024 }; },
   removePartialUploads: () => [],
   remove: (id: string) => { present.delete(id); },
+  recordingPathFor: (id: string) => `/fake/audio/${id}.recording`,
+  appendRecordingChunk: () => { throw new Error('這支測試用不到 app 內錄音'); },
+  promoteRecording: () => { throw new Error('這支測試用不到 app 內錄音'); },
+  removeRecording: () => {},
 });
 
 const fakeSlicer = (durationSeconds: number, readSlice?: AudioSlicer['readSlice']): AudioSlicer => ({
@@ -1478,6 +1482,10 @@ const createAudioFileStoreStub = (): AudioFileStore => ({
   saveFrom: async () => ({ path: '', bytes: 0 }),
   removePartialUploads: () => [],
   remove: () => {},
+  recordingPathFor: (id: string) => `/fake/audio/${id}.recording`,
+  appendRecordingChunk: () => { throw new Error('這支測試用不到 app 內錄音'); },
+  promoteRecording: () => { throw new Error('這支測試用不到 app 內錄音'); },
+  removeRecording: () => {},
 });
 
 describe('run：關聯接在 READY 之後（W4）', () => {

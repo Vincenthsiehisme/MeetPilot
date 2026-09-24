@@ -12,6 +12,10 @@ interface ParticipantPickerProps {
   onCancel: () => void;
   /** 確認按鈕上的動作。預設「建立會議」；從錄音按鍵進來時是「開始錄音」，按下去就真的開始錄 */
   confirmVerb?: string;
+  /** 放在按鈕上方的額外欄位（app 內錄音的麥克風選單，E4） */
+  extra?: React.ReactNode;
+  /** 還不能確認的原因（例如麥克風還沒讀到）。有值時確認按鈕停用、上面寫這個原因 */
+  confirmBlockedReason?: string | null;
 }
 
 /**
@@ -19,7 +23,7 @@ interface ParticipantPickerProps {
  * 388 人的名單需要搜尋才選得動，純捲動清單不夠用。
  */
 const ParticipantPicker: React.FC<ParticipantPickerProps> = ({
-  isOpen, people, loadError, onRetry, onConfirm, onCancel, confirmVerb = '建立會議',
+  isOpen, people, loadError, onRetry, onConfirm, onCancel, confirmVerb = '建立會議', extra, confirmBlockedReason = null,
 }) => {
   const [query, setQuery] = useState('');
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -135,6 +139,8 @@ const ParticipantPicker: React.FC<ParticipantPickerProps> = ({
               )}
             </div>
 
+            {extra}
+
             <div className="flex border-t border-slate-100">
               <button
                 onClick={onCancel}
@@ -144,10 +150,12 @@ const ParticipantPicker: React.FC<ParticipantPickerProps> = ({
               </button>
               <button
                 onClick={() => onConfirm(Array.from(selected))}
-                disabled={selected.size === 0}
+                disabled={selected.size === 0 || confirmBlockedReason !== null}
                 className="flex-1 px-6 py-4 text-sm font-bold text-indigo-600 hover:bg-indigo-50 transition-colors disabled:text-slate-300 disabled:hover:bg-transparent disabled:cursor-not-allowed"
               >
-                {selected.size === 0 ? '至少選一位' : `${confirmVerb}（已選 ${selected.size} 位）`}
+                {selected.size === 0
+                  ? '至少選一位'
+                  : confirmBlockedReason !== null ? confirmBlockedReason : `${confirmVerb}（已選 ${selected.size} 位）`}
               </button>
             </div>
           </motion.div>

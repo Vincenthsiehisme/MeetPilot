@@ -375,6 +375,21 @@ const MIGRATIONS: readonly string[] = [
     stopped_at INTEGER
   );
   `,
+  // 桌面 app 自己錄音（vault plan「MeetPilot · 跨平台打包部署」E4）：同一場會的起訖紀錄多了一種來源。
+  //
+  // 沿用同一張表、不另開：一場 RECORDING 的會只會有一列起訖紀錄，分兩張表的話「現在在錄的是誰、
+  // 從什麼時候開始」要兩邊一起查，只查一邊的地方就會漏。所以改名成 recordings，加上 method。
+  // 既有的列都是語音備忘錄錄的，DEFAULT 'voice_memo' 就是它們的正確值。
+  //
+  // received_chunks／received_bytes 只有 in_app 用：前端每 10 秒送一段，server 附加到 `<id>.recording`。
+  // 兩個數字是「已經確定寫進檔案」的進度：寫檔之前先把檔案截到 received_bytes，寫完才更新這兩欄，
+  // 斷在中間（server 掛掉、請求中斷）時前端重送同一段不會變成重複的資料。
+  `
+  ALTER TABLE voice_memo_recordings RENAME TO recordings;
+  ALTER TABLE recordings ADD COLUMN method TEXT NOT NULL DEFAULT 'voice_memo' CHECK (method IN ('voice_memo', 'in_app'));
+  ALTER TABLE recordings ADD COLUMN received_chunks INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE recordings ADD COLUMN received_bytes INTEGER NOT NULL DEFAULT 0;
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

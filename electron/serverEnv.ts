@@ -10,6 +10,7 @@
  * - 投影資料夾由 E3 的設定頁讓記錄人自己選（通常是共享資料夾）。沒指定時放 userData，不用 server 的預設
  *   `~/MeetPilot Vault`：同一台機器上跑著網頁版的話，兩個各有資料庫的 server 會寫進同一個資料夾，
  *   投影器處理檔名衝突時會改名既有檔案。
+ * - 錄音走 app 內錄音（`MEETPILOT_RECORDER=in-app`，E4），限流放寬到每分鐘 600 次（理由見下方）。
  * - 名單由外殼從 gateway 拿、寫成 userData 的 roster.json，以 `MEETPILOT_ROSTER_DOCUMENT` 交給 server 每次啟動匯入。
  * - 呼叫端環境裡跟 server 設定同名的變數（使用者機器上剛好設了 PORT、HOST、MEETPILOT_DB 之類）
  *   一律不往下傳：桌面 app 的行為不能因為使用者的 shell 設定而改變，而且那種錯很難從畫面上看出來。
@@ -54,6 +55,11 @@ export function buildServerEnv(input: ServerEnvInput): Record<string, string> {
     MEETPILOT_AUDIO_DIR: join(input.userDataDir, 'audio'),
     MEETPILOT_LLM_LOG: join(input.userDataDir, 'logs', 'llm.jsonl'),
     MEETPILOT_VAULT: input.vaultDir ?? join(input.userDataDir, 'vault'),
+    // 錄音由 app 自己的視窗用麥克風錄（E4），不叫語音備忘錄：Windows 沒有，Mac 上也要每人手建三個捷徑
+    MEETPILOT_RECORDER: 'in-app',
+    // 限流是給對外開放的網頁版擋濫用的。桌面版只綁 127.0.0.1、只有自己的視窗，錄音中 polling（每分鐘 40 次）
+    // 加分段上傳（每分鐘 6 次）已經逼近預設的 60，撞到 429 的話段落會一直重送
+    MEETPILOT_API_RATE_LIMIT: '600',
   });
   if (input.rosterDocument !== undefined) env.MEETPILOT_ROSTER_DOCUMENT = input.rosterDocument;
   if (input.ffmpeg !== undefined) {

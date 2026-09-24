@@ -70,17 +70,55 @@ export interface MeetingView extends Meeting {
    * 不能從「這個分頁按下開始的那一刻」算（vault plan「MeetPilot · 網頁錄音」AC-4）
    */
   recording_started_at: number | null;
+  /** 這場錄音是誰在錄。只有 `RECORDING` 時有值：畫面要靠它決定停止按鍵做什麼、中斷了能不能救 */
+  recording_method: RecordingMethod | null;
+  /**
+   * app 內錄音已經確定收到的段數（E4）。只有 `RECORDING` 且 `in_app` 時有值。
+   * app 關掉或當掉之後重開，畫面靠它講「已經收到多少」，讓使用者決定要不要送出已錄的部分
+   */
+  recording_received_chunks: number | null;
 }
 
 /**
- * `GET /api/recording/availability`。這台 server 能不能叫語音備忘錄錄音。
+ * 錄音是誰在錄。`voice_memo` 是網頁版叫本機語音備忘錄（vault plan「MeetPilot · 網頁錄音」），
+ * `in_app` 是桌面 app 自己用麥克風錄、分段送上來（vault plan「MeetPilot · 跨平台打包部署」E4）。
+ * 一台 server 只提供一種（`MEETPILOT_RECORDER`），已經在錄的那一場照它開始時的方式收尾
+ */
+export type RecordingMethod = 'voice_memo' | 'in_app';
+
+/**
+ * `GET /api/recording/availability`。這台 server 能不能錄音、用哪一種方式。
  *
  * 不能的時候一定帶原因：錄音按鍵要嘛不出現、要嘛講清楚為什麼不能按（AC-5），
  * 不讓使用者按下去才失敗。原因只有 server 知道（平台、三個捷徑在不在、請求是不是從本機來）。
+ * `in_app` 的「麥克風能不能用」server 不知道，由前端開始錄之前自己問瀏覽器。
  */
 export type RecordingAvailabilityResponse =
-  | { available: true }
+  | { available: true; method: RecordingMethod }
   | { available: false; reason: string };
+
+/**
+ * app 內錄音每一段多長（毫秒），也是 app 當掉時最多丟掉的長度（還沒送出去的那一段）。
+ * 10 秒是我判的（E4 裁定）：再短，每分鐘的請求數會吃掉更多限流額度；再長，當掉時丟得更多
+ */
+export const RECORDING_CHUNK_MS = 10_000;
+
+/** `PUT /api/meetings/:id/recording/chunks/:seq` 的一段最多幾 bytes。10 秒 64 kbps 約 80 KB，給兩個數量級的餘裕 */
+export const RECORDING_CHUNK_MAX_BYTES = 8 * 1024 * 1024;
+
+/** `PUT /api/meetings/:id/recording/chunks/:seq` 200：server 目前確定收到的進度 */
+export interface RecordingChunkResponse {
+  received_chunks: number;
+  received_bytes: number;
+}
+
+/**
+ * `POST /api/meetings/:id/recording/stop` 的 body，只有 app 內錄音要帶（語音備忘錄不帶）。
+ * - `{ chunks: N }`：正常停止，前端一共錄了 N 段、都送到了。server 收到的不是 N 段就拒絕，不把缺段的檔送去轉錄
+ * - `{ partial: true }`：app 關掉或當掉後救回來，錄音已經中斷，收到幾段就送幾段
+ * 兩個都沒帶一律拒絕：分不出是哪一種的話，前端漏帶段數就會安靜地變成「收到幾段算幾段」
+ */
+export type StopInAppRecordingRequest = { chunks: number } | { partial: true };
 
 /**
  * `POST /api/meetings` 201、`PUT /api/meetings/:id/audio` 202、`POST /api/meetings/:id/retry` 202、

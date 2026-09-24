@@ -190,6 +190,10 @@ function f(p: Pick) {
 - **Electron 版本釘死（`44.4.5`，不用 `^`）。** `node:sqlite` 能在它的 utilityProcess 裡用是對這一版實測的
   （Node 24.21.0），升版要重驗。npm 上 44 是最新穩定版，45 還是 alpha。
 - **單一實例不能拿掉。** `jobStore.reclaimAllActive` 建立在同一個 DB 只有一個 process 上。
+- **app 內錄音（E4）跑在主視窗的頁面裡。** 會讓頁面換掉的動作（托盤「設定…」、結束、server 崩潰後換錯誤頁）都會切斷錄音；
+  錄音狀態由頁面經 preload 的 `meetpilotDesktop.setRecording` 告訴主程序，主程序只收 server 頁面來的。主視窗的
+  `backgroundThrottling: false` 不能拿掉：藏到系統匣的頁面會被節流。冒煙測試的錄音段用 Chromium 假麥克風，
+  從主程序（`--inspect`）關視窗；頁面裡的 `window.close()` 會被 Chromium 擋掉，測不到關視窗那條路。
 - **`electron/serverEnv.ts` 不 import electron**，才測得到；呼叫端環境裡 `MEETPILOT_*`、`HOST`、`PORT`、`GEMINI_API_KEY`
   一律不往下傳給 server，值只由外殼決定。
 - 打包後的 app 只有 `scripts/smokeDesktop.mjs` 驗得到（CI 的 `desktop` job 兩平台各跑一次）。Windows 的結果只有 CI 看得到。
@@ -207,8 +211,8 @@ function f(p: Pick) {
 
 ## 這個 repo 的已知地雷
 
-- `server.ts` 的 middleware 順序有意義：限流 → Basic Auth → **音檔路由** → body parser →
-  body parser 錯誤處理 → 其餘路由。往上搬 body parser 會讓未認證請求先吃 50MB；
+- `server.ts` 的 middleware 順序有意義：限流 → Basic Auth → **音檔路由（`PUT audio` 與 app 內錄音的
+  `PUT recording/chunks/:seq`）** → body parser → body parser 錯誤處理 → 其餘路由。往上搬 body parser 會讓未認證請求先吃 50MB；
   往下搬音檔路由會讓 100 分鐘的音檔先被讀進記憶體。
 - overlap 秒數的唯一來源是 `services/transcriptMerge.ts` 的 `SLICE_OVERLAP_SECONDS`。
   W2 之後 import 它的只有 `services/transcriptionPipeline.ts`（前端已經不切片）；

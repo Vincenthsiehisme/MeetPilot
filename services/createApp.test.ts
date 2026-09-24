@@ -87,6 +87,7 @@ const startWith = async (options: {
   voiceMemoRecorder?: FakeRecorder | null;
   isLocalRequest?: () => boolean;
   recordingFetchPolicy?: { attempts: number; delayMs: number };
+  recordingMethod?: 'voice_memo' | 'in_app';
 } = {}) => {
   const app = createApp({
     listenConfig: {
@@ -115,6 +116,7 @@ const startWith = async (options: {
     voiceMemoRecorder: options.voiceMemoRecorder ?? null,
     isLocalRequest: options.isLocalRequest,
     recordingFetchPolicy: options.recordingFetchPolicy ?? { attempts: 2, delayMs: 0 },
+    recordingMethod: options.recordingMethod,
   });
   server = createServer(app);
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -1153,6 +1155,12 @@ describe('語音備忘錄錄音的路由（vault plan「MeetPilot · 網頁錄�
       expect(recorderCalls).toEqual([]);
     });
 
+    it('能錄的時候講是哪一種方式，前端照它決定按下去做什麼', async () => {
+      await startWith({ voiceMemoRecorder: fakeRecorder() });
+      const body = await (await fetch(`${url}/api/recording/availability`)).json() as any;
+      expect(body).toEqual({ available: true, method: 'voice_memo' });
+    });
+
     it('沒接語音備忘錄的 server 講清楚沒接', async () => {
       await startWith();
       const body = await (await fetch(`${url}/api/recording/availability`)).json() as any;
@@ -1347,7 +1355,7 @@ describe('語音備忘錄錄音的路由（vault plan「MeetPilot · 網頁錄�
     it('別台電腦來的請求回 403', async () => {
       await startWith({ voiceMemoRecorder: fakeRecorder(), isLocalRequest: () => false });
       const id = await createRecordingMeeting();
-      store.startRecording(id, Date.now());
+      store.startRecording(id, Date.now(), 'voice_memo');
       expect((await post(`/api/meetings/${id}/recording/stop`)).status).toBe(403);
       expect(recorderCalls).toEqual([]);
     });
@@ -1409,5 +1417,273 @@ describe('語音備忘錄錄音的路由（vault plan「MeetPilot · 網頁錄�
       expect(((await res.json()) as any).error).toContain('沒有刪除');
       expect(store.getMeeting(id)?.status).toBe('RECORDING');
     });
+  });
+});
+
+describe('app 內錄音的路由（vault plan「MeetPilot · 跨平台打包部署」E4）', () => {
+  const post = async (path: string, body?: unknown) => {
+    const res = await fetch(`${url}${path}`, {
+      method: 'POST',
+      headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return { status: res.status, body: await res.json() as any };
+  };
+  const putChunk = async (id: string, seq: number | string, data: Buffer | string) => {
+    const res = await fetch(`${url}/api/meetings/${id}/recording/chunks/${seq}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: typeof data === 'string' ? Buffer.from(data) : data,
+    });
+    return { status: res.status, body: await res.json() as any };
+  };
+  const startRecording = async (): Promise<string> => {
+    const { body } = await createMeeting({ fileName: 'MeetPilot 錄音', fileSize: 0, participantIds: [TEST_EMPLOYEE_ID] });
+    const id = body.meeting.meeting_id;
+    const started = await post(`/api/meetings/${id}/recording/start`);
+    expect(started.status).toBe(200);
+    return id;
+  };
+
+  it('availability 說可以錄、方式是 in_app，不去碰語音備忘錄', async () => {
+    await startWith({ recordingMethod: 'in_app' });
+    const body = await (await fetch(`${url}/api/recording/availability`)).json() as any;
+    expect(body).toEqual({ available: true, method: 'in_app' });
+  });
+
+  it('開始：狀態進 RECORDING，清單帶來源與段數 0', async () => {
+    await startWith({ recordingMethod: 'in_app' });
+    const id = await startRecording();
+    const list = await (await fetch(`${url}/api/meetings`)).json() as any;
+    expect(list.meetings[0]).toMatchObject({
+      status: 'RECORDING', recording_method: 'in_app', recording_received_chunks: 0,
+    });
+    expect(store.getRecording(id)?.method).toBe('in_app');
+  });
+
+  it('開始時清掉同一場會的舊段落：第 0 段送到之前，不讓無關的檔被當成這場的錄音', async () => {
+    await startWith({ recordingMethod: 'in_app' });
+    const { body } = await createMeeting({ fileName: 'x', fileSize: 0, participantIds: [TEST_EMPLOYEE_ID] });
+    const id = body.meeting.meeting_id;
+    writeFileSync(audioStore.recordingPathFor(id), 'stale');
+    expect((await post(`/api/meetings/${id}/recording/start`)).status).toBe(200);
+    expect(readdirSync(audioDir).filter(n => n.endsWith('.recording'))).toEqual([]);
+  });
+
+  it('一次只能錄一場', async () => {
+    await startWith({ recordingMethod: 'in_app' });
+    const first = await startRecording();
+    const { body } = await createMeeting({ fileName: 'x', fileSize: 0, participantIds: [TEST_EMPLOYEE_ID] });
+    const second = await post(`/api/meetings/${body.meeting.meeting_id}/recording/start`);
+    expect(second.status).toBe(409);
+    expect(second.body.error).toContain(first);
+  });
+
+  it('別台電腦來的開始、分段、停止一律 403', async () => {
+    await startWith({ recordingMethod: 'in_app', isLocalRequest: () => false });
+    const { body } = await createMeeting({ fileName: 'x', fileSize: 0, participantIds: [TEST_EMPLOYEE_ID] });
+    const id = body.meeting.meeting_id;
+    expect((await post(`/api/meetings/${id}/recording/start`)).status).toBe(403);
+    store.startRecording(id, Date.now(), 'in_app');
+    expect((await putChunk(id, 0, 'aaa')).status).toBe(403);
+    expect((await post(`/api/meetings/${id}/recording/stop`, { chunks: 0 })).status).toBe(403);
+  });
+
+  it('分段依序接上，停止帶段數：檔案變成音檔、大小補上、進轉錄', async () => {
+    await startWith({ recordingMethod: 'in_app' });
+    const id = await startRecording();
+    expect((await putChunk(id, 0, 'webm-head')).body).toEqual({ received_chunks: 1, received_bytes: 9 });
+    expect((await putChunk(id, 1, '-cluster')).body).toEqual({ received_chunks: 2, received_bytes: 17 });
+
+    const stopped = await post(`/api/meetings/${id}/recording/stop`, { chunks: 2 });
+    expect(stopped.status).toBe(202);
+    expect(stopped.body.meeting).toMatchObject({ status: 'TRANSCRIBING', has_audio: true, recording_method: null });
+    expect(readFileSync(audioStore.pathFor(id), 'utf8')).toBe('webm-head-cluster');
+    expect(store.getMeeting(id)?.source_file_size).toBe(17);
+    expect(store.getRecording(id)?.stopped_at).not.toBeNull();
+    expect(enqueued).toEqual([id]);
+    expect(readdirSync(audioDir).filter(n => n.endsWith('.recording'))).toEqual([]);
+  });
+
+  it('重送已經收到的段：回目前進度、不重寫；跳號：409 講出要第幾段', async () => {
+    await startWith({ recordingMethod: 'in_app' });
+    const id = await startRecording();
+    await putChunk(id, 0, 'aaa');
+    const again = await putChunk(id, 0, 'aaa');
+    expect(again.status).toBe(200);
+    expect(again.body).toEqual({ received_chunks: 1, received_bytes: 3 });
+    const skipped = await putChunk(id, 2, 'ccc');
+    expect(skipped.status).toBe(409);
+    expect(skipped.body.error).toContain('下一段應該是第 1 段');
+    expect(readFileSync(audioStore.recordingPathFor(id), 'utf8')).toBe('aaa');
+  });
+
+  it('空的段、超過上限的段、壞掉的段號都不收', async () => {
+    await startWith({ recordingMethod: 'in_app' });
+    const id = await startRecording();
+    expect((await putChunk(id, 0, Buffer.alloc(0))).status).toBe(400);
+    expect((await putChunk(id, 'x', 'aaa')).status).toBe(400);
+    expect((await putChunk(id, 0, Buffer.alloc(8 * 1024 * 1024 + 1))).status).toBe(413);
+    expect(store.getRecording(id)?.received_chunks).toBe(0);
+  });
+
+  it('上一段還在寫的時候又送來一段：503 叫它等一下再送，不讓兩個寫入同時截檔', async () => {
+    await startWith({ recordingMethod: 'in_app' });
+    const id = await startRecording();
+    const { request } = await import('node:http');
+    const port = Number(new URL(url).port);
+    // 第一個請求只送一半 body、不結束，server 那頭就一直停在「讀這一段」
+    const slow = request({ host: '127.0.0.1', port, method: 'PUT', path: `/api/meetings/${id}/recording/chunks/0`,
+      headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': '6' } });
+    slow.on('error', () => {});
+    slow.write('aaa');
+    await new Promise(r => setTimeout(r, 50));
+    const res = await fetch(`${url}/api/meetings/${id}/recording/chunks/0`, { method: 'PUT', body: 'bbb' });
+    expect(res.status).toBe(503);
+    expect(res.headers.get('retry-after')).toBe('1');
+    slow.end('aaa');
+    await new Promise(r => setTimeout(r, 50));
+    expect(readFileSync(audioStore.recordingPathFor(id), 'utf8')).toBe('aaaaaa');
+    expect(store.getRecording(id)?.received_chunks).toBe(1);
+  });
+
+  it('上一次收尾改完檔名就斷了（狀態還是 RECORDING）：再按一次停止照常進轉錄（Codex review）', async () => {
+    await startWith({ recordingMethod: 'in_app' });
+    const id = await startRecording();
+    await putChunk(id, 0, 'aaa');
+    // 模擬 promoteRecording 做完、後面的資料庫更新還沒跑 server 就掛了
+    store.markRecordingStopped(id, Date.now());
+    audioStore.promoteRecording(id, 3);
+    const res = await post(`/api/meetings/${id}/recording/stop`, { partial: true });
+    expect(res.status).toBe(202);
+    expect(readFileSync(audioStore.pathFor(id), 'utf8')).toBe('aaa');
+  });
+
+  it('有一段正在寫的時候不刪：503，寫完再刪就不留下沒人認領的錄音檔（Codex review）', async () => {
+    await startWith({ recordingMethod: 'in_app' });
+    const id = await startRecording();
+    const { request } = await import('node:http');
+    const port = Number(new URL(url).port);
+    const slow = request({ host: '127.0.0.1', port, method: 'PUT', path: `/api/meetings/${id}/recording/chunks/0`,
+      headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': '6' } });
+    const slowDone = new Promise<void>(resolve => slow.on('response', res => { res.resume(); res.on('end', () => resolve()); }));
+    slow.on('error', () => {});
+    slow.write('aaa');
+    await new Promise(r => setTimeout(r, 50));
+    const blocked = await fetch(`${url}/api/meetings/${id}`, { method: 'DELETE' });
+    expect(blocked.status).toBe(503);
+    expect(store.getMeeting(id)).not.toBeNull();
+    slow.end('aaa');
+    await slowDone;
+    expect((await fetch(`${url}/api/meetings/${id}`, { method: 'DELETE' })).status).toBe(200);
+    expect(readdirSync(audioDir).filter(n => n.endsWith('.recording'))).toEqual([]);
+  });
+
+  it('段數對不上不停止：狀態留在 RECORDING，訊息講差幾段', async () => {
+    await startWith({ recordingMethod: 'in_app' });
+    const id = await startRecording();
+    await putChunk(id, 0, 'aaa');
+    const res = await post(`/api/meetings/${id}/recording/stop`, { chunks: 3 });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain('server 只收到 1 段');
+    expect(store.getMeeting(id)?.status).toBe('RECORDING');
+    expect(store.getRecording(id)?.stopped_at).toBeNull();
+    // 補送完再停一次就好
+    await putChunk(id, 1, 'bbb');
+    await putChunk(id, 2, 'ccc');
+    expect((await post(`/api/meetings/${id}/recording/stop`, { chunks: 3 })).status).toBe(202);
+  });
+
+  it('收尾失敗（錄音檔比收到的短）之後再按停止：講出同一個原因，不卡在「已經停過」', async () => {
+    await startWith({ recordingMethod: 'in_app' });
+    const id = await startRecording();
+    await putChunk(id, 0, 'aaaaaa');
+    writeFileSync(audioStore.recordingPathFor(id), 'aa');
+    const first = await post(`/api/meetings/${id}/recording/stop`, { chunks: 1 });
+    expect(first.status).toBe(500);
+    expect(first.body.error).toContain('比已經收到的 6 bytes 短');
+    const second = await post(`/api/meetings/${id}/recording/stop`, { chunks: 1 });
+    expect(second.body.error).toContain('比已經收到的 6 bytes 短');
+    // 救得回來的話（檔案補回去）照常收尾
+    writeFileSync(audioStore.recordingPathFor(id), 'aaaaaa');
+    expect((await post(`/api/meetings/${id}/recording/stop`, { chunks: 1 })).status).toBe(202);
+  });
+
+  it('收過段落、錄音檔卻不見了：退回 CREATED 講清楚，不每次收尾都 500（fable review）', async () => {
+    await startWith({ recordingMethod: 'in_app' });
+    const id = await startRecording();
+    await putChunk(id, 0, 'aaa');
+    rmSync(audioStore.recordingPathFor(id));
+    const res = await post(`/api/meetings/${id}/recording/stop`, { partial: true });
+    expect(res.status).toBe(422);
+    expect(res.body.error).toContain('錄音檔不見了');
+    expect(store.getMeeting(id)?.status).toBe('CREATED');
+    expect(enqueued).toEqual([]);
+  });
+
+  it('停止沒講是哪一種收尾：400，不默默當成「收到幾段算幾段」', async () => {
+    await startWith({ recordingMethod: 'in_app' });
+    const id = await startRecording();
+    await putChunk(id, 0, 'aaa');
+    expect((await post(`/api/meetings/${id}/recording/stop`)).status).toBe(400);
+    expect((await post(`/api/meetings/${id}/recording/stop`, { chunks: '1' })).status).toBe(400);
+    expect(store.getMeeting(id)?.status).toBe('RECORDING');
+  });
+
+  it('救回中斷的錄音（partial）：收到幾段送幾段', async () => {
+    await startWith({ recordingMethod: 'in_app' });
+    const id = await startRecording();
+    await putChunk(id, 0, 'aaa');
+    const res = await post(`/api/meetings/${id}/recording/stop`, { partial: true });
+    expect(res.status).toBe(202);
+    expect(readFileSync(audioStore.pathFor(id), 'utf8')).toBe('aaa');
+  });
+
+  it('一段都沒收到就停止：退回 CREATED 等補音檔，不送一個空檔去轉錄', async () => {
+    await startWith({ recordingMethod: 'in_app' });
+    const id = await startRecording();
+    const res = await post(`/api/meetings/${id}/recording/stop`, { partial: true });
+    expect(res.status).toBe(422);
+    expect(res.body.error).toContain('一段都沒有送到');
+    expect(store.getMeeting(id)?.status).toBe('CREATED');
+    expect(audioStore.exists(id)).toBe(false);
+    expect(enqueued).toEqual([]);
+  });
+
+  it('server 換成語音備忘錄模式重開，上一次 app 內錄音照 in_app 收尾，不去叫語音備忘錄', async () => {
+    await startWith({ recordingMethod: 'in_app' });
+    const id = await startRecording();
+    await putChunk(id, 0, 'aaa');
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    await startWith({ recordingMethod: 'voice_memo', voiceMemoRecorder: null });
+    expect((await post(`/api/meetings/${id}/recording/stop`, { chunks: 1 })).status).toBe(202);
+  });
+
+  it('語音備忘錄在錄的會不收 app 的段落', async () => {
+    await startWith({ recordingMethod: 'in_app' });
+    const { body } = await createMeeting({ fileName: 'x', fileSize: 0, participantIds: [TEST_EMPLOYEE_ID] });
+    const id = body.meeting.meeting_id;
+    store.startRecording(id, Date.now(), 'voice_memo');
+    const res = await putChunk(id, 0, 'aaa');
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain('語音備忘錄在錄');
+  });
+
+  it('停止之後再送段落：409，不接在已經變成音檔的檔後面', async () => {
+    await startWith({ recordingMethod: 'in_app' });
+    const id = await startRecording();
+    await putChunk(id, 0, 'aaa');
+    await post(`/api/meetings/${id}/recording/stop`, { chunks: 1 });
+    expect((await putChunk(id, 1, 'late')).status).toBe(409);
+  });
+
+  it('刪除錄音中的會：不叫語音備忘錄，已送到的段落一起刪', async () => {
+    await startWith({ recordingMethod: 'in_app' });
+    const id = await startRecording();
+    await putChunk(id, 0, 'aaa');
+    const res = await fetch(`${url}/api/meetings/${id}`, { method: 'DELETE' });
+    expect(res.status).toBe(200);
+    expect(store.getMeeting(id)).toBeNull();
+    expect(readdirSync(audioDir).filter(n => n.endsWith('.recording'))).toEqual([]);
   });
 });

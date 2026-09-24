@@ -44,6 +44,8 @@ const makeMeeting = (overrides: Partial<MeetingView> = {}): MeetingView => ({
   has_audio: true,
   // 預設不在錄音：只有 RECORDING 的測試自己覆寫
   recording_started_at: null,
+  recording_method: null,
+  recording_received_chunks: null,
   title: null,
   status: 'CREATED',
   created_at: 1000,
@@ -150,8 +152,10 @@ describe('meetingToJob 的狀態對應', () => {
   });
 
   it('錄音開始時間只在 server 給了才帶進 Job，計時從 server 接回來', () => {
-    const recording = meetingToJob(makeMeeting({ status: 'RECORDING', recording_started_at: 1_700_000_000_000 }));
+    const recording = meetingToJob(makeMeeting({ status: 'RECORDING', recording_started_at: 1_700_000_000_000, recording_method: 'in_app' }));
     expect(recording.recordingStartedAt).toBe(1_700_000_000_000);
+    expect(recording.recordingMethod).toBe('in_app');
+    expect(meetingToJob(makeMeeting({ status: 'LINKED' })).recordingMethod).toBeUndefined();
     expect(meetingToJob(makeMeeting({ status: 'LINKED' })).recordingStartedAt).toBeUndefined();
   });
 
