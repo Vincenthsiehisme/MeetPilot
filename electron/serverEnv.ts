@@ -24,6 +24,8 @@ export interface ServerEnvInput {
   geminiApiKey?: string;
   /** 會議 markdown 投影到哪；沒給就是 userData/vault */
   vaultDir?: string;
+  /** 隨附的 ffmpeg／ffprobe（E2）。沒給就不設，server 走 PATH 上的（開發時） */
+  ffmpeg?: { ffmpeg: string; ffprobe: string };
 }
 
 // server 會看的設定變數前綴與名稱。不在這張表裡的系統變數（PATH、HOME、SystemRoot、TEMP…）照傳，
@@ -50,6 +52,10 @@ export function buildServerEnv(input: ServerEnvInput): Record<string, string> {
     MEETPILOT_LLM_LOG: join(input.userDataDir, 'logs', 'llm.jsonl'),
     MEETPILOT_VAULT: input.vaultDir ?? join(input.userDataDir, 'vault'),
   });
+  if (input.ffmpeg !== undefined) {
+    env.MEETPILOT_FFMPEG = input.ffmpeg.ffmpeg;
+    env.MEETPILOT_FFPROBE = input.ffmpeg.ffprobe;
+  }
   if (input.geminiApiKey !== undefined && input.geminiApiKey.trim() !== '') {
     env.GEMINI_API_KEY = input.geminiApiKey.trim();
   }

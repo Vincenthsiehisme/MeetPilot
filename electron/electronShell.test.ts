@@ -1,7 +1,10 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
 import { buildServerEnv } from './serverEnv';
 import { createLogTail } from './logTail';
+import { resolveBundledFfmpeg } from './bundledFfmpeg';
 
 describe('buildServerEnv', () => {
   const base = { PATH: '/usr/bin', HOME: '/home/u', SystemRoot: 'C:\\Windows' };
@@ -24,6 +27,15 @@ describe('buildServerEnv', () => {
       .toBe(join('/d', 'vault'));
     expect(buildServerEnv({ baseEnv: {}, userDataDir: '/d', port: 1, vaultDir: '/shared/records' }).MEETPILOT_VAULT)
       .toBe('/shared/records');
+  });
+
+  it('隨附的 ffmpeg 路徑傳給 server；沒給就不設，使用者 shell 裡的 MEETPILOT_FFMPEG 也不會漏進去', () => {
+    const bundled = buildServerEnv({ baseEnv: {}, userDataDir: '/d', port: 1, ffmpeg: { ffmpeg: '/r/ffmpeg/ffmpeg', ffprobe: '/r/ffmpeg/ffprobe' } });
+    expect(bundled.MEETPILOT_FFMPEG).toBe('/r/ffmpeg/ffmpeg');
+    expect(bundled.MEETPILOT_FFPROBE).toBe('/r/ffmpeg/ffprobe');
+    const dev = buildServerEnv({ baseEnv: { MEETPILOT_FFMPEG: '/opt/x/ffmpeg' }, userDataDir: '/d', port: 1 });
+    expect(dev).not.toHaveProperty('MEETPILOT_FFMPEG');
+    expect(dev).not.toHaveProperty('MEETPILOT_FFPROBE');
   });
 
   it('系統變數照傳：子程序要靠 PATH 找 ffmpeg、Windows 要 SystemRoot', () => {
@@ -84,5 +96,37 @@ describe('createLogTail', () => {
     const tail = createLogTail(5);
     tail.push('x\r\ny\r\nlast');
     expect(tail.lines()).toEqual(['x', 'y', 'last']);
+  });
+});
+
+describe('resolveBundledFfmpeg', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'meetpilot-ffmpeg-'));
+  const withBinaries = (sub: string, exe = '') => {
+    const d = join(dir, sub);
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, `ffmpeg${exe}`), '');
+    writeFileSync(join(d, `ffprobe${exe}`), '');
+    return d;
+  };
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  it('打包後用 resources/ffmpeg；Windows 帶 .exe', () => {
+    const res = join(dir, 'res-win');
+    withBinaries(join('res-win', 'ffmpeg'), '.exe');
+    expect(resolveBundledFfmpeg({ isPackaged: true, resourcesPath: res, appPath: '/x', platform: 'win32', arch: 'x64' }))
+      .toEqual({ ffmpeg: join(res, 'ffmpeg', 'ffmpeg.exe'), ffprobe: join(res, 'ffmpeg', 'ffprobe.exe') });
+  });
+
+  it('打包後缺檔直接拋，不退回 PATH：記錄人的電腦上本來就沒有 ffmpeg', () => {
+    expect(() => resolveBundledFfmpeg({ isPackaged: true, resourcesPath: join(dir, 'nothing'), appPath: '/x', platform: 'darwin', arch: 'arm64' }))
+      .toThrow(/安裝檔裡少了 ffmpeg/);
+  });
+
+  it('開發時用 vendor/ffmpeg/<平台>-<架構>，沒編過就回 undefined 讓 server 走 PATH', () => {
+    const app = join(dir, 'app');
+    withBinaries(join('app', 'vendor', 'ffmpeg', 'mac-arm64'));
+    expect(resolveBundledFfmpeg({ isPackaged: false, resourcesPath: '/r', appPath: app, platform: 'darwin', arch: 'arm64' })?.ffmpeg)
+      .toBe(join(app, 'vendor', 'ffmpeg', 'mac-arm64', 'ffmpeg'));
+    expect(resolveBundledFfmpeg({ isPackaged: false, resourcesPath: '/r', appPath: app, platform: 'darwin', arch: 'x64' })).toBeUndefined();
   });
 });

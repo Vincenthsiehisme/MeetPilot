@@ -104,9 +104,10 @@ server 行程自己讀不到（`Operation not permitted`），授權是捷徑 Ap
 ## 桌面 app（開發中）
 
 多位記錄人各自在 Mac 或 Windows 上用的版本，Electron 包一層，裡面跑的就是上面這個 server（vault plan
-`MeetPilot · 跨平台打包部署`）。目前做到外殼（E1）：還沒有隨附 ffmpeg、沒有邀請碼設定畫面、沒有 app 內錄音。
+`MeetPilot · 跨平台打包部署`）。目前做到外殼（E1）與隨附 ffmpeg（E2）：還沒有邀請碼設定畫面、沒有 app 內錄音。
 
 ```bash
+npm run ffmpeg:build -- mac-arm64   # 先編隨附的 ffmpeg（mac-arm64、mac-x64、win-x64），輸出到 vendor/ffmpeg/
 npm run desktop        # 建置後直接開桌面 app（開發用）
 npm run package:mac    # 產 .dmg（arm64 與 x64），輸出在 release/
 npm run package:win    # 產 .exe 安裝程式（在 Windows 上跑）
@@ -119,6 +120,20 @@ node scripts/smokeDesktop.mjs <打包後的執行檔>   # 啟動打包後的 app
   server 的輸出寫在 userData 的 `logs/server.log`。
 - 關掉視窗只是縮到托盤，托盤選單的「結束 MeetPilot」才會停 server。同時只能開一個。
 - server 掛掉會跳錯誤視窗，顯示結束碼與最後幾行輸出，由使用者選重新啟動或結束，不會安靜重啟。
+- **隨附的 ffmpeg 是自己從官方原始碼編的最小版本**（`scripts/ffmpeg/build.sh`，參數在 `configure-flags.txt`）：
+  只開 server 用得到的音訊解碼器、容器、WAV 輸出與重採樣，沒有 GPL 元件、沒有外部函式庫，授權 LGPL 2.1 以上，
+  授權檔跟著放在安裝檔的 `ffmpeg/LICENSE-ffmpeg.txt`，`ffmpeg/NOTICE-ffmpeg.txt` 寫明版本、官方原始碼網址與 sha256、
+  configure 參數，以及連進執行檔的三個 MIT 授權檔案聲明。原始碼固定 8.1.3 並驗 sha256，CI 另外驗官方簽章
+  （金鑰指紋釘死在腳本裡，撤銷或過期的金鑰也拒絕）。兩個執行檔合計約 5.5 MB。
+- 打包前 `scripts/ffmpeg/beforePack.cjs` 確認那個平台與架構的 ffmpeg 已經編好，缺了就讓打包失敗。
+  `package:mac` 同時打 arm64 與 x64，兩個都要先編。
+- 編完一定要跑 `npm run ffmpeg:verify -- <ffmpeg> <ffprobe>`：拿 `scripts/ffmpeg-fixtures/` 的測試音檔
+  （21 支：語音備忘錄 m4a、ALAC、MP3、MediaRecorder 那種沒長度的 webm、Opus、Vorbis、FLAC、WAV、WMA、AAC、
+  Android 的 AMR 與 AMR-WB、GarageBand 的 24-bit AIFF、QuickTime 的 24-bit／float LPCM、錄音筆常見的 IMA／MS ADPCM
+  與 8-bit WAV、64-bit float WAV、MP2、CAF ima4。AMR 兩支是用合法格式手工組的雜訊，本機 ffmpeg 沒有 AMR 編碼器）
+  跑 server 自己的 `createAudioSlicer`。少開一個解碼器，某種檔就會在轉錄一開始 FAILED，而三條 gate 照樣全綠。
+  要支援新格式：在 `configure-flags.txt` 加元件、在 fixtures 加一支該格式的音檔，兩個都要。
+- 打包後找不到隨附的 ffmpeg 會跳錯誤視窗，不退回 PATH（記錄人電腦上本來就沒有 ffmpeg）。
 - 安裝檔沒有簽章，第一次打開 macOS 要到「系統設定 → 隱私權與安全性」按「仍要打開」，Windows 的 SmartScreen
   要按「其他資訊 → 仍要執行」。
 - 目前 Gemini key 只從啟動 app 的環境變數 `GEMINI_API_KEY` 讀；從 Finder 或開始選單打開時沒有 key，轉錄會失敗並講原因。

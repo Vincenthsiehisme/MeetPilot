@@ -42,3 +42,6 @@ eval-data/
 
 # electron-builder 的輸出（安裝檔），由 CI 產出，不進版控
 release/
+
+# 自己編的最小 ffmpeg（scripts/ffmpeg/build.sh 產出）與它的建置暫存，不進版控
+vendor/
