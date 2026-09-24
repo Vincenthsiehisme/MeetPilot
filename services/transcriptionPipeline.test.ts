@@ -4,6 +4,7 @@ import { TranscriptSegment } from '../types';
 import { AnalysisModelOutput } from './analysisContract';
 import { AudioFileStore } from './audioFileStore';
 import { AudioSlicer } from './audioSlicer';
+import { silentWav, toneWav } from './wavFixture';
 import { GeminiServerClient } from './geminiServerClient';
 import { createJobStore } from './jobStore';
 import { openMeetingDb } from './meetingDb';
@@ -48,7 +49,8 @@ const fakeAudioStore = (present: Set<string>): AudioFileStore => ({
 
 const fakeSlicer = (durationSeconds: number, readSlice?: AudioSlicer['readSlice']): AudioSlicer => ({
   probeDurationRemuxingIfMissing: async () => durationSeconds,
-  readSlice: readSlice ?? (async (_path, start) => Buffer.from(`wav@${start}`)),
+  // 預設切出有聲音的 WAV：轉錄前會先量音量，全是靜音的音檔不送 Gemini（services/audioLevel.ts）
+  readSlice: readSlice ?? (async () => toneWav()),
 });
 
 /** gemini.analyzeTranscript 的回傳形狀（segment_from／segment_to，不是秒數）。
@@ -1192,6 +1194,87 @@ describe('run：續傳', () => {
     expect(statuses).toEqual(['TRANSCRIBED', 'ANALYZING', 'READY']);
     expect(store.getTranscript('m-1')?.segments).toHaveLength(2);
     expect(store.getMeeting('m-1')?.processed_slices).toBe(3);
+  });
+});
+
+describe('轉錄前擋掉整支沒有聲音的音檔', () => {
+  it('每一片都沒聲音 → 不送 Gemini，這場會 FAILED 並講原因', async () => {
+    newMeeting();
+    const transcribeSlice = vi.fn(fakeGemini().transcribeSlice);
+    const sliced: number[] = [];
+    const pipeline = pipelineWith({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(THREE_SLICE_DURATION, async (_path, start) => { sliced.push(start); return silentWav(); }),
+      gemini: fakeGemini({ transcribeSlice }),
+      now: () => T0 + 1,
+    });
+
+    await expect(pipeline.run('m-1')).rejects.toThrow(/幾乎沒有聲音/);
+    expect(transcribeSlice).not.toHaveBeenCalled();
+    expect(sliced).toEqual([0, 600, 1200]);
+    const meeting = store.getMeeting('m-1');
+    expect(meeting?.status).toBe('FAILED');
+    expect(meeting?.error).toContain('完全是 0');
+    expect(meeting?.error).toContain('麥克風');
+    expect(store.getTranscript('m-1')).toBeNull();
+  });
+
+  it('切出來的不是 WAV（上游壞了）→ 拋、不送 Gemini，不當成有聲音放行', async () => {
+    newMeeting();
+    const transcribeSlice = vi.fn(fakeGemini().transcribeSlice);
+    const pipeline = pipelineWith({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(THREE_SLICE_DURATION, async () => Buffer.from('not a wav')),
+      gemini: fakeGemini({ transcribeSlice }),
+      now: () => T0 + 1,
+    });
+
+    await expect(pipeline.run('m-1')).rejects.toThrow(/不是 WAV/);
+    expect(transcribeSlice).not.toHaveBeenCalled();
+    expect(store.getMeeting('m-1')?.status).toBe('FAILED');
+  });
+
+  it('第一片沒聲音、後面有 → 照常轉錄每一片，每片送的是自己那段音訊（會議開頭安靜是正常的）', async () => {
+    newMeeting();
+    const sent: { offset: number; data: string }[] = [];
+    const pipeline = pipelineWith({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(THREE_SLICE_DURATION, async (_path, start) => (start === 0 ? silentWav() : toneWav())),
+      gemini: fakeGemini({
+        transcribeSlice: async ({ offsetSeconds = 0, base64Data = '' }) => {
+          sent.push({ offset: offsetSeconds, data: base64Data });
+          return [{ start: offsetSeconds, end: offsetSeconds + 30, text: `片段 ${offsetSeconds}`, speaker: 'S' }];
+        },
+      }),
+      now: () => T0 + 1,
+    });
+
+    await pipeline.run('m-1');
+
+    expect(sent.map((s) => s.offset)).toEqual([0, 600, 1200]);
+    // 量音量時在第二片才找到聲音，不能把第二片的音訊當成第一片送出去
+    expect(sent[0].data).toBe(silentWav().toString('base64'));
+    expect(sent[1].data).toBe(toneWav().toString('base64'));
+    expect(store.getMeeting('m-1')?.status).toBe('READY');
+  });
+
+  it('第一片就有聲音 → 量音量用的那一片直接拿去轉錄，不重切', async () => {
+    newMeeting();
+    const sliced: number[] = [];
+    const pipeline = pipelineWith({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(THREE_SLICE_DURATION, async (_path, start) => { sliced.push(start); return toneWav(); }),
+      gemini: fakeGemini(),
+      now: () => T0 + 1,
+    });
+
+    await pipeline.run('m-1');
+
+    expect(sliced).toEqual([0, 600, 1200]);
   });
 });
 

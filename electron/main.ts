@@ -22,7 +22,8 @@
  * Windows 靜默安裝後自動重開；macOS 沒有簽章不能自動換版，打開 dmg 讓使用者自己拖。
  */
 import {
-  app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, powerSaveBlocker, safeStorage, session, shell, Tray, utilityProcess,
+  app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, powerSaveBlocker, safeStorage, session, shell, systemPreferences, Tray,
+  utilityProcess,
 } from 'electron';
 import type { IpcMainInvokeEvent, UtilityProcess } from 'electron';
 import { spawn } from 'node:child_process';
@@ -952,6 +953,37 @@ async function openSettings(): Promise<void> {
   await serialized(async () => { showSetup(null); });
 }
 
+/**
+ * macOS 的麥克風系統權限。2026-09-24 第一次實機錄音，31 秒只收到 7 KB、幾乎是空白，Gemini 卻轉出一段編的內容；
+ * 最可能的原因是這台 Mac 沒給 MeetPilot 麥克風權限（沒簽章的 app，系統詢問容易被略過），未證實。
+ * 所以頁面要麥克風時先查：還沒問過就請系統問；被拒就講怎麼打開，不給頁面麥克風，讓「開始錄音」直接失敗、看得見。
+ * 冒煙測試用 Chromium 的假麥克風，不經過系統的麥克風，不用查（CI 的機器上系統詢問沒有人會按）。
+ * Windows 的麥克風隱私設定關掉時 getUserMedia 會直接失敗，這裡不另外處理（沒有實機驗過）。
+ */
+async function ensureMicrophoneAccess(): Promise<boolean> {
+  if (process.platform !== 'darwin' || app.commandLine.hasSwitch('use-fake-device-for-media-stream')) return true;
+  const status = systemPreferences.getMediaAccessStatus('microphone');
+  if (status === 'granted') return true;
+  if (status === 'not-determined') {
+    const granted = await systemPreferences.askForMediaAccess('microphone');
+    writeLog(`--- 系統詢問麥克風權限：${granted ? '允許' : '拒絕'} ---\n`);
+    if (granted) return true;
+  }
+  writeLog(`--- 沒有麥克風權限（${systemPreferences.getMediaAccessStatus('microphone')}），不給頁面麥克風 ---\n`);
+  showWindow();
+  const { response } = await dialog.showMessageBox({
+    type: 'warning',
+    title: 'MeetPilot',
+    message: 'MeetPilot 沒有使用麥克風的權限，這次沒有開始錄音',
+    detail: '到「系統設定 → 隱私權與安全性 → 麥克風」打開 MeetPilot，然後結束 MeetPilot 再重新打開，才能錄音。',
+    buttons: ['打開系統設定', '稍後'],
+    defaultId: 0,
+    cancelId: 1,
+  });
+  if (response === 0) void shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone');
+  return false;
+}
+
 function isServerUrl(url: string): boolean {
   return serverOrigin !== null && (url === serverOrigin || url.startsWith(`${serverOrigin}/`));
 }
@@ -1079,9 +1111,16 @@ if (!app.requestSingleInstanceLock()) {
   app.on('window-all-closed', () => {});
 
   void app.whenReady().then(async () => {
-    // 只有 server 自己的頁面能要麥克風（E4 的 app 內錄音），其他權限一律拒絕
+    // 只有 server 自己的頁面能要麥克風（E4 的 app 內錄音），其他權限一律拒絕；給之前先確認系統層的麥克風權限
     session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
-      callback(permission === 'media' && isServerUrl(webContents.getURL()));
+      if (permission !== 'media' || !isServerUrl(webContents.getURL())) {
+        callback(false);
+        return;
+      }
+      ensureMicrophoneAccess().then(callback, (err: Error) => {
+        writeLog(`--- 查麥克風權限失敗，不給頁面麥克風：${err.stack ?? err.message} ---\n`);
+        callback(false);
+      });
     });
     registerSetupHandlers();
     createWindow();
