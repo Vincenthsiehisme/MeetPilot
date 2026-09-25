@@ -213,6 +213,9 @@ function f(p: Pick) {
 - **隨附的 ffmpeg 只開了 server 用得到的元件**（`scripts/ffmpeg/configure-flags.txt`）。server 改用新的 ffmpeg 功能
   （新的濾鏡、編碼器、容器）時，開發機上的完整版 ffmpeg 照樣能跑、三條 gate 照樣綠，打包後才壞。改 `audioSlicer.ts`
   的 ffmpeg 參數時，同一個 PR 要在 flags 加元件並跑 `npm run ffmpeg:verify`；新格式要加一支 fixture。
+- **icon 與托盤圖示由 `npm run icons:build` 產生**（圖案在 `scripts/icon/iconArtwork.ts`），不要手改 `build/icon.*`
+  或 `electron/assets/*.png`，下次重跑就被蓋掉。托盤的 `trayTemplate*.png` 是 macOS template：只能有黑色與透明，
+  檔名結尾 `Template` 不能改，系統靠它判斷要依深淺模式上色。
 - `package.json` 的 `name` 是 `meetpilot`：electron-builder 要求合法的 npm 套件名，中文名不行；產品名在 `build.productName`。
 
 ## 這個 repo 的已知地雷
