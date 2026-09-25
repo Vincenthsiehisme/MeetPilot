@@ -51,6 +51,13 @@ describe('buildWorktreeEnv', () => {
     expect(lines.filter((l) => l.startsWith('MEETPILOT_HMR_PORT='))).toEqual(['MEETPILOT_HMR_PORT=24690']);
   });
 
+  it('主 clone 的 MEETPILOT_VAULT、PORT 是空值也丟掉，只留強制寫的那一行', () => {
+    const r = buildWorktreeEnv(['MEETPILOT_VAULT=', 'PORT='].join('\n'), { port: 3009, hmrPort: 24680, vaultDir: '/tmp/v', mainClone: '/dev/App', worktree: '/dev/App-x' });
+    const lines = r.text.split('\n');
+    expect(lines.filter((l) => l.startsWith('MEETPILOT_VAULT='))).toEqual(['MEETPILOT_VAULT=/tmp/v']);
+    expect(lines.filter((l) => l.startsWith('PORT='))).toEqual(['PORT=3009']);
+  });
+
   it('主 clone 沒設 MEETPILOT_VAULT 也要寫，不然會落到 ~/MeetPilot Vault', () => {
     expect(buildWorktreeEnv('HOST=127.0.0.1', { port: 3001, hmrPort: 24680, vaultDir: '/tmp/v', mainClone: '/dev/App', worktree: '/dev/App-x' }).text).toContain('MEETPILOT_VAULT=/tmp/v');
   });
@@ -116,6 +123,19 @@ describe('buildWorktreeEnv', () => {
 });
 
 describe('portIsFree', () => {
+  it('別人綁在 0.0.0.0 或 ::1 的 port 也不算空的', async () => {
+    for (const host of ['0.0.0.0', '::1']) {
+      const server = createServer();
+      await new Promise<void>((done) => server.listen(0, host, () => done()));
+      const taken = (server.address() as { port: number }).port;
+      try {
+        expect(await portIsFree(taken)).toBe(false);
+      } finally {
+        await new Promise<void>((done) => server.close(() => done()));
+      }
+    }
+  });
+
   it('別人綁在所有介面的 port 不算空的（只探 127.0.0.1 會看不到）', async () => {
     const server = createServer();
     await new Promise<void>((done) => server.listen(0, () => done()));

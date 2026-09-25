@@ -18,7 +18,8 @@
  *      （名單 CSV 在 `eval-data/`），worktree 裡沒有，server 一啟動就找不到檔而退出（2026-09-25 試跑踩到）。
  *    值只在記憶體裡處理，回傳的報告只有 key 名，不印任何值（`.env` 裡有 API key 與 Basic Auth 密碼）。
  * 4. `findFreePort`：從 3001 往上找 server 的 port、從 24679 往上找 Vite 熱更新的 port（`MEETPILOT_HMR_PORT`），
- *    都要是 127.0.0.1 上沒被佔用的。熱更新的預設 24678 會被主 clone 的 `npm run dev` 佔住。
+ *    `127.0.0.1`、`::1`、`0.0.0.0` 與所有介面都要能 listen（`portIsFree`）。熱更新的預設 24678 會被主 clone 的
+ *    `npm run dev` 佔住。
  *
  * 動手之前先擋一種情況：呼叫的 shell 已經 export 了 `WRITE_TARGET_KEYS`、`PORT`、`MEETPILOT_HMR_PORT`。
  * Node 的 `--env-file` 讓既有環境變數優先，`.env` 寫的安全值會被蓋掉（`inheritedIsolationKeys`）。
@@ -150,18 +151,26 @@ export function buildWorktreeEnv(
   return { text: out.join('\n'), report };
 }
 
+/** 這台機器沒有那種位址（沒開 IPv6 的 `::1`）不算被佔用，不然每個 port 都會判成滿的。 */
+const NOT_APPLICABLE = new Set(['EADDRNOTAVAIL', 'EAFNOSUPPORT']);
+
 const canListen = (port: number, host: string | undefined) =>
   new Promise<boolean>((done) => {
     const server = createServer();
-    server.once('error', () => done(false));
+    server.once('error', (err: NodeJS.ErrnoException) => done(NOT_APPLICABLE.has(err.code ?? '')));
     server.listen(port, host, () => server.close(() => done(true)));
   });
 
+const PROBE_HOSTS = ['127.0.0.1', '::1', '0.0.0.0', undefined];
+
 /**
- * 127.0.0.1 與所有介面都要能 listen 才算空的。Vite 的熱更新 WebSocket 綁所有介面，
- * 只探 127.0.0.1 會把別人綁 `::` 的 port 當成空的，第二個 worktree 拿到同一個 port、熱更新安靜失效。
+ * `PROBE_HOSTS` 每一個都能 listen 才算空的。Vite 的熱更新 WebSocket 綁所有介面，只探 127.0.0.1 會把別人綁 `::`
+ * 的 port 當成空的；主 clone 的 `HOST=0.0.0.0` 或 `HOST=localhost`（解析成 `::1`）複製到 worktree 後也一樣。
  */
-export const portIsFree = async (port: number) => (await canListen(port, '127.0.0.1')) && (await canListen(port, undefined));
+export async function portIsFree(port: number): Promise<boolean> {
+  for (const host of PROBE_HOSTS) if (!(await canListen(port, host))) return false;
+  return true;
+}
 
 export async function findFreePort(start = 3001, limit = 200): Promise<number> {
   for (let port = start; port < start + limit; port++) {
@@ -205,7 +214,7 @@ async function main() {
   writeFileSync(join(path, '.env'), text, { mode: 0o600 });
 
   console.log(`\nworktree：${path}（${args.branch}，從 ${args.base}）`);
-  console.log(`.env：${existsSync(sourceEnv) ? '從主 clone 複製' : '主 clone 沒有 .env，只寫了下面兩行'}；PORT=${port}、MEETPILOT_HMR_PORT=${hmrPort}、MEETPILOT_VAULT=${vaultDir}`);
+  console.log(`.env：${existsSync(sourceEnv) ? '從主 clone 複製' : '主 clone 沒有 .env，只寫了下面三行'}；PORT=${port}、MEETPILOT_HMR_PORT=${hmrPort}、MEETPILOT_VAULT=${vaultDir}`);
   if (report.dropped.length) console.log(`拿掉（指到 worktree 外，改用 worktree 內的預設）：${report.dropped.join('、')}`);
   if (report.repointed.length) console.log(`改指回主 clone（只讀的輸入檔）：${report.repointed.join('、')}`);
   console.log(`複製的 key：${report.copied.join('、') || '無'}`);
