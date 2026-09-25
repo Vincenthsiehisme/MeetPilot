@@ -9,7 +9,8 @@
  *   1. HEAD 已經在 `origin/main` 裡（`git merge-base --is-ancestor`）
  *   2. 工作樹乾淨（`git status --porcelain --untracked-files=all` 空：明寫 untracked，使用者設了
  *      `status.showUntrackedFiles=no` 也不會把有新檔的 worktree 判成乾淨）
- *   3. 沒有任何行程的 cwd 在它底下（`lsof -d cwd`）：dev server 還開著就不收
+ *   3. 沒有任何行程的 cwd 在它底下（`lsof -d cwd`）：dev server 還開著就不收。非 root 的 lsof 只看得到
+ *      自己的行程，別的使用者或 sudo 起的行程不算進來；這支假設 worktree 只有自己在用。
  * 主 clone 與 `git worktree lock` 鎖住的永遠不是候選。整支只在 macOS 與 Linux 跑（`lsof`）。判斷不了（例如 lsof 失敗）就整支停下，不當成「沒有人在用」。
  *
  * 收的方式是搬進 `~/.Trash`，可以還原，不做永久刪除；分支不刪，已合併的分支之後用
@@ -18,7 +19,7 @@
  * `--apply` 只支援 macOS（垃圾桶位置），其他平台 exit 1。
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, renameSync } from 'node:fs';
+import { existsSync, renameSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -116,6 +117,11 @@ function main() {
     return;
   }
   const trash = join(homedir(), '.Trash');
+  const trashDev = statSync(trash).dev;
+  const crossVolume = candidates.filter((e) => statSync(e.path).dev !== trashDev);
+  if (crossVolume.length) {
+    throw new Error(`這幾個跟垃圾桶不在同一個磁碟，搬不過去（rename 跨磁碟會失敗），一個都沒動：${crossVolume.map((e) => e.path).join('、')}`);
+  }
   for (const e of candidates) {
     const target = trashTarget(trash, basename(e.path), existsSync);
     renameSync(e.path, target);

@@ -22,7 +22,8 @@
  *
  * 動手之前先擋一種情況：呼叫的 shell 已經 export 了 `WRITE_TARGET_KEYS`、`PORT`、`MEETPILOT_HMR_PORT`。
  * Node 的 `--env-file` 讓既有環境變數優先，`.env` 寫的安全值會被蓋掉（`inheritedIsolationKeys`）。
- * 暫存 vault 每次用 `mkdtemp` 開新的，不同 worktree、同名重建都不會共用。
+ * 暫存 vault 每次用 `mkdtemp` 開新的，不同 worktree、同名重建都不會共用。放在系統暫存目錄，macOS 會清掉
+ * 三天沒碰的檔，投影出來的 markdown 可能消失（server 會安靜重建目錄）；worktree 的測試 vault 可以接受這個。
  * 任何一步失敗就停下並 exit 1，已經建好的 worktree 留著讓人看，不自動清掉。
  */
 import { execFileSync } from 'node:child_process';
@@ -46,7 +47,8 @@ export interface GitStep {
 export function gitSteps(input: { mainClone: string; branch: string; path: string; base: string }): GitStep[] {
   return [
     { args: ['fetch', 'origin'], cwd: input.mainClone },
-    { args: ['worktree', 'add', '-b', input.branch, input.path, input.base], cwd: input.mainClone },
+    // --no-track：不然新分支的 upstream 是 origin/main，push 被拒時 git 提示的正是直推 main 的指令
+    { args: ['worktree', 'add', '--no-track', '-b', input.branch, input.path, input.base], cwd: input.mainClone },
   ];
 }
 
@@ -124,6 +126,11 @@ export function buildWorktreeEnv(
     const key = m[1];
     const value = parseDotenvValue(m[2]);
     if (key in forced) continue;
+    if ((WRITE_TARGET_KEYS as readonly string[]).includes(key) && value === '') {
+      out.push(line);
+      report.copied.push(key);
+      continue;
+    }
     if ((WRITE_TARGET_KEYS as readonly string[]).includes(key) && value.toLowerCase() !== 'off' && !staysInside(overrides.worktree, value)) {
       report.dropped.push(key);
       continue;
@@ -143,12 +150,18 @@ export function buildWorktreeEnv(
   return { text: out.join('\n'), report };
 }
 
-const portIsFree = (port: number) =>
+const canListen = (port: number, host: string | undefined) =>
   new Promise<boolean>((done) => {
     const server = createServer();
     server.once('error', () => done(false));
-    server.listen(port, '127.0.0.1', () => server.close(() => done(true)));
+    server.listen(port, host, () => server.close(() => done(true)));
   });
+
+/**
+ * 127.0.0.1 與所有介面都要能 listen 才算空的。Vite 的熱更新 WebSocket 綁所有介面，
+ * 只探 127.0.0.1 會把別人綁 `::` 的 port 當成空的，第二個 worktree 拿到同一個 port、熱更新安靜失效。
+ */
+export const portIsFree = async (port: number) => (await canListen(port, '127.0.0.1')) && (await canListen(port, undefined));
 
 export async function findFreePort(start = 3001, limit = 200): Promise<number> {
   for (let port = start; port < start + limit; port++) {

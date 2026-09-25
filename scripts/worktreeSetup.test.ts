@@ -1,6 +1,6 @@
 import { createServer } from 'node:net';
 import { describe, expect, it } from 'vitest';
-import { buildWorktreeEnv, defaultWorktreePath, findFreePort, gitSteps, inheritedIsolationKeys, installStep, parseDotenvValue, staysInside } from './worktreeSetup';
+import { buildWorktreeEnv, defaultWorktreePath, findFreePort, gitSteps, inheritedIsolationKeys, installStep, parseDotenvValue, portIsFree, staysInside } from './worktreeSetup';
 
 describe('gitSteps', () => {
   const steps = gitSteps({ mainClone: '/dev/App', branch: 'feat/x', path: '/dev/App-x', base: 'origin/main' });
@@ -8,7 +8,7 @@ describe('gitSteps', () => {
   it('先 fetch 再從 base 開 worktree', () => {
     expect(steps.map((s) => s.args)).toEqual([
       ['fetch', 'origin'],
-      ['worktree', 'add', '-b', 'feat/x', '/dev/App-x', 'origin/main'],
+      ['worktree', 'add', '--no-track', '-b', 'feat/x', '/dev/App-x', 'origin/main'],
     ]);
   });
 
@@ -81,6 +81,12 @@ describe('buildWorktreeEnv', () => {
     expect(buildWorktreeEnv('MEETPILOT_DB=C:\\data\\prod.db', { port: 3001, hmrPort: 24680, vaultDir: '/tmp/v', mainClone: '/dev/App', worktree: '/dev/App-x' }).report.dropped).toEqual(['MEETPILOT_DB']);
   });
 
+  it('寫入設定是空值就原樣留（等同用預設），不報成指到 worktree 外', () => {
+    const r = buildWorktreeEnv('MEETPILOT_DB=', { port: 3001, hmrPort: 24680, vaultDir: '/tmp/v', mainClone: '/dev/App', worktree: '/dev/App-x' });
+    expect(r.report.dropped).toEqual([]);
+    expect(r.report.copied).toEqual(['MEETPILOT_DB']);
+  });
+
   it('LLM log 設成 off 照留', () => {
     expect(buildWorktreeEnv('MEETPILOT_LLM_LOG=off', { port: 3001, hmrPort: 24680, vaultDir: '/tmp/v', mainClone: '/dev/App', worktree: '/dev/App-x' }).text).toContain('MEETPILOT_LLM_LOG=off');
   });
@@ -106,6 +112,19 @@ describe('buildWorktreeEnv', () => {
   it('報告只有 key 名，不含任何值', () => {
     const flat = JSON.stringify(report);
     for (const secret of ['fake-key-123', 'admin', 'prod.db', '127.0.0.1']) expect(flat).not.toContain(secret);
+  });
+});
+
+describe('portIsFree', () => {
+  it('別人綁在所有介面的 port 不算空的（只探 127.0.0.1 會看不到）', async () => {
+    const server = createServer();
+    await new Promise<void>((done) => server.listen(0, () => done()));
+    const taken = (server.address() as { port: number }).port;
+    try {
+      expect(await portIsFree(taken)).toBe(false);
+    } finally {
+      await new Promise<void>((done) => server.close(() => done()));
+    }
   });
 });
 
