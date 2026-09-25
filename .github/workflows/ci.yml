@@ -11,7 +11,8 @@ on:
 jobs:
   # 本機 hook 只在設定過的 clone 生效，GitHub 網頁 merge、fork 送來的 commit 都不經過它。
   # 這裡每次掃 HEAD 的整段祖先（改動與 commit message，兩步範圍一致，不掃 origin 上別的分支），
-  # gitleaks 釘版本並驗官方 checksum。-v 印出檔案、行號與規則，值照樣遮掉。
+  # gitleaks 釘版本並驗官方 checksum，值一律遮掉。merge commit 要帶 --diff-merges=first-parent：
+  # git log -p 預設不印 merge 的 diff，解衝突時貼進去的內容（GitHub 網頁 Resolve conflicts）會漏掉。
   secrets:
     runs-on: ubuntu-latest
     steps:
@@ -24,9 +25,17 @@ jobs:
           echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tgz" | sha256sum -c -
           tar -xzf gitleaks.tgz gitleaks
       - name: 掃歷史裡的改動
-        run: ./gitleaks git -v --redact --no-banner --log-opts=HEAD .
-      - name: 掃 commit message
-        run: git log --format='%H%n%B' HEAD | ./gitleaks stdin -v --redact --no-banner
+        run: ./gitleaks git -v --redact --no-banner --log-opts="HEAD --diff-merges=first-parent" .
+      - name: 掃 commit message（一個 commit 一次，紅了才知道是哪一個）
+        run: |
+          bad=0
+          for c in $(git rev-list HEAD); do
+            if ! git log -1 --format=%B "$c" | ./gitleaks stdin --redact --no-banner --log-level error; then
+              echo "commit $c 的 message 有疑似密鑰"
+              bad=1
+            fi
+          done
+          exit $bad
 
   gate:
     strategy:
