@@ -40,7 +40,7 @@ CI 看得到**：碰到路徑、換行、spawn、檔案權限、`process.platfor
 
 ```bash
 npx tsx scripts/worktreeSetup.ts <分支名>     # 從 origin/main 開、npm ci、寫好這個 worktree 專用的 .env
-npx tsx scripts/worktreeClean.ts              # 列出已合併、乾淨、沒有行程在用的 worktree；加 --apply 才搬進垃圾桶
+npx tsx scripts/worktreeClean.ts              # 列出已合併、乾淨、沒鎖、沒有行程在用的 worktree；加 --apply 才搬進垃圾桶（macOS／Linux）
 ```
 
 `worktreeSetup.ts` 寫的 `.env` 會把 `PORT`、`MEETPILOT_HMR_PORT` 換成空的 port，`MEETPILOT_VAULT` 指到暫存目錄，

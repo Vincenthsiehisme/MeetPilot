@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { isBusy, isCandidate, parseWorktreeList, trashTarget } from './worktreeClean';
+import { assertSupportedPlatform, isBusy, isCandidate, parseWorktreeList, trashTarget } from './worktreeClean';
 
 const porcelain = [
   'worktree /dev/App',
@@ -14,14 +14,20 @@ const porcelain = [
   'HEAD ccc333',
   'detached',
   '',
+  'worktree /dev/App-locked',
+  'HEAD ddd444',
+  'branch refs/heads/feat/locked',
+  'locked 還在用',
+  '',
 ].join('\n');
 
 describe('parseWorktreeList', () => {
   it('第一段是主 clone，分支去掉 refs/heads/，detached 的分支是 null', () => {
     expect(parseWorktreeList(porcelain)).toEqual([
-      { path: '/dev/App', head: 'aaa111', branch: 'main', isMain: true },
-      { path: '/dev/App-feature', head: 'bbb222', branch: 'feat/feature', isMain: false },
-      { path: '/dev/App-detached', head: 'ccc333', branch: null, isMain: false },
+      { path: '/dev/App', head: 'aaa111', branch: 'main', isMain: true, locked: false },
+      { path: '/dev/App-feature', head: 'bbb222', branch: 'feat/feature', isMain: false, locked: false },
+      { path: '/dev/App-detached', head: 'ccc333', branch: null, isMain: false, locked: false },
+      { path: '/dev/App-locked', head: 'ddd444', branch: 'feat/locked', isMain: false, locked: true },
     ]);
   });
 
@@ -31,7 +37,7 @@ describe('parseWorktreeList', () => {
 });
 
 describe('isCandidate', () => {
-  const wt = { path: '/dev/App-x', head: 'b', branch: 'x', isMain: false };
+  const wt = { path: '/dev/App-x', head: 'b', branch: 'x', isMain: false, locked: false };
   const ok = { merged: true, clean: true, busy: false };
 
   it('三條都成立才是候選', () => {
@@ -46,6 +52,10 @@ describe('isCandidate', () => {
 
   it('主 clone 永遠不是候選', () => {
     expect(isCandidate({ ...wt, isMain: true }, ok)).toBe(false);
+  });
+
+  it('git worktree lock 鎖住的不是候選，其他條件都成立也一樣', () => {
+    expect(isCandidate({ ...wt, locked: true }, ok)).toBe(false);
   });
 });
 
@@ -65,5 +75,13 @@ describe('trashTarget', () => {
     const taken = new Set(['/T/App-x', '/T/App-x 2']);
     expect(trashTarget('/T', 'App-x', (p) => taken.has(p))).toBe('/T/App-x 3');
     expect(trashTarget('/T', 'App-y', (p) => taken.has(p))).toBe('/T/App-y');
+  });
+});
+
+describe('assertSupportedPlatform', () => {
+  it('Windows 整支不跑（行程檢查靠 lsof），不是跑到一半 ENOENT', () => {
+    expect(() => assertSupportedPlatform('win32')).toThrow('只支援 macOS 與 Linux');
+    expect(() => assertSupportedPlatform('darwin')).not.toThrow();
+    expect(() => assertSupportedPlatform('linux')).not.toThrow();
   });
 });
