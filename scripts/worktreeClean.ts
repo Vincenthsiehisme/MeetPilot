@@ -7,7 +7,8 @@
  * 從主 clone 或任一 worktree 跑都可以。先 `git fetch origin`（不動 HEAD），再逐一判斷。
  * **只有正面證據才算用完**，三條全成立才是候選（`isCandidate`）：
  *   1. HEAD 已經在 `origin/main` 裡（`git merge-base --is-ancestor`）
- *   2. 工作樹乾淨（`git status --porcelain` 空，含 untracked）
+ *   2. 工作樹乾淨（`git status --porcelain --untracked-files=all` 空：明寫 untracked，使用者設了
+ *      `status.showUntrackedFiles=no` 也不會把有新檔的 worktree 判成乾淨）
  *   3. 沒有任何行程的 cwd 在它底下（`lsof -d cwd`）：dev server 還開著就不收
  * 主 clone 與 `git worktree lock` 鎖住的永遠不是候選。整支只在 macOS 與 Linux 跑（`lsof`）。判斷不了（例如 lsof 失敗）就整支停下，不當成「沒有人在用」。
  *
@@ -101,7 +102,7 @@ function main() {
     } catch {
       merged = false;
     }
-    const facts = { merged, clean: git(e.path, 'status', '--porcelain').trim() === '', busy: isBusy(e.path, cwds) };
+    const facts = { merged, clean: git(e.path, 'status', '--porcelain', '--untracked-files=all').trim() === '', busy: isBusy(e.path, cwds) };
     const why = [e.locked && '被 git worktree lock 鎖住', !facts.merged && '未合併', !facts.clean && '有未提交的改動', facts.busy && '有行程在用'].filter(Boolean).join('、');
     if (isCandidate(e, facts)) {
       candidates.push(e);

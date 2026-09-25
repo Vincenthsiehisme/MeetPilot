@@ -1,6 +1,6 @@
 import { createServer } from 'node:net';
 import { describe, expect, it } from 'vitest';
-import { buildWorktreeEnv, defaultWorktreePath, findFreePort, gitSteps, installStep } from './worktreeSetup';
+import { buildWorktreeEnv, defaultWorktreePath, findFreePort, gitSteps, inheritedIsolationKeys, installStep, staysInside } from './worktreeSetup';
 
 describe('gitSteps', () => {
   const steps = gitSteps({ mainClone: '/dev/App', branch: 'feat/x', path: '/dev/App-x', base: 'origin/main' });
@@ -42,7 +42,7 @@ describe('buildWorktreeEnv', () => {
     'export MEETPILOT_BASIC_AUTH_USER=admin',
     '',
   ].join('\n');
-  const { text, report } = buildWorktreeEnv(source, { port: 3007, hmrPort: 24690, vaultDir: '/tmp/vault-x', mainClone: '/dev/App' });
+  const { text, report } = buildWorktreeEnv(source, { port: 3007, hmrPort: 24690, vaultDir: '/tmp/vault-x', mainClone: '/dev/App', worktree: '/dev/App-x' });
   const lines = text.split('\n');
 
   it('PORT 與 MEETPILOT_VAULT 一定換成這個 worktree 的值，各只出現一次', () => {
@@ -52,7 +52,7 @@ describe('buildWorktreeEnv', () => {
   });
 
   it('主 clone 沒設 MEETPILOT_VAULT 也要寫，不然會落到 ~/MeetPilot Vault', () => {
-    expect(buildWorktreeEnv('HOST=127.0.0.1', { port: 3001, hmrPort: 24680, vaultDir: '/tmp/v', mainClone: '/dev/App' }).text).toContain('MEETPILOT_VAULT=/tmp/v');
+    expect(buildWorktreeEnv('HOST=127.0.0.1', { port: 3001, hmrPort: 24680, vaultDir: '/tmp/v', mainClone: '/dev/App', worktree: '/dev/App-x' }).text).toContain('MEETPILOT_VAULT=/tmp/v');
   });
 
   it('會寫檔的設定是絕對路徑或 ~ 就拿掉，相對路徑留著', () => {
@@ -62,18 +62,33 @@ describe('buildWorktreeEnv', () => {
     expect(report.dropped).toEqual(['MEETPILOT_DB', 'MEETPILOT_LLM_LOG']);
   });
 
+  it('相對路徑跑出 worktree 外也拿掉，留在裡面的照留', () => {
+    const r = buildWorktreeEnv(['MEETPILOT_DB=../shared/prod.db', 'MEETPILOT_AUDIO_DIR=data/audio'].join('\n'), {
+      port: 3001, hmrPort: 24680, vaultDir: '/tmp/v', mainClone: '/dev/App', worktree: '/dev/App-x',
+    });
+    expect(r.report.dropped).toEqual(['MEETPILOT_DB']);
+    expect(r.text).toContain('MEETPILOT_AUDIO_DIR=data/audio');
+  });
+
+  it('UNC 與 Windows 根目錄相對路徑算在 worktree 外', () => {
+    expect(staysInside('/dev/App-x', '\\\\server\\share\\db')).toBe(false);
+    expect(staysInside('/dev/App-x', '\\data\\db')).toBe(false);
+    expect(staysInside('/dev/App-x', 'data/db')).toBe(true);
+    expect(staysInside('/dev/App-x', '.')).toBe(false);
+  });
+
   it('Windows 磁碟機路徑也算絕對路徑', () => {
-    expect(buildWorktreeEnv('MEETPILOT_DB=C:\\data\\prod.db', { port: 3001, hmrPort: 24680, vaultDir: '/tmp/v', mainClone: '/dev/App' }).report.dropped).toEqual(['MEETPILOT_DB']);
+    expect(buildWorktreeEnv('MEETPILOT_DB=C:\\data\\prod.db', { port: 3001, hmrPort: 24680, vaultDir: '/tmp/v', mainClone: '/dev/App', worktree: '/dev/App-x' }).report.dropped).toEqual(['MEETPILOT_DB']);
   });
 
   it('LLM log 設成 off 照留', () => {
-    expect(buildWorktreeEnv('MEETPILOT_LLM_LOG=off', { port: 3001, hmrPort: 24680, vaultDir: '/tmp/v', mainClone: '/dev/App' }).text).toContain('MEETPILOT_LLM_LOG=off');
+    expect(buildWorktreeEnv('MEETPILOT_LLM_LOG=off', { port: 3001, hmrPort: 24680, vaultDir: '/tmp/v', mainClone: '/dev/App', worktree: '/dev/App-x' }).text).toContain('MEETPILOT_LLM_LOG=off');
   });
 
   it('只讀的輸入檔若是相對路徑，改指回主 clone；絕對路徑與不是路徑的值原樣留', () => {
     const r = buildWorktreeEnv(
       ['MEETPILOT_ROSTER_CSV=eval-data/roster.csv', 'MEETPILOT_FFMPEG=/opt/bin/ffmpeg', 'MEETPILOT_FFPROBE=ffprobe'].join('\n'),
-      { port: 3001, hmrPort: 24680, vaultDir: '/tmp/v', mainClone: '/dev/App' },
+      { port: 3001, hmrPort: 24680, vaultDir: '/tmp/v', mainClone: '/dev/App', worktree: '/dev/App-x' },
     );
     expect(r.text).toContain('MEETPILOT_ROSTER_CSV=/dev/App/eval-data/roster.csv');
     expect(r.text).toContain('MEETPILOT_FFMPEG=/opt/bin/ffmpeg');
@@ -106,5 +121,12 @@ describe('findFreePort', () => {
     } finally {
       await new Promise<void>((done) => server.close(() => done()));
     }
+  });
+});
+
+describe('inheritedIsolationKeys', () => {
+  it('shell 已經 export 的隔離 key 列出來（只有 key 名），空字串不算', () => {
+    expect(inheritedIsolationKeys({ MEETPILOT_DB: '/x/prod.db', PORT: '3000', MEETPILOT_VAULT: ' ', HOME: '/h' })).toEqual(['MEETPILOT_DB', 'PORT']);
+    expect(inheritedIsolationKeys({ HOME: '/h' })).toEqual([]);
   });
 });
