@@ -8,7 +8,7 @@
  * - 48px 以上從 1024 的向量縮。macOS 版照 Apple 格線（824 方塊置中、外面透明、不加陰影），
  *   macOS 26 對形狀不合的 icon 會套灰底框；Windows 版方塊撐滿畫布。
  * - 32px 以下照像素格手排：條寬、間隙、條的上下緣都是整數像素，不然邊緣落在半格上會糊。
- *   16、24px 改直條，前傾的 2px 細條在這兩個尺寸會被混色成灰。
+ *   Windows 16、24px 與 macOS 16、32px 改直條，前傾的細條在這些尺寸會被混色成灰。
  */
 
 export const CORAL = '#FF5A4E';
@@ -126,12 +126,26 @@ export interface PixelSpec {
   lean: number;
 }
 
+/** 有底色方塊的小尺寸；inset 是方塊離畫布邊緣的格數（Windows 撐滿是 0，macOS 照 Apple 格線留白） */
+export interface FramedSpec extends PixelSpec {
+  inset: number;
+  radius: number;
+  edge: boolean;
+}
+
 // 條高都取偶數，中心在整數格上時上下緣才會落在整數像素
-export const SMALL_ICONS: Record<16 | 24 | 32, PixelSpec & { radius: number; edge: boolean }> = {
-  32: { size: 32, radius: 7, heights: [10, 18, 12, 8], barWidth: 3, gap: 2, dotGap: 2, dotRadius: 2, lean: LEAN, edge: true },
-  24: { size: 24, radius: 5, heights: [8, 14, 10, 6], barWidth: 2, gap: 2, dotGap: 2, dotRadius: 2, lean: 0, edge: true },
+export const SMALL_ICONS: Record<16 | 24 | 32, FramedSpec> = {
+  32: { size: 32, inset: 0, radius: 7, heights: [10, 18, 12, 8], barWidth: 3, gap: 2, dotGap: 2, dotRadius: 2, lean: LEAN, edge: true },
+  24: { size: 24, inset: 0, radius: 5, heights: [8, 14, 10, 6], barWidth: 2, gap: 2, dotGap: 2, dotRadius: 2, lean: 0, edge: true },
   // 16px 左右只剩 1px，邊線會跟最外側的條黏在一起，所以不畫
-  16: { size: 16, radius: 3.5, heights: [6, 10, 8, 4], barWidth: 2, gap: 1, dotGap: 1, dotRadius: 1, lean: 0, edge: false },
+  16: { size: 16, inset: 0, radius: 3.5, heights: [6, 10, 8, 4], barWidth: 2, gap: 1, dotGap: 1, dotRadius: 1, lean: 0, edge: false },
+};
+
+// macOS 的 16、32px（Finder 列表與側欄）：方塊照 Apple 格線約 81%（16px 本體 14 格、32px 本體 26 格），
+// 裡面放不下 3px 的前傾條，兩個都用直條
+export const MAC_SMALL_ICONS: Record<16 | 32, FramedSpec> = {
+  32: { size: 32, inset: 3, radius: 6, heights: [8, 14, 10, 6], barWidth: 2, gap: 2, dotGap: 2, dotRadius: 2, lean: 0, edge: true },
+  16: { size: 16, inset: 1, radius: 3, heights: [6, 10, 8, 4], barWidth: 1, gap: 1, dotGap: 1, dotRadius: 1, lean: 0, edge: true },
 };
 
 /** macOS 選單列 template：只用黑色與透明，系統依深淺模式上色 */
@@ -144,13 +158,20 @@ export function pixelGlyph(spec: PixelSpec): GlyphLayout {
   return layoutGlyph({ ...spec, cx: spec.size / 2, cy: spec.size / 2 });
 }
 
-export function smallIconSvg(size: 16 | 24 | 32): string {
-  const spec = SMALL_ICONS[size];
-  // 邊線畫在半像素上才會落在最外一圈像素裡；沒有邊線時底色要鋪滿，不然最外圈只蓋一半會發灰
-  const inset = spec.edge ? 0.5 : 0;
+function framedIconSvg(spec: FramedSpec): string {
+  // 邊線畫在半像素上才會落在方塊最外一圈像素裡；沒有邊線時底色要鋪滿，不然最外圈只蓋一半會發灰
+  const inset = spec.inset + (spec.edge ? 0.5 : 0);
   const line = spec.edge ? ` ${EDGE} stroke-width="1"` : '';
-  const back = `<rect x="${inset}" y="${inset}" width="${size - 2 * inset}" height="${size - 2 * inset}" rx="${spec.radius}" fill="url(#bg)"${line}/>`;
-  return svg(size, back + glyphSvg(pixelGlyph(spec), INK, CORAL));
+  const side = spec.size - 2 * inset;
+  const back = `<rect x="${inset}" y="${inset}" width="${side}" height="${side}" rx="${spec.radius}" fill="url(#bg)"${line}/>`;
+  return svg(spec.size, back + glyphSvg(pixelGlyph(spec), INK, CORAL));
+}
+
+export const smallIconSvg = (size: 16 | 24 | 32): string => framedIconSvg(SMALL_ICONS[size]);
+
+/** .icns 各尺寸的來源：16、32px 用像素格版，其餘從 1024 縮 */
+export function macIconSourceSvg(size: number): string {
+  return size === 16 || size === 32 ? framedIconSvg(MAC_SMALL_ICONS[size]) : macIconSvg();
 }
 
 export function traySvg(size: 16 | 32): string {
@@ -204,4 +225,20 @@ export function packIco(images: { size: number; png: Buffer }[]): Buffer {
     offset += png.length;
   }
   return Buffer.concat([header, ...entries, ...images.map((i) => i.png)]);
+}
+
+export interface RenderJob { name: string; svg: string; size: number }
+
+/**
+ * `scripts/buildIcons.ts` 要渲染的全部圖：`mac-<px>` 組 .icns、`win-<px>` 組 .ico、`tray-*` 是托盤圖。
+ * 哪個尺寸用哪一版圖只在這裡決定，測試才守得到接線。
+ */
+export function renderPlan(): RenderJob[] {
+  return [
+    ...[...new Set(Object.values(ICONSET))].map((size) => ({ name: `mac-${size}`, svg: macIconSourceSvg(size), size })),
+    ...ICO_SIZES.map((size) => ({ name: `win-${size}`, svg: icoSourceSvg(size), size })),
+    { name: 'tray-16', svg: traySvg(16), size: 16 },
+    { name: 'tray-32', svg: traySvg(32), size: 32 },
+    { name: 'tray-win', svg: smallIconSvg(32), size: 32 },
+  ];
 }

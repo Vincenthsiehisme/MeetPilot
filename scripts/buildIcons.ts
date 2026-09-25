@@ -12,11 +12,7 @@ import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSy
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import {
-  ICO_SIZES, ICONSET, icoSourceSvg, macIconSvg, packIco, smallIconSvg, traySvg,
-} from './icon/iconArtwork';
-
-interface Job { name: string; svg: string; size: number }
+import { ICO_SIZES, ICONSET, packIco, renderPlan } from './icon/iconArtwork';
 
 function main(): void {
   if (process.platform !== 'darwin') {
@@ -26,13 +22,7 @@ function main(): void {
   }
   const work = mkdtempSync(join(tmpdir(), 'meetpilot-icons-'));
   try {
-    const jobs: Job[] = [
-      ...[...new Set(Object.values(ICONSET))].map((size) => ({ name: `mac-${size}`, svg: macIconSvg(), size })),
-      ...ICO_SIZES.map((size) => ({ name: `win-${size}`, svg: icoSourceSvg(size), size })),
-      { name: 'tray-16', svg: traySvg(16), size: 16 },
-      { name: 'tray-32', svg: traySvg(32), size: 32 },
-      { name: 'tray-win', svg: smallIconSvg(32), size: 32 },
-    ];
+    const jobs = renderPlan();
     const png = (name: string) => join(work, `${name}.png`);
     const renderJobs = jobs.map(({ name, svg, size }) => {
       const svgPath = join(work, `${name}.svg`);
