@@ -62,8 +62,10 @@ git config core.hooksPath "$(git rev-parse --show-toplevel)/.githooks"    # 在�
 
 一定要絕對路徑：相對的 `.githooks` 會從每個 worktree 自己的根目錄找，還沒有這些 hook 的舊分支 worktree 會被
 git 安靜略過。絕對路徑指到主 clone，主 clone 一律待在 main（正式 server 從那裡跑）。
+hook 讀的是主 clone 工作樹裡的 `.githooks/`：主 clone 更新到含這個目錄的 main 之前，git 找不到 hook，所有 worktree 的 commit 都不掃
+（2026-09-25 設好 `core.hooksPath` 時主 clone 停在 `d84ee6e`，就是這個狀態）。確認有沒有作用：`git hook run pre-commit`，印 `cannot find a hook` 就是沒有。
 CI 的 `secrets` job 另外每次掃 HEAD 的整段歷史與 commit message，抓 GitHub 網頁 merge、fork 這些不經過本機 hook 的路；
-本機 hook 是第一層。`secrets` 沒設成 main 的 required check 之前，它紅了只是通知，merge 按鈕照樣能按。
+本機 hook 是第一層。`secrets` 是 main 的 required check（2026-09-25 起），紅了不能 merge；admin 看得到 bypass 選項，不要用它硬合。
 本機 hook 擋不到的路：`git rebase --continue`（解衝突時新貼進去的內容）、無衝突的 cherry-pick 與 rebase 重放、fast-forward，這些靠 CI。
 已經進歷史的誤報寫進 `.gitleaksignore`，一條一個理由。
 沒裝 gitleaks 時三支 hook 都直接擋 commit，不會安靜略過。誤報（例如公開的簽章指紋）在那一行加 `# gitleaks:allow`
