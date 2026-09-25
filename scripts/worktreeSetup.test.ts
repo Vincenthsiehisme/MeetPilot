@@ -1,4 +1,5 @@
 import { createServer } from 'node:net';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { buildWorktreeEnv, defaultWorktreePath, findFreePort, gitSteps, inheritedIsolationKeys, installStep, parseDotenvValue, portIsFree, staysInside } from './worktreeSetup';
 
@@ -25,7 +26,7 @@ describe('installStep', () => {
 
 describe('defaultWorktreePath', () => {
   it('放主 clone 旁邊，名字接分支最後一段', () => {
-    expect(defaultWorktreePath('/dev/App', 'feat/the-thing')).toBe('/dev/App-the-thing');
+    expect(defaultWorktreePath('/dev/App', 'feat/the-thing')).toBe(join('/dev', 'App-the-thing'));
   });
 });
 
@@ -103,7 +104,7 @@ describe('buildWorktreeEnv', () => {
       ['MEETPILOT_ROSTER_CSV=eval-data/roster.csv', 'MEETPILOT_FFMPEG=/opt/bin/ffmpeg', 'MEETPILOT_FFPROBE=ffprobe'].join('\n'),
       { port: 3001, hmrPort: 24680, vaultDir: '/tmp/v', mainClone: '/dev/App', worktree: '/dev/App-x' },
     );
-    expect(r.text).toContain('MEETPILOT_ROSTER_CSV=/dev/App/eval-data/roster.csv');
+    expect(r.text).toContain(`MEETPILOT_ROSTER_CSV=${join('/dev/App', 'eval-data/roster.csv')}`);
     expect(r.text).toContain('MEETPILOT_FFMPEG=/opt/bin/ffmpeg');
     expect(r.text).toContain('MEETPILOT_FFPROBE=ffprobe');
     expect(r.report.repointed).toEqual(['MEETPILOT_ROSTER_CSV']);
@@ -191,7 +192,7 @@ describe('buildWorktreeEnv 的 dotenv 語意', () => {
 
   it('沒有斜線的相對輸入檔也改指回主 clone，ffmpeg 的裸命令名稱例外', () => {
     const r = buildWorktreeEnv(['MEETPILOT_ROSTER_CSV=roster.csv', 'MEETPILOT_FFMPEG=ffmpeg'].join('\n'), o);
-    expect(r.text).toContain('MEETPILOT_ROSTER_CSV=/dev/App/roster.csv');
+    expect(r.text).toContain(`MEETPILOT_ROSTER_CSV=${join('/dev/App', 'roster.csv')}`);
     expect(r.text).toContain('MEETPILOT_FFMPEG=ffmpeg');
     expect(r.report.repointed).toEqual(['MEETPILOT_ROSTER_CSV']);
   });

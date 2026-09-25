@@ -1,3 +1,4 @@
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { assertSupportedPlatform, isBusy, isCandidate, parseWorktreeList, trashTarget } from './worktreeClean';
 
@@ -61,20 +62,21 @@ describe('isCandidate', () => {
 
 describe('isBusy', () => {
   it('cwd 是它本身或在它底下就算在用', () => {
-    expect(isBusy('/dev/App-x', ['/dev/App-x'])).toBe(true);
-    expect(isBusy('/dev/App-x', ['/dev/App-x/server'])).toBe(true);
+    const wt = join('/dev', 'App-x');
+    expect(isBusy(wt, [wt])).toBe(true);
+    expect(isBusy(wt, [join(wt, 'server')])).toBe(true);
   });
 
   it('名字是前綴的兄弟目錄不算', () => {
-    expect(isBusy('/dev/App', ['/dev/App-x'])).toBe(false);
+    expect(isBusy(join('/dev', 'App'), [join('/dev', 'App-x')])).toBe(false);
   });
 });
 
 describe('trashTarget', () => {
   it('撞名加編號，不覆蓋', () => {
-    const taken = new Set(['/T/App-x', '/T/App-x 2']);
-    expect(trashTarget('/T', 'App-x', (p) => taken.has(p))).toBe('/T/App-x 3');
-    expect(trashTarget('/T', 'App-y', (p) => taken.has(p))).toBe('/T/App-y');
+    const taken = new Set([join('/T', 'App-x'), join('/T', 'App-x 2')]);
+    expect(trashTarget('/T', 'App-x', (p) => taken.has(p))).toBe(join('/T', 'App-x 3'));
+    expect(trashTarget('/T', 'App-y', (p) => taken.has(p))).toBe(join('/T', 'App-y'));
   });
 });
 
