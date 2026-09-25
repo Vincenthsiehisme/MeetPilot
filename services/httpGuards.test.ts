@@ -6,6 +6,7 @@ import {
   createRateLimiter,
   isLoopbackHost,
   describeBodyParserError,
+  resolveHmrPort,
 } from './httpGuards';
 
 const basicHeader = (user: string, password: string) =>
@@ -226,5 +227,22 @@ describe('isLoopbackAddress（錄音路由只收本機請求，AC-6）', () => {
   it('只比對整段位址，不被長得像的字串騙過', () => {
     expect(isLoopbackAddress('127.0.0.1.evil')).toBe(false);
     expect(isLoopbackAddress('x127.0.0.1')).toBe(false);
+  });
+});
+
+describe('resolveHmrPort', () => {
+  it('沒設或空白回 undefined，讓 Vite 用預設', () => {
+    expect(resolveHmrPort({})).toBeUndefined();
+    expect(resolveHmrPort({ MEETPILOT_HMR_PORT: '  ' })).toBeUndefined();
+  });
+
+  it('十進位整數照收', () => {
+    expect(resolveHmrPort({ MEETPILOT_HMR_PORT: '24690' })).toBe(24690);
+  });
+
+  it('不是合法連接埠就啟動時拋錯，"3e3" 這種寫法也擋', () => {
+    expect(() => resolveHmrPort({ MEETPILOT_HMR_PORT: 'abc' })).toThrowError('MEETPILOT_HMR_PORT="abc" 不是合法的連接埠');
+    expect(() => resolveHmrPort({ MEETPILOT_HMR_PORT: '70000' })).toThrowError('不是合法的連接埠');
+    expect(() => resolveHmrPort({ MEETPILOT_HMR_PORT: '3e3' })).toThrowError('不是合法的連接埠');
   });
 });

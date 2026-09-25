@@ -107,6 +107,21 @@ function safeEqual(a: string, b: string): boolean {
   return timingSafeEqual(bufA, bufB);
 }
 
+/**
+ * 開發模式 Vite 熱更新的 WebSocket port（`MEETPILOT_HMR_PORT`）。沒設回 undefined，Vite 用它的預設 24678。
+ * 同一台機器同時跑兩個 `npm run dev`（主 clone 加一個 worktree）時第二個會撞 port、熱更新失效，
+ * `scripts/worktreeSetup.ts` 會替 worktree 寫一個空的 port。驗證規則跟 PORT 一樣。
+ */
+export function resolveHmrPort(env: NodeJS.ProcessEnv): number | undefined {
+  const raw = readEnv(env, 'MEETPILOT_HMR_PORT');
+  if (raw === undefined) return undefined;
+  const port = parseDecimalInteger(raw);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`MEETPILOT_HMR_PORT="${raw}" 不是合法的連接埠（1-65535），請修正 .env`);
+  }
+  return port;
+}
+
 // 檢查 Authorization header 是否等於設定的 Basic Auth 帳密。
 export function checkBasicAuth(
   authorizationHeader: string | undefined,

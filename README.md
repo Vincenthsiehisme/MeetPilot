@@ -140,6 +140,12 @@ node scripts/smokeDesktop.mjs <打包後的執行檔>   # 啟動打包後的 app
   跑 server 自己的 `createAudioSlicer`。少開一個解碼器，某種檔就會在轉錄一開始 FAILED，而三條 gate 照樣全綠。
   要支援新格式：在 `configure-flags.txt` 加元件、在 fixtures 加一支該格式的音檔，兩個都要。
 - 打包後找不到隨附的 ffmpeg 會跳錯誤視窗，不退回 PATH（記錄人電腦上本來就沒有 ffmpeg）。
+- **app icon 與托盤圖示是產生的**：圖案定義在 `scripts/icon/iconArtwork.ts`，`npm run icons:build`（只能在 macOS 跑，
+  `.icns` 要用 `iconutil`）寫出 `build/icon.icns`、`build/icon.ico` 與 `electron/assets/` 的三張托盤圖，產出的圖一起 commit。
+  要改樣子改 `iconArtwork.ts` 再重跑，不要手改圖檔。32px 以下（`.icns` 的 16、32 與 `.ico` 的 16、24、32）是照像素格手排的，
+  `iconArtwork.test.ts` 守條與點排版時的外框落在整數像素（前傾的條渲染後邊緣本來就是斜的）、前傾之後離方塊左右仍留 1px，
+  以及每個尺寸接到對的那一版（`renderPlan`）。macOS 26 會把形狀不合 Apple 格線的 icon 放進灰底框；目前的形狀是超橢圓近似，
+  會不會被判不合要在 macOS 26 上裝起來看。要根治得改用 Icon Composer 的 `.icon`（electron-builder 支援，但要 Xcode 26 的 `actool`）。
 - 安裝檔沒有簽章，第一次打開 macOS 要到「系統設定 → 隱私權與安全性」按「仍要打開」，Windows 的 SmartScreen
   要按「其他資訊 → 仍要執行」。
 - **第一次打開是設定頁**（外殼自己的 `electron/setup.html`，server 還沒起來）：輸入 admin 給的邀請碼、選會議記錄資料夾。
@@ -516,7 +522,7 @@ POST /api/meetings/import   { jobs: Job[], blobIds: string[] }
 
 見 `.env.example`。`MEETPILOT_AUDIO_DIR` 是上傳音檔的落地位置；`MEETPILOT_FFMPEG` 與
 `MEETPILOT_FFPROBE` 指定那兩支執行檔的路徑，不設就走 PATH。`MEETPILOT_DB` 是 SQLite 的位置，路徑不可寫時 server 直接起不來；
-資料庫的 schema 版本比程式碼新時也拒絕開啟，不用舊程式碼往裡面寫。`npm run dev` 與 `npm start` 用 Node 的 `--env-file-if-exists=.env` 讀 `.env`，沒有那個檔就只吃 shell 環境變數。`HOST` 不是本機位址時必須設 `MEETPILOT_BASIC_AUTH_USER` 與 `MEETPILOT_BASIC_AUTH_PASSWORD`，server 才會啟動。`/api/*` 每個 IP 每分鐘最多 `MEETPILOT_API_RATE_LIMIT` 次（預設 60）。放在反向代理後面時所有使用者會共用同一個 IP 的額度，Express 沒設 `trust proxy`，這是刻意的：設了又沒限定代理位址，`X-Forwarded-For` 就能繞過限流。同機反向代理另有兩個問題：`HOST` 是本機位址所以不要求 Basic Auth，而且語音備忘錄錄音的「只收本機請求」會失效，見〈用語音備忘錄錄音〉。
+資料庫的 schema 版本比程式碼新時也拒絕開啟，不用舊程式碼往裡面寫。`npm run dev` 與 `npm start` 用 Node 的 `--env-file-if-exists=.env` 讀 `.env`，沒有那個檔就只吃 shell 環境變數。`HOST` 不是本機位址時必須設 `MEETPILOT_BASIC_AUTH_USER` 與 `MEETPILOT_BASIC_AUTH_PASSWORD`，server 才會啟動。`/api/*` 每個 IP 每分鐘最多 `MEETPILOT_API_RATE_LIMIT` 次（預設 60）。開發模式的熱更新 port 可用 `MEETPILOT_HMR_PORT` 改（預設 24678），同機跑第二個 `npm run dev` 時要設，`scripts/worktreeSetup.ts` 開的 worktree 會自動寫好。放在反向代理後面時所有使用者會共用同一個 IP 的額度，Express 沒設 `trust proxy`，這是刻意的：設了又沒限定代理位址，`X-Forwarded-For` 就能繞過限流。同機反向代理另有兩個問題：`HOST` 是本機位址所以不要求 Basic Auth，而且語音備忘錄錄音的「只收本機請求」會失效，見〈用語音備忘錄錄音〉。
 
 `MEETPILOT_RECORDER` 決定新的錄音怎麼開始：`voice-memo`（預設，叫本機語音備忘錄）或 `in-app`（頁面自己用麥克風錄、分段送上來，桌面 app 用這個）。寫錯值 server 起不來。已經在錄的那場照它開始時的方式收尾，不看現在的設定。
 

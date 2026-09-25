@@ -34,6 +34,21 @@ CI 看得到**：碰到路徑、換行、spawn、檔案權限、`process.platfor
 - `npm start` 用 `cross-env` 設 `NODE_ENV`，因為 cmd 與 PowerShell 不吃 `VAR=value cmd` 的寫法。
   它放在 `dependencies` 不是 `devDependencies`：`--omit=dev` 的安裝也要能 `npm start`。
 
+## 開 worktree 與收掉
+
+正式 server 從主 clone 跑，**主 clone 不切分支、不 pull、不直接改檔**。要動手就開 worktree：
+
+```bash
+npx tsx scripts/worktreeSetup.ts <分支名>     # 從 origin/main 開、npm ci、寫好這個 worktree 專用的 .env
+npx tsx scripts/worktreeClean.ts              # 列出已合併、乾淨、沒鎖、沒有行程在用的 worktree；加 --apply 才搬進垃圾桶（macOS／Linux）
+```
+
+`worktreeSetup.ts` 寫的 `.env` 會把 `PORT`、`MEETPILOT_HMR_PORT` 換成空的 port，`MEETPILOT_VAULT` 指到暫存目錄，
+會寫檔的絕對路徑拿掉、只讀輸入檔的相對路徑改指回主 clone。規則與理由在兩支腳本的檔頭。
+shell 裡已經 export 了 `PORT`、`MEETPILOT_HMR_PORT` 或會寫檔的路徑設定時，Node 的 `--env-file` 不會蓋掉它們，腳本會拒跑；之後在那個 worktree 跑 `npm run dev` 的 shell 也不能有這些 export。
+新增會寫檔或只讀的路徑型 `MEETPILOT_*` 設定時，要加進 `worktreeSetup.ts` 的 `WRITE_TARGET_KEYS` 或 `READ_INPUT_KEYS`，
+不然 worktree 會寫到正式那份，或一啟動就找不到檔。
+
 ## commit 前的檢查
 
 `.githooks/pre-commit` 用 gitleaks 掃 staged 的改動，`.githooks/commit-msg` 掃 commit message，`.githooks/pre-merge-commit`
@@ -234,6 +249,9 @@ function f(p: Pick) {
 - **隨附的 ffmpeg 只開了 server 用得到的元件**（`scripts/ffmpeg/configure-flags.txt`）。server 改用新的 ffmpeg 功能
   （新的濾鏡、編碼器、容器）時，開發機上的完整版 ffmpeg 照樣能跑、三條 gate 照樣綠，打包後才壞。改 `audioSlicer.ts`
   的 ffmpeg 參數時，同一個 PR 要在 flags 加元件並跑 `npm run ffmpeg:verify`；新格式要加一支 fixture。
+- **icon 與托盤圖示由 `npm run icons:build` 產生**（圖案在 `scripts/icon/iconArtwork.ts`），不要手改 `build/icon.*`
+  或 `electron/assets/*.png`，下次重跑就被蓋掉。托盤的 `trayTemplate*.png` 是 macOS template：只能有黑色與透明，
+  檔名結尾 `Template` 不能改，系統靠它判斷要依深淺模式上色。
 - `package.json` 的 `name` 是 `meetpilot`：electron-builder 要求合法的 npm 套件名，中文名不行；產品名在 `build.productName`。
 
 ## 這個 repo 的已知地雷
