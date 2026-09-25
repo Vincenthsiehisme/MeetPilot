@@ -1,6 +1,6 @@
 import { createServer } from 'node:net';
 import { describe, expect, it } from 'vitest';
-import { buildWorktreeEnv, defaultWorktreePath, findFreePort, gitSteps, inheritedIsolationKeys, installStep, staysInside } from './worktreeSetup';
+import { buildWorktreeEnv, defaultWorktreePath, findFreePort, gitSteps, inheritedIsolationKeys, installStep, parseDotenvValue, staysInside } from './worktreeSetup';
 
 describe('gitSteps', () => {
   const steps = gitSteps({ mainClone: '/dev/App', branch: 'feat/x', path: '/dev/App-x', base: 'origin/main' });
@@ -128,5 +128,32 @@ describe('inheritedIsolationKeys', () => {
   it('shell 已經 export 的隔離 key 列出來（只有 key 名），空字串不算', () => {
     expect(inheritedIsolationKeys({ MEETPILOT_DB: '/x/prod.db', PORT: '3000', MEETPILOT_VAULT: ' ', HOME: '/h' })).toEqual(['MEETPILOT_DB', 'PORT']);
     expect(inheritedIsolationKeys({ HOME: '/h' })).toEqual([]);
+  });
+});
+
+describe('parseDotenvValue', () => {
+  it('引號值取到收尾引號，後面的註解不算', () => {
+    expect(parseDotenvValue('"/prod/db.sqlite" # production')).toBe('/prod/db.sqlite');
+    expect(parseDotenvValue("'a b' # x")).toBe('a b');
+  });
+
+  it('沒引號就切掉 # 之後的註解', () => {
+    expect(parseDotenvValue('data/db.sqlite # 本機')).toBe('data/db.sqlite');
+    expect(parseDotenvValue('  plain  ')).toBe('plain');
+  });
+});
+
+describe('buildWorktreeEnv 的 dotenv 語意', () => {
+  const o = { port: 3001, hmrPort: 24680, vaultDir: '/tmp/v', mainClone: '/dev/App', worktree: '/dev/App-x' };
+
+  it('引號加行尾註解的絕對寫入路徑照樣拿掉', () => {
+    expect(buildWorktreeEnv('MEETPILOT_DB="/prod/db.sqlite" # production', o).report.dropped).toEqual(['MEETPILOT_DB']);
+  });
+
+  it('沒有斜線的相對輸入檔也改指回主 clone，ffmpeg 的裸命令名稱例外', () => {
+    const r = buildWorktreeEnv(['MEETPILOT_ROSTER_CSV=roster.csv', 'MEETPILOT_FFMPEG=ffmpeg'].join('\n'), o);
+    expect(r.text).toContain('MEETPILOT_ROSTER_CSV=/dev/App/roster.csv');
+    expect(r.text).toContain('MEETPILOT_FFMPEG=ffmpeg');
+    expect(r.report.repointed).toEqual(['MEETPILOT_ROSTER_CSV']);
   });
 });

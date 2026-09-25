@@ -85,7 +85,25 @@ export function inheritedIsolationKeys(env: NodeJS.ProcessEnv): string[] {
   return [...WRITE_TARGET_KEYS, 'PORT', 'MEETPILOT_HMR_PORT'].filter((k) => (env[k] ?? '').trim() !== '');
 }
 
-/** `.env` 一行一個 `KEY=value`；註解與空行原樣留。只認 dotenv 的基本寫法，不展開變數。 */
+/**
+ * 照 Node `--env-file` 的語意取出值：引號開頭就取到對應的收尾引號為止（後面的 `# 註解` 不算值）；
+ * 沒有引號就切掉第一個 `#` 之後的行尾註解。不展開變數。
+ */
+export function parseDotenvValue(raw: string): string {
+  const v = raw.trim();
+  const q = v[0];
+  if (q === '"' || q === "'" || q === '`') {
+    const end = v.indexOf(q, 1);
+    return end > 0 ? v.slice(1, end) : v.slice(1);
+  }
+  const hash = v.indexOf('#');
+  return (hash >= 0 ? v.slice(0, hash) : v).trim();
+}
+
+/** ffmpeg／ffprobe 可以只寫命令名稱（走 PATH），不是相對路徑；其餘只讀輸入的相對值一律是路徑。 */
+const COMMAND_NAME_KEYS = ['MEETPILOT_FFMPEG', 'MEETPILOT_FFPROBE'];
+
+/** `.env` 一行一個 `KEY=value`；註解與空行原樣留。 */
 export function buildWorktreeEnv(
   source: string,
   overrides: { port: number; hmrPort: number; vaultDir: string; mainClone: string; worktree: string },
@@ -104,13 +122,14 @@ export function buildWorktreeEnv(
       continue;
     }
     const key = m[1];
-    const value = m[2].trim().replace(/^(['"])(.*)\1$/, '$2');
+    const value = parseDotenvValue(m[2]);
     if (key in forced) continue;
     if ((WRITE_TARGET_KEYS as readonly string[]).includes(key) && value.toLowerCase() !== 'off' && !staysInside(overrides.worktree, value)) {
       report.dropped.push(key);
       continue;
     }
-    if ((READ_INPUT_KEYS as readonly string[]).includes(key) && value !== '' && !isAbsoluteLike(value) && /[\\/]/.test(value)) {
+    const bareCommand = COMMAND_NAME_KEYS.includes(key) && !/[\\/]/.test(value);
+    if ((READ_INPUT_KEYS as readonly string[]).includes(key) && value !== '' && !isAbsoluteLike(value) && !bareCommand) {
       out.push(`${key}=${join(overrides.mainClone, value)}`);
       report.repointed.push(key);
       continue;
