@@ -36,7 +36,8 @@ CI 看得到**：碰到路徑、換行、spawn、檔案權限、`process.platfor
 
 ## commit 前的檢查
 
-`.githooks/pre-commit` 用 gitleaks 掃 staged 的改動，`.githooks/commit-msg` 掃 commit message，有疑似密鑰就擋。
+`.githooks/pre-commit` 用 gitleaks 掃 staged 的改動，`.githooks/commit-msg` 掃 commit message，`.githooks/pre-merge-commit`
+在沒有衝突、git 直接建 merge commit 時掃合併結果（git 這時不呼叫 pre-commit），有疑似密鑰就擋。
 **在主 clone 啟用一次，所有 worktree 共用**：
 
 ```bash

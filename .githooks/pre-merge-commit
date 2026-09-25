@@ -1,0 +1,4 @@
+#!/bin/sh
+# 沒有衝突的 git merge 直接建 merge commit 時，git 呼叫這支、不呼叫 pre-commit。
+# 合併結果已經在 index 裡，交給同一支 pre-commit 掃，規則只有一份。
+exec "$(dirname "$0")/pre-commit"
