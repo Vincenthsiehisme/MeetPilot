@@ -42,15 +42,18 @@ CI 看得到**：碰到路徑、換行、spawn、檔案權限、`process.platfor
 
 ```bash
 brew install gitleaks
-git config core.hooksPath "$PWD/.githooks"    # 在主 clone 根目錄跑；一定要絕對路徑
+git config core.hooksPath "$(git rev-parse --show-toplevel)/.githooks"    # 在主 clone 裡跑（不是 worktree）；一定要絕對路徑
 ```
 
-一定要絕對路徑：相對的 `.githooks` 會從每個 worktree 自己的根目錄找，還沒有這兩支 hook 的舊分支 worktree 會被
+一定要絕對路徑：相對的 `.githooks` 會從每個 worktree 自己的根目錄找，還沒有這些 hook 的舊分支 worktree 會被
 git 安靜略過。絕對路徑指到主 clone，主 clone 一律待在 main（正式 server 從那裡跑）。
-CI 的 `secrets` job 另外每次掃整段歷史與 commit message，擋住 GitHub 網頁 merge、fork 這些不經過本機 hook 的路；本機 hook 是第一層。
+CI 的 `secrets` job 另外每次掃 HEAD 的整段歷史與 commit message，抓 GitHub 網頁 merge、fork 這些不經過本機 hook 的路；
+本機 hook 是第一層。`secrets` 沒設成 main 的 required check 之前，它紅了只是通知，merge 按鈕照樣能按。
+本機 hook 擋不到的路：`git rebase --continue`（解衝突時新貼進去的內容）、無衝突的 cherry-pick 與 rebase 重放、fast-forward，這些靠 CI。
 已經進歷史的誤報寫進 `.gitleaksignore`，一條一個理由。
 沒裝 gitleaks 時三支 hook 都直接擋 commit，不會安靜略過。誤報（例如公開的簽章指紋）在那一行加 `# gitleaks:allow`
-並寫理由，不要整個關掉 hook。PR 說明照 `.github/pull_request_template.md` 寫。
+並寫理由，不要整個關掉 hook。`gitleaks:allow` 整行放行，只能用在整行都是公開資料的地方；commit message 裡不准寫它
+（寫了，message 掃描也會放行）。PR 說明照 `.github/pull_request_template.md` 寫。
 
 ## CodeGraph
 

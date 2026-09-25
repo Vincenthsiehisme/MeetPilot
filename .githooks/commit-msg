@@ -6,7 +6,7 @@ if ! command -v gitleaks >/dev/null 2>&1; then
   echo "commit-msg：找不到 gitleaks（macOS：brew install gitleaks）。不裝就不能 commit，不是略過。" >&2
   exit 1
 fi
-if ! gitleaks stdin --redact --no-banner < "$1"; then
+if ! gitleaks stdin -v --redact --no-banner < "$1"; then
   echo "commit-msg：commit message 裡有疑似密鑰，commit 已擋下。改掉 message 再 commit。" >&2
   exit 1
 fi

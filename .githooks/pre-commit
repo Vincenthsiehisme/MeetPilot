@@ -6,4 +6,4 @@ if ! command -v gitleaks >/dev/null 2>&1; then
   echo "pre-commit：找不到 gitleaks（macOS：brew install gitleaks）。不裝就不能 commit，不是略過。" >&2
   exit 1
 fi
-gitleaks git --pre-commit --staged --redact --no-banner .
+gitleaks git --pre-commit --staged -v --redact --no-banner .
