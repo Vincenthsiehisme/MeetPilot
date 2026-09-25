@@ -12,7 +12,8 @@ const pixelSpecs: [string, PixelSpec, number][] = [
 ];
 
 describe('小尺寸照像素格排', () => {
-  it.each(pixelSpecs)('%s：條與點的邊緣都落在整數像素上', (_, spec) => {
+  // 查的是斜切前的外框；前傾的條（Windows 32、tray 32）渲染後邊緣本來就是斜的
+  it.each(pixelSpecs)('%s：條與點排版時的外框落在整數像素上', (_, spec) => {
     const { bars, dot } = pixelGlyph(spec);
     for (const b of bars) {
       for (const v of [b.x, b.y, b.width, b.height]) expect(Number.isInteger(v)).toBe(true);

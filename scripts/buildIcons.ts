@@ -34,6 +34,7 @@ function main(): void {
 
     const electron = createRequire(import.meta.url)('electron') as string;
     const rendered = spawnSync(electron, [resolve('scripts/icon/renderIcons.cjs'), jobsFile], { stdio: 'inherit' });
+    if (rendered.error) throw rendered.error;
     if (rendered.status !== 0) throw new Error(`Electron 渲染結束碼 ${rendered.status ?? rendered.signal}`);
 
     mkdirSync('build', { recursive: true });
@@ -43,6 +44,7 @@ function main(): void {
     mkdirSync(iconset);
     for (const [file, size] of Object.entries(ICONSET)) copyFileSync(png(`mac-${size}`), join(iconset, file));
     const icns = spawnSync('iconutil', ['-c', 'icns', iconset, '-o', 'build/icon.icns'], { stdio: 'inherit' });
+    if (icns.error) throw icns.error;
     if (icns.status !== 0) throw new Error(`iconutil 結束碼 ${icns.status ?? icns.signal}`);
 
     copyFileSync(png('tray-16'), 'electron/assets/trayTemplate.png');

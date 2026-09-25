@@ -29,6 +29,11 @@ async function render({ svg, size, out }) {
     const image = await win.webContents.capturePage({ x: 0, y: 0, width: size, height: size });
     const { width, height } = image.getSize();
     if (width !== size || height !== size) throw new Error(`${out}：要 ${size}px，截到 ${width}×${height}`);
+    // 截圖早於繪製時會拿到尺寸對但全透明的圖，iconutil 與 .ico 打包都不會抱怨，只有肉眼看得出
+    const bgra = image.toBitmap();
+    let painted = false;
+    for (let i = 3; i < bgra.length; i += 4) if (bgra[i] > 0) { painted = true; break; }
+    if (!painted) throw new Error(`${out}：截到的圖全透明`);
     writeFileSync(out, image.toPNG());
   } finally {
     win.destroy();
