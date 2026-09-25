@@ -1,0 +1,3 @@
+# 已經在歷史裡的誤報，逐條寫理由。
+# FFmpeg 官方簽章公鑰的指紋，公開資料（scripts/ffmpeg/build.sh 同一行現在也標了 gitleaks:allow）。
+2bed5af19e10ee61624017718bac39316ad6c560:scripts/ffmpeg/build.sh:generic-api-key:16

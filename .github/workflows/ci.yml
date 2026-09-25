@@ -9,6 +9,24 @@ on:
   pull_request:
 
 jobs:
+  # 本機 hook 只在設定過的 clone 生效，GitHub 網頁 merge、fork 送來的 commit 都不經過它。
+  # 這裡每次掃整段歷史（改動與 commit message），gitleaks 釘版本並驗官方 checksum。
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: 安裝 gitleaks 8.30.1
+        run: |
+          curl -sSfL -o gitleaks.tgz https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tgz" | sha256sum -c -
+          tar -xzf gitleaks.tgz gitleaks
+      - name: 掃歷史裡的改動
+        run: ./gitleaks git --redact --no-banner .
+      - name: 掃 commit message
+        run: git log --format='%H%n%B' | ./gitleaks stdin --redact --no-banner
+
   gate:
     strategy:
       fail-fast: false
