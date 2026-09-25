@@ -16,7 +16,8 @@
     "package:mac": "npm run build && npm run build:electron && electron-builder --mac --publish never",
     "package:win": "npm run build && npm run build:electron && electron-builder --win --publish never",
     "ffmpeg:build": "bash scripts/ffmpeg/build.sh",
-    "ffmpeg:verify": "tsx scripts/verifyFfmpeg.ts"
+    "ffmpeg:verify": "tsx scripts/verifyFfmpeg.ts",
+    "icons:build": "tsx scripts/buildIcons.ts"
   },
   "dependencies": {
     "@google/genai": "^1.38.0",
@@ -72,6 +73,7 @@
           ]
         }
       ],
+      "icon": "build/icon.icns",
       "category": "public.app-category.productivity",
       "identity": null,
       "extendInfo": {
@@ -79,6 +81,7 @@
       }
     },
     "win": {
+      "icon": "build/icon.ico",
       "target": [
         {
           "target": "nsis",
