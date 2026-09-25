@@ -45,6 +45,7 @@ npx tsx scripts/worktreeClean.ts              # 列出已合併、乾淨、沒�
 
 `worktreeSetup.ts` 寫的 `.env` 會把 `PORT`、`MEETPILOT_HMR_PORT` 換成空的 port，`MEETPILOT_VAULT` 指到暫存目錄，
 會寫檔的絕對路徑拿掉、只讀輸入檔的相對路徑改指回主 clone。規則與理由在兩支腳本的檔頭。
+shell 裡已經 export 了 `PORT`、`MEETPILOT_HMR_PORT` 或會寫檔的路徑設定時，Node 的 `--env-file` 不會蓋掉它們，腳本會拒跑；之後在那個 worktree 跑 `npm run dev` 的 shell 也不能有這些 export。
 新增會寫檔或只讀的路徑型 `MEETPILOT_*` 設定時，要加進 `worktreeSetup.ts` 的 `WRITE_TARGET_KEYS` 或 `READ_INPUT_KEYS`，
 不然 worktree 會寫到正式那份，或一啟動就找不到檔。
 
