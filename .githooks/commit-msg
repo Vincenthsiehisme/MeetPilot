@@ -1,0 +1,12 @@
+#!/bin/sh
+# commit message 也會進公開歷史：用 gitleaks 掃 git 傳進來的 message 檔。pre-commit 執行時 message 還不存在，
+# 所以要另一支。啟用方式同 pre-commit，見 AGENTS.md〈commit 前的檢查〉。
+set -e
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "commit-msg：找不到 gitleaks（macOS：brew install gitleaks）。不裝就不能 commit，不是略過。" >&2
+  exit 1
+fi
+if ! gitleaks stdin --redact --no-banner < "$1"; then
+  echo "commit-msg：commit message 裡有疑似密鑰，commit 已擋下。改掉 message 再 commit。" >&2
+  exit 1
+fi

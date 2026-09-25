@@ -36,15 +36,18 @@ CI 看得到**：碰到路徑、換行、spawn、檔案權限、`process.platfor
 
 ## commit 前的檢查
 
-`.githooks/pre-commit` 用 gitleaks 掃 staged 的改動，有疑似密鑰就擋。每個 clone 啟用一次（worktree 共用）：
+`.githooks/pre-commit` 用 gitleaks 掃 staged 的改動，`.githooks/commit-msg` 掃 commit message，有疑似密鑰就擋。
+**在主 clone 啟用一次，所有 worktree 共用**：
 
 ```bash
 brew install gitleaks
-git config core.hooksPath .githooks
+git config core.hooksPath "$PWD/.githooks"    # 在主 clone 根目錄跑；一定要絕對路徑
 ```
 
-沒裝 gitleaks 時 hook 直接擋 commit，不會安靜略過。誤報（例如公開的簽章指紋）在那一行加 `# gitleaks:allow` 並寫理由，
-不要整個關掉 hook。PR 說明照 `.github/pull_request_template.md` 寫。
+一定要絕對路徑：相對的 `.githooks` 會從每個 worktree 自己的根目錄找，還沒有這兩支 hook 的舊分支 worktree 會被
+git 安靜略過。絕對路徑指到主 clone，主 clone 一律待在 main（正式 server 從那裡跑）。
+沒裝 gitleaks 時兩支 hook 都直接擋 commit，不會安靜略過。誤報（例如公開的簽章指紋）在那一行加 `# gitleaks:allow`
+並寫理由，不要整個關掉 hook。PR 說明照 `.github/pull_request_template.md` 寫。
 
 ## CodeGraph
 
