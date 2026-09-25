@@ -1,7 +1,7 @@
 import express from 'express';
 import path from 'path';
 import { writeSync } from 'node:fs';
-import { resolveListenConfig } from './services/httpGuards';
+import { resolveHmrPort, resolveListenConfig } from './services/httpGuards';
 import { createLlmLogger, resolveLlmLogPath } from './services/llmTelemetry';
 import { openMeetingDb, resolveDbPath } from './services/meetingDb';
 import { createMeetingStore } from './services/meetingStore';
@@ -256,8 +256,9 @@ async function startServer() {
     // 轉成 dist/server.cjs 檔頭無條件的 require("vite")，不裝 devDependencies 的安裝（打包成
     // 桌面 app、`npm install --omit=dev`）一啟動就炸，跟有沒有走到這個分支無關
     const { createServer: createViteServer } = await import('vite');
+    const hmrPort = resolveHmrPort(process.env);
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: { middlewareMode: true, ...(hmrPort === undefined ? {} : { hmr: { port: hmrPort } }) },
       appType: 'spa',
     });
     app.use(vite.middlewares);
