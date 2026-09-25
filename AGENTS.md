@@ -34,6 +34,21 @@ CI 看得到**：碰到路徑、換行、spawn、檔案權限、`process.platfor
 - `npm start` 用 `cross-env` 設 `NODE_ENV`，因為 cmd 與 PowerShell 不吃 `VAR=value cmd` 的寫法。
   它放在 `dependencies` 不是 `devDependencies`：`--omit=dev` 的安裝也要能 `npm start`。
 
+## 開 worktree 與收掉
+
+正式 server 從主 clone 跑，**主 clone 不切分支、不 pull、不直接改檔**。要動手就開 worktree：
+
+```bash
+npx tsx scripts/worktreeSetup.ts <分支名>     # 從 origin/main 開、npm ci、寫好這個 worktree 專用的 .env
+npx tsx scripts/worktreeClean.ts              # 列出已合併、乾淨、沒鎖、沒有行程在用的 worktree；加 --apply 才搬進垃圾桶（macOS／Linux）
+```
+
+`worktreeSetup.ts` 寫的 `.env` 會把 `PORT`、`MEETPILOT_HMR_PORT` 換成空的 port，`MEETPILOT_VAULT` 指到暫存目錄，
+會寫檔的絕對路徑拿掉、只讀輸入檔的相對路徑改指回主 clone。規則與理由在兩支腳本的檔頭。
+shell 裡已經 export 了 `PORT`、`MEETPILOT_HMR_PORT` 或會寫檔的路徑設定時，Node 的 `--env-file` 不會蓋掉它們，腳本會拒跑；之後在那個 worktree 跑 `npm run dev` 的 shell 也不能有這些 export。
+新增會寫檔或只讀的路徑型 `MEETPILOT_*` 設定時，要加進 `worktreeSetup.ts` 的 `WRITE_TARGET_KEYS` 或 `READ_INPUT_KEYS`，
+不然 worktree 會寫到正式那份，或一啟動就找不到檔。
+
 ## CodeGraph
 
 索引在 `.codegraph/`（2026-09-14 建，`codegraph init`）。本機產物，不進版控。
