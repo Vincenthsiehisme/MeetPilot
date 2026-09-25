@@ -15,7 +15,7 @@ set -euo pipefail
 TARGET="${1:?用法：scripts/ffmpeg/build.sh <mac-arm64|mac-x64|win-x64>}"
 VERSION=8.1.3
 SHA256=7138d28c96d9d3e3af4ee3d8cad72741f8ffb40da90c1112235dea3ecd3178a3
-KEY_FINGERPRINT=FCF986EA15E6E293A5644F10B4322F04D67658D8
+KEY_FINGERPRINT=FCF986EA15E6E293A5644F10B4322F04D67658D8  # gitleaks:allow FFmpeg 官方簽章公鑰的指紋，公開資料，釘死是為了驗簽章
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
