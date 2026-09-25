@@ -19,7 +19,7 @@ npm test                # vitest
 npm run build           # 前端與 server bundle
 ```
 
-目標分支 `main`。`npm run build` 會產生 `dist/`，驗證完記得 `rm -rf dist`，否則工作樹不乾淨。
+目標分支 `main`。`npm run build` 會產生 `dist/`（已在 `.gitignore`，不影響工作樹乾不乾淨）。
 
 **CI（`.github/workflows/ci.yml`）在 macOS 與 Windows 各跑一次三條 gate，外加正式版冒煙測試**
 （`npm prune --omit=dev` 後跑 `scripts/smokeProduction.mjs`）。本機只有 macOS，**Windows 的結果只有
@@ -33,6 +33,18 @@ CI 看得到**：碰到路徑、換行、spawn、檔案權限、`process.platfor
   在 Windows runner 上守它。
 - `npm start` 用 `cross-env` 設 `NODE_ENV`，因為 cmd 與 PowerShell 不吃 `VAR=value cmd` 的寫法。
   它放在 `dependencies` 不是 `devDependencies`：`--omit=dev` 的安裝也要能 `npm start`。
+
+## commit 前的檢查
+
+`.githooks/pre-commit` 用 gitleaks 掃 staged 的改動，有疑似密鑰就擋。每個 clone 啟用一次（worktree 共用）：
+
+```bash
+brew install gitleaks
+git config core.hooksPath .githooks
+```
+
+沒裝 gitleaks 時 hook 直接擋 commit，不會安靜略過。誤報（例如公開的簽章指紋）在那一行加 `# gitleaks:allow` 並寫理由，
+不要整個關掉 hook。PR 說明照 `.github/pull_request_template.md` 寫。
 
 ## CodeGraph
 
