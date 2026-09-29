@@ -533,6 +533,13 @@ off 開關；目錄不可寫時 server 直接起不來。細節見上面〈投�
 
 每次 Gemini 呼叫會在 `MEETPILOT_LLM_LOG`（預設 `logs/llm.jsonl`）追加一行 JSON，設成 `off` 關閉。一次嘗試一行，fallback 鏈退了幾個模型、重試幾次都各自有一行，所以它回答得了「首選模型多常不可用」「撞限流時實際等多久」「一場會議燒多少 token」。**只記 metadata，不記逐字稿、提問或模型回覆**；拿不到的 token 數記成 `null`，不是 `0`。啟動時就開檔，路徑不可寫會直接讓 server 起不來。
 
+撞到限流（429、`RESOURCE_EXHAUSTED`）時照回應的 `retryDelay` 等，夾在 1 到 60 秒，回應沒給就 5 秒起跳、每次加倍，
+都加 0～1 秒 jitter；同一個模型的第二次也撞到就直接換下一個模型，不再等（各模型額度分開算）。回應看得出是每日額度
+用完（`quotaId` 含 `PerDay`）就不在那個模型上等，直接換。embedding 不換模型，限流最多試 3 次。每次因限流而等待，
+那一行的 `backoffMs` 記等了幾毫秒、`backoffSource` 記時間從哪來（`retry-info`、`backoff`，每日額度用完換模型是
+`daily-quota` 加 0）；空輸出與 503 仍固定等 1、2 秒，這兩欄是 `null`。2026-09-29 以前的紀錄沒有這兩欄。
+**429 的回應格式照 Gemini API 公開文件寫，還沒有實際樣本**，解析不到就當沒給，照樣走退避。
+
 `MEETPILOT_GEMINI_MAX_CONCURRENCY`（預設 2）是所有 Gemini 呼叫共用的全域併發上限，不管是轉錄還是分析發出的請求。目前處理仍是完全序列，這個值暫時不會改變任何行為。
 
 看最近十次呼叫：

@@ -38,9 +38,11 @@ export interface JobWorkerDeps {
    * `transcriptionPipeline.markTranscriptionFailed` 把 meeting 轉成真正的終態。
    *
    * **退回 queued 的 job 沒有 backoff，可能立刻在同一輪被同一個 worker 重新搶到重跑**
-   * （見 `runOne` 的 `finally`）。這是刻意的簡化：`generateContentWithFallback` 自己對
-   * transient 錯誤已經有 1～2 秒的 backoff，會走到 job 級失敗的通常是更嚴重的問題（例外
-   * 而不是限流），而這是單人本機工具、`max_attempts` 通常設得小，立即重試的代價可接受。
+   * （見 `runOne` 的 `finally`）。這是刻意的簡化：`generateContentWithFallback` 自己會等：
+   * 空輸出與 503 等 1、2 秒，限流照回應的 `retryDelay` 等、最多 60 秒（vault plan「MeetPilot ·
+   * Gemini 限流退避」），會走到 job 級失敗的通常是限流持續好幾分鐘、或更嚴重的問題，
+   * `max_attempts` 設得小，立即重試的代價可接受。限流持續到三次立刻重試都用完時會議會 FAILED，
+   * 這包刻意不處理（要改 `jobs` schema）。
    * 之後如果真的需要 backoff，加在這裡（`onFailure` 裡 delay 後再 `poke()`）不用動這支本身。
    */
   onFailure?: (meetingId: string, outcome: 'queued' | 'failed', err: unknown) => void;

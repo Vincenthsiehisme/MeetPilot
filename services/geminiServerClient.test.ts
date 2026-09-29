@@ -41,6 +41,17 @@ const {
 const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
 
 let logged: LlmCallInput[];
+
+/** SDK 的 ApiError 形狀：status 是 HTTP 狀態碼，message 是整個錯誤 body 的 JSON.stringify */
+const rateLimited = (details?: unknown[]) => Object.assign(
+  new Error(JSON.stringify({ error: { code: 429, message: 'You exceeded your current quota', status: 'RESOURCE_EXHAUSTED', details } })),
+  { status: 429 },
+);
+const retryInfo = (retryDelay: string) => ({ '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay });
+const quotaFailure = (quotaId: string) => ({
+  '@type': 'type.googleapis.com/google.rpc.QuotaFailure',
+  violations: [{ quotaMetric: 'generativelanguage.googleapis.com/generate_content_requests', quotaId }],
+});
 const client = () => createGeminiServerClient({ log: (input) => logged.push(input) });
 
 beforeEach(() => {
@@ -493,6 +504,89 @@ describe('isTransientLlmError', () => {
   });
 });
 
+describe('限流退避（vault plan「MeetPilot · Gemini 限流退避」）', () => {
+  it('照回應的 retryDelay 等完才重試同一個模型，紀錄留下等了多久與來源（AC-1、AC-4）', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    generateContent
+      .mockRejectedValueOnce(rateLimited([quotaFailure('GenerateRequestsPerMinutePerProjectPerModel'), retryInfo('20s')]))
+      .mockResolvedValueOnce({ text: '{"segments":[]}' });
+
+    const pending = client().transcribeSlice({ base64Data: 'AAAA' });
+    await vi.advanceTimersByTimeAsync(19_999);
+    expect(generateContent).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+
+    await expect(pending).resolves.toEqual([]);
+    expect(generateContent.mock.calls.map(c => (c[0] as any).model)).toEqual(['gemini-3.8-flash', 'gemini-3.8-flash']);
+    expect(logged.map(l => [l.outcome, l.transientReason ?? null, l.backoffMs ?? null, l.backoffSource ?? null])).toEqual([
+      ['transient', 'rate_limited', 20_000, 'retry-info'],
+      ['ok', null, null, null],
+    ]);
+  });
+
+  it('回應沒給 retryDelay 就等 5 秒；同一個模型第二次也撞到就直接換模型，不再等', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    generateContent
+      .mockRejectedValueOnce(rateLimited())
+      .mockRejectedValueOnce(rateLimited())
+      .mockResolvedValueOnce({ text: '{"segments":[]}' });
+
+    const pending = client().transcribeSlice({ base64Data: 'AAAA' });
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(generateContent).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+
+    await expect(pending).resolves.toEqual([]);
+    expect(generateContent.mock.calls.map(c => (c[0] as any).model)).toEqual([
+      'gemini-3.8-flash', 'gemini-3.8-flash', 'gemini-3.1-flash-lite',
+    ]);
+    expect(logged.map(l => [l.backoffMs ?? null, l.backoffSource ?? null])).toEqual([[5_000, 'backoff'], [null, null], [null, null]]);
+  });
+
+  it('每日額度用完不在這個模型上等，直接換下一個模型（AC-2）', async () => {
+    vi.useFakeTimers();
+    generateContent
+      .mockRejectedValueOnce(rateLimited([quotaFailure('GenerateRequestsPerDayPerProjectPerModel'), retryInfo('50000s')]))
+      .mockResolvedValueOnce({ text: '{"segments":[]}' });
+
+    const pending = client().transcribeSlice({ base64Data: 'AAAA' });
+    await vi.advanceTimersByTimeAsync(0);
+
+    await expect(pending).resolves.toEqual([]);
+    expect(generateContent.mock.calls.map(c => (c[0] as any).model)).toEqual(['gemini-3.8-flash', 'gemini-3.1-flash-lite']);
+    expect(logged.map(l => [l.modelIndex, l.backoffMs ?? null, l.backoffSource ?? null])).toEqual([[0, 0, 'daily-quota'], [1, null, null]]);
+  });
+
+  it('503 不算限流，維持原本 1 秒的等法，紀錄不填等待欄位', async () => {
+    vi.useFakeTimers();
+    generateContent
+      .mockRejectedValueOnce(new Error('503 Service Unavailable'))
+      .mockResolvedValueOnce({ text: '{"segments":[]}' });
+
+    const pending = client().transcribeSlice({ base64Data: 'AAAA' });
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    await expect(pending).resolves.toEqual([]);
+    expect(logged.map(l => [l.backoffMs ?? null, l.backoffSource ?? null])).toEqual([[null, null], [null, null]]);
+  });
+
+  it('解析不到的 429（不是 JSON，訊息也沒有 429 字樣）照樣走退避，不拋解析錯誤（AC-5）', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    generateContent
+      .mockRejectedValueOnce(Object.assign(new Error('<html>Too Many Requests</html>'), { status: 429 }))
+      .mockResolvedValueOnce({ text: '{"segments":[]}' });
+
+    const pending = client().transcribeSlice({ base64Data: 'AAAA' });
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    await expect(pending).resolves.toEqual([]);
+    expect(logged[0]).toMatchObject({ transientReason: 'rate_limited', backoffMs: 5_000, backoffSource: 'backoff' });
+  });
+});
+
 describe('embedTopicTags（W4）', () => {
   it('分批送出，回來的順序就是送出去的順序', async () => {
     embedContent.mockImplementation((request: any) => ({
@@ -543,11 +637,52 @@ describe('embedTopicTags（W4）', () => {
   });
 
   it('失敗時紀錄分得出 transient 與 fatal，而且不退到別的 embedding model', async () => {
-    embedContent.mockRejectedValue(new Error('429 RESOURCE_EXHAUSTED'));
-    await expect(client().embedTopicTags(['甲'])).rejects.toThrow(/429/);
+    embedContent.mockRejectedValue(new Error('503 Service Unavailable'));
+    await expect(client().embedTopicTags(['甲'])).rejects.toThrow(/503/);
 
     expect(embedContent).toHaveBeenCalledTimes(1);
     expect(logged.map(l => [l.kind, l.model, l.outcome])).toEqual([['embed', EMBEDDING_MODEL, 'transient']]);
+  });
+
+  it('撞到限流照等法重試，最多 3 次，一直是同一個 embedding model（AC-3）', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    embedContent.mockRejectedValue(new Error('429 RESOURCE_EXHAUSTED'));
+
+    const pending = client().embedTopicTags(['甲']);
+    const settled = pending.then(() => new Error('應該要失敗'), (err: Error) => err);
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(embedContent).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1 + 10_000);
+
+    expect((await settled).message).toMatch(/429/);
+    expect(embedContent).toHaveBeenCalledTimes(3);
+    expect(embedContent.mock.calls.every(c => (c[0] as any).model === EMBEDDING_MODEL)).toBe(true);
+    expect(logged.map(l => [l.attempt, l.outcome, l.backoffMs ?? null, l.backoffSource ?? null])).toEqual([
+      [1, 'transient', 5_000, 'backoff'],
+      [2, 'transient', 10_000, 'backoff'],
+      [3, 'transient', null, null],
+    ]);
+  });
+
+  it('限流之後重試成功，ok 那一行記的是第幾次', async () => {
+    vi.useFakeTimers();
+    embedContent
+      .mockRejectedValueOnce(rateLimited([retryInfo('2s')]))
+      .mockResolvedValueOnce({ embeddings: [{ values: [1, 2, 3] }] });
+
+    const pending = client().embedTopicTags(['甲']);
+    await vi.advanceTimersByTimeAsync(3_000);
+
+    await expect(pending).resolves.toMatchObject({ dimensions: 3 });
+    expect(logged.map(l => [l.attempt, l.outcome, l.backoffSource ?? null])).toEqual([[1, 'transient', 'retry-info'], [2, 'ok', null]]);
+  });
+
+  it('embedding 每日額度用完就不等，直接拋', async () => {
+    embedContent.mockRejectedValue(rateLimited([quotaFailure('EmbedContentRequestsPerDayPerProject')]));
+
+    await expect(client().embedTopicTags(['甲'])).rejects.toThrow(/RESOURCE_EXHAUSTED/);
+    expect(embedContent).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -19,8 +19,15 @@ import { createConcurrencyLimiter } from './concurrencyLimiter';
 import { normalizeTranscribedSegments } from './transcribeSegments';
 import { LlmCallKind, LlmLogger } from './llmTelemetry';
 import { PairJudgement } from './topicLink';
+import { BackoffSource, isRateLimitError, rateLimitWait, readRateLimitInfo } from './rateLimitBackoff';
 
 const DECIMAL_INTEGER = /^\d+$/;
+
+/** fallback 鏈上每個模型試幾次 */
+const ATTEMPTS_PER_MODEL = 2;
+/** embedding 撞到限流最多試幾次。不換模型：換了就是另一個向量空間 */
+const EMBED_ATTEMPTS = 3;
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 /**
  * 兩條佇列（轉錄／分析）共用同一個 Gemini API project 的全域併發上限（AC-6，vault plan
@@ -450,7 +457,7 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
     // 用索引跑，modelIndex 要進紀錄：>0 代表當時首選模型不能用，退到了 fallback 鏈後面
     for (let modelIndex = 0; modelIndex < models.length; modelIndex++) {
       const model = models[modelIndex];
-      for (let attempt = 0; attempt < 2; attempt++) {
+      for (let attempt = 0; attempt < ATTEMPTS_PER_MODEL; attempt++) {
         const startedAt = Date.now();
         let response: any;
         try {
@@ -480,7 +487,14 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
           // 兩種 transient 成因在這裡本來就是分開判斷的，記進紀錄時不要再壓平成同一個值：
           // 空輸出（thinking 吃光預算或被安全過濾）跟限流過載要採取的對策完全不同
           const isEmptyOutput = err instanceof RetryableLlmResponseError;
-          const isTransient = isEmptyOutput || isTransientLlmError(err);
+          // 限流另外算等待時間（vault plan「MeetPilot · Gemini 限流退避」）：照回應的 retryDelay 等，
+          // 每日額度用完就不在這個模型上等。空輸出與 503 維持下面固定的 1、2 秒
+          const rateLimit = !isEmptyOutput && isRateLimitError(err) ? readRateLimitInfo(err) : null;
+          const isTransient = isEmptyOutput || rateLimit !== null || isTransientLlmError(err);
+          // 這個模型的最後一次不等：下一個模型的額度是分開算的，等了只是白等
+          let backoff: { ms: number; source: BackoffSource } | null = null;
+          if (rateLimit?.dailyQuotaExhausted) backoff = { ms: 0, source: 'daily-quota' };
+          else if (rateLimit && attempt + 1 < ATTEMPTS_PER_MODEL) backoff = rateLimitWait(rateLimit, attempt);
 
           llmLogger.log({
             kind: request.kind,
@@ -495,6 +509,8 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
             response,
             error: err,
             configuredMaxOutputTokens: request.config?.maxOutputTokens ?? null,
+            backoffMs: backoff?.ms ?? null,
+            backoffSource: backoff?.source ?? null,
           });
 
           console.warn(`[Gemini Request] Model ${model} (attempt ${attempt + 1}) failed:`, err?.message || err);
@@ -503,7 +519,19 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
             throw err;
           }
 
-          await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
+          if (rateLimit) {
+            if (rateLimit.dailyQuotaExhausted) {
+              console.warn(`[Gemini Request] Model ${model} 今天的額度用完，改用 fallback 鏈的下一個模型`);
+              break;
+            }
+            if (backoff) {
+              console.warn(`[Gemini Request] Model ${model} (attempt ${attempt + 1}) 撞到限流，等 ${(backoff.ms / 1000).toFixed(1)} 秒再試（${backoff.source}）`);
+              await sleep(backoff.ms);
+            }
+            continue;
+          }
+
+          await sleep(1000 * (attempt + 1));
         }
       }
     }
@@ -803,31 +831,48 @@ ${formatTranscriptForAnalysis(transcript)}`,
 
       for (let i = 0; i < texts.length; i += BATCH) {
         const batch = texts.slice(i, i + BATCH);
-        const startedAt = Date.now();
         let response: any;
-        try {
-          response = await ai.models.embedContent({ model: EMBEDDING_MODEL, contents: batch as string[] });
-        } catch (err) {
-          llmLogger.log({
-            kind: 'embed',
-            meetingId: meetingId ?? null,
-            model: EMBEDDING_MODEL,
-            modelIndex: 0,
-            attempt: 1,
-            streamed: false,
-            latencyMs: Date.now() - startedAt,
-            outcome: isTransientLlmError(err) ? 'transient' : 'fatal',
-            error: err,
-          });
-          // 不退到別的 embedding model：那是另一個向量空間，跟既有向量算出來的 cosine 沒有意義
-          throw err;
+        let attempt = 0;
+        let startedAt = Date.now();
+        for (;;) {
+          startedAt = Date.now();
+          try {
+            response = await ai.models.embedContent({ model: EMBEDDING_MODEL, contents: batch as string[] });
+            break;
+          } catch (err) {
+            // 撞到限流照 generateContentWithFallback 同一套等法重試；每日額度用完等了也沒用，直接拋
+            const rateLimit = isRateLimitError(err) ? readRateLimitInfo(err) : null;
+            const backoff = rateLimit && !rateLimit.dailyQuotaExhausted && attempt + 1 < EMBED_ATTEMPTS
+              ? rateLimitWait(rateLimit, attempt)
+              : null;
+            const isTransient = rateLimit !== null || isTransientLlmError(err);
+            llmLogger.log({
+              kind: 'embed',
+              meetingId: meetingId ?? null,
+              model: EMBEDDING_MODEL,
+              modelIndex: 0,
+              attempt: attempt + 1,
+              streamed: false,
+              latencyMs: Date.now() - startedAt,
+              outcome: isTransient ? 'transient' : 'fatal',
+              transientReason: isTransient ? 'rate_limited' : null,
+              error: err,
+              backoffMs: backoff?.ms ?? null,
+              backoffSource: backoff?.source ?? null,
+            });
+            // 不退到別的 embedding model：那是另一個向量空間，跟既有向量算出來的 cosine 沒有意義
+            if (!backoff) throw err;
+            console.warn(`[Gemini Request] ${EMBEDDING_MODEL} (attempt ${attempt + 1}) 撞到限流，等 ${(backoff.ms / 1000).toFixed(1)} 秒再試（${backoff.source}）`);
+            await sleep(backoff.ms);
+            attempt += 1;
+          }
         }
         llmLogger.log({
           kind: 'embed',
           meetingId: meetingId ?? null,
           model: EMBEDDING_MODEL,
           modelIndex: 0,
-          attempt: 1,
+          attempt: attempt + 1,
           streamed: false,
           latencyMs: Date.now() - startedAt,
           outcome: 'ok',

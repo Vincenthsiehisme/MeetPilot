@@ -1,5 +1,6 @@
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import type { BackoffSource } from './rateLimitBackoff';
 
 // Gemini 呼叫的結構化紀錄：每次嘗試一行 JSONL。只記 metadata，不記逐字稿、提問或模型回覆內容。
 // 在這之前唯一的痕跡是 console.warn 的散字，回答不了「fallback 多常觸發」「限流有多嚴重」
@@ -61,6 +62,10 @@ export interface LlmCallInput {
   // 這通呼叫實際帶的 maxOutputTokens。沒設就是 null——「沒設」跟「設了但拿不到」
   // 要分得開，不然之後改了設定也對不回舊紀錄裡哪些呼叫當時有沒有上限
   configuredMaxOutputTokens?: number | null;
+  // 這次限流失敗之後要等多久才再試（vault plan「MeetPilot · Gemini 限流退避」）。只有限流才填；
+  // 空輸出、503 的固定等待不記。每日額度用完直接換模型時是 0，來源 'daily-quota'
+  backoffMs?: number | null;
+  backoffSource?: BackoffSource | null;
   // 測試注入用；正式呼叫不要傳
   now?: Date;
 }
@@ -92,6 +97,9 @@ export interface LlmCallRecord {
   candidatesCount: number | null;
   errorStatus: number | null;
   errorMessage: string | null;
+  // 限流後等了多久、時間從哪來。2026-09-29 以前的紀錄沒有這兩欄，讀的一方不能假設它在
+  backoffMs: number | null;
+  backoffSource: BackoffSource | null;
 }
 
 // 錯誤訊息截斷長度。Gemini 的錯誤是 API 層的訊息，不含 prompt，但上限是為了萬一：
@@ -196,6 +204,8 @@ export function buildLlmRecord(input: LlmCallInput): LlmCallRecord {
     candidatesCount: extractCandidatesCount(input.response),
     errorStatus: error?.status ?? null,
     errorMessage: error?.message ?? null,
+    backoffMs: input.backoffMs ?? null,
+    backoffSource: input.backoffSource ?? null,
   };
 }
 

@@ -201,7 +201,16 @@ describe('buildLlmRecord', () => {
       candidatesCount: 0,
       errorStatus: null,
       errorMessage: null,
+      backoffMs: null,
+      backoffSource: null,
     });
+  });
+
+  it('限流後的等待時間與來源原樣記下；沒給就是 null（2026-09-29 以前的紀錄沒有這兩欄）', () => {
+    const base = { kind: 'transcribe' as const, model: 'm', modelIndex: 0, attempt: 1, streamed: false, latencyMs: 1, outcome: 'transient' as const };
+    expect(buildLlmRecord({ ...base, backoffMs: 20_000, backoffSource: 'retry-info' })).toMatchObject({ backoffMs: 20_000, backoffSource: 'retry-info' });
+    expect(buildLlmRecord({ ...base, backoffMs: 0, backoffSource: 'daily-quota' })).toMatchObject({ backoffMs: 0, backoffSource: 'daily-quota' });
+    expect(buildLlmRecord(base)).toMatchObject({ backoffMs: null, backoffSource: null });
   });
 
   it('meetingId 有傳就記得下來，沒傳（前端 polish 舊路由）記 null', () => {
