@@ -31,7 +31,7 @@ import { appendFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from '
 import { createServer } from 'node:net';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { buildServerEnv } from './serverEnv';
+import { buildServerEnv, serverLogPathFor } from './serverEnv';
 import { createLogTail } from './logTail';
 import { resolveBundledFfmpeg } from './bundledFfmpeg';
 import { GATEWAY_URL, GatewayError, createGatewayClient, syncWithGateway } from './gatewayClient';
@@ -131,7 +131,7 @@ class ServerStartupError extends Error {
 }
 
 const logDir = () => join(app.getPath('userData'), 'logs');
-const serverLogPath = () => join(logDir(), 'server.log');
+const serverLogPath = () => serverLogPathFor(app.getPath('userData'));
 
 // log 寫不進去（磁碟滿、權限、同名目錄）不能讓錯誤視窗跟著出不來：寫入失敗只記下原因，
 // 在錯誤視窗裡講出來，不往上拋（Codex review 2026-09-24）
@@ -216,6 +216,7 @@ async function startServer(): Promise<void> {
       vaultDir: runtime.vaultDir,
       rosterDocument: runtime.rosterDocument,
       ffmpeg,
+      appVersion: app.getVersion(),
     }),
     stdio: 'pipe',
     serviceName: 'MeetPilot Server',

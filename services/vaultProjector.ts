@@ -465,14 +465,26 @@ const scanVaultIndex = (vaultDir: string): Map<string, string> => {
   return index;
 };
 
-/** 先寫暫存檔再原子 rename（同 audioFileStore 的寫入慣例）。同一個 vault 可能同時開著 Obsidian，非原子寫入會讓它讀到截斷的檔 */
-const writeAtomic = (path: string, content: string): void => {
+/**
+ * 先寫暫存檔再原子 rename（同 audioFileStore 的寫入慣例）。同一個 vault 可能同時開著 Obsidian，非原子寫入會讓它讀到截斷的檔。
+ * `diagnosticsExport.ts` 寫 `_診斷/` 也用這支：OneDrive 同樣不能同步到半截的檔
+ */
+export const writeAtomic = (path: string, content: string | Buffer): void => {
   const partPath = `${path}.${randomUUID()}.part`;
   try {
-    writeFileSync(partPath, content, 'utf8');
+    writeFileSync(partPath, content, typeof content === 'string' ? 'utf8' : undefined);
     renameSync(partPath, path);
   } catch (err) {
-    rmSync(partPath, { force: true });
+    // 暫存檔也可能刪不掉（Windows 上 OneDrive 正鎖著剛建出來的 .part）。那時不能讓清理的錯誤
+    // 蓋掉原本寫不進去的原因，也要講出哪個 .part 留在資料夾裡
+    try {
+      rmSync(partPath, { force: true });
+    } catch (cleanupErr) {
+      throw new Error(
+        `${(err as Error).message}；暫存檔 ${partPath} 也沒清掉：${(cleanupErr as Error).message}`,
+        { cause: err },
+      );
+    }
     throw err;
   }
 };

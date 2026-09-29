@@ -11,6 +11,8 @@
  *   `~/MeetPilot Vault`：同一台機器上跑著網頁版的話，兩個各有資料庫的 server 會寫進同一個資料夾，
  *   投影器處理檔名衝突時會改名既有檔案。
  * - 錄音走 app 內錄音（`MEETPILOT_RECORDER=in-app`，E4），限流放寬到每分鐘 600 次（理由見下方）。
+ * - 外殼把 server 的輸出寫進 userData 的 `logs/server.log`，路徑與 app 版本交給 server（`MEETPILOT_SERVER_LOG`、
+ *   `MEETPILOT_APP_VERSION`），會議跑完時連同 llm.jsonl 複製進投影資料夾的 `_診斷/`（vault plan「MeetPilot · 診斷 log 跟著會議記錄上傳」）。
  * - 名單由外殼從 gateway 拿、寫成 userData 的 roster.json，以 `MEETPILOT_ROSTER_DOCUMENT` 交給 server 每次啟動匯入。
  * - 呼叫端環境裡跟 server 設定同名的變數（使用者機器上剛好設了 PORT、HOST、MEETPILOT_DB 之類）
  *   一律不往下傳：桌面 app 的行為不能因為使用者的 shell 設定而改變，而且那種錯很難從畫面上看出來。
@@ -30,7 +32,12 @@ export interface ServerEnvInput {
   rosterDocument?: string;
   /** 隨附的 ffmpeg／ffprobe（E2）。沒給就不設，server 走 PATH 上的（開發時） */
   ffmpeg?: { ffmpeg: string; ffprobe: string };
+  /** `app.getVersion()`，寫進 `_診斷/info.json`；沒給就不設，server 記成 null */
+  appVersion?: string;
 }
+
+/** 外殼寫 server 輸出的位置。main.ts 寫檔與 server 複製檔都從這裡拿，兩邊不會各算一份 */
+export const serverLogPathFor = (userDataDir: string): string => join(userDataDir, 'logs', 'server.log');
 
 // server 會看的設定變數前綴與名稱。不在這張表裡的系統變數（PATH、HOME、SystemRoot、TEMP…）照傳，
 // 子程序要靠它們找 ffmpeg、建暫存檔。
@@ -54,6 +61,7 @@ export function buildServerEnv(input: ServerEnvInput): Record<string, string> {
     MEETPILOT_DB: join(input.userDataDir, 'meetpilot.db'),
     MEETPILOT_AUDIO_DIR: join(input.userDataDir, 'audio'),
     MEETPILOT_LLM_LOG: join(input.userDataDir, 'logs', 'llm.jsonl'),
+    MEETPILOT_SERVER_LOG: serverLogPathFor(input.userDataDir),
     MEETPILOT_VAULT: input.vaultDir ?? join(input.userDataDir, 'vault'),
     // 錄音由 app 自己的視窗用麥克風錄（E4），不叫語音備忘錄：Windows 沒有，Mac 上也要每人手建三個捷徑
     MEETPILOT_RECORDER: 'in-app',
@@ -66,6 +74,7 @@ export function buildServerEnv(input: ServerEnvInput): Record<string, string> {
     env.MEETPILOT_FFMPEG = input.ffmpeg.ffmpeg;
     env.MEETPILOT_FFPROBE = input.ffmpeg.ffprobe;
   }
+  if (input.appVersion !== undefined) env.MEETPILOT_APP_VERSION = input.appVersion;
   if (input.geminiApiKey !== undefined && input.geminiApiKey.trim() !== '') {
     env.GEMINI_API_KEY = input.geminiApiKey.trim();
   }

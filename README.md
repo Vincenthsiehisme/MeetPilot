@@ -124,6 +124,14 @@ node scripts/smokeDesktop.mjs <打包後的執行檔>   # 啟動打包後的 app
 - server 跑在 Electron 的 `utilityProcess` 裡（`electron/main.ts`），動態 port、只綁 `127.0.0.1`，主視窗載它。
 - 資料全部在 userData：macOS `~/Library/Application Support/MeetPilot`，Windows `%APPDATA%\MeetPilot`。
   會議 markdown 投影到設定頁選的資料夾。server 的輸出寫在 userData 的 `logs/server.log`。
+- **log 跟著會議記錄出去。** 每場會走到流程終點（投影完、轉錄 `FAILED`、分析失敗退回 `TRANSCRIBED`），
+  `logs/server.log` 與 `logs/llm.jsonl` 整份複製到投影資料夾底下的 `_診斷/`，另寫一份 `info.json`
+  （app 版本、平台、觸發的會議與狀態、每個檔複製了幾 bytes 或為什麼沒有）。投影資料夾在共享 OneDrive 裡，
+  所以別台電腦出問題時不用請對方找檔案，直接看 `MeetPilot 記錄/<名字>/_診斷/`。**共享資料夾的成員都讀得到**：
+  `llm.jsonl` 只有 metadata；`server.log` 沒有整份逐字稿，但有與會者人名、會議 id、投影資料夾路徑、
+  錯誤訊息與 stack、題目標籤原文、從逐字稿抽出卻對不上名單的字串（不一定是人名）、邀請碼的 id（不是邀請碼本身）。
+  失敗的會不會投影，它的這些內容只會經 `_診斷/server.log` 出去。
+  寫不進去（資料夾不見了、Windows 上 OneDrive 正鎖著檔）只在 `server.log` 記一行，不影響會議，下一場會再寫。
 - 關掉視窗只是縮到托盤，托盤選單的「結束 MeetPilot」才會停 server。同時只能開一個。
 - server 掛掉會跳錯誤視窗，顯示結束碼與最後幾行輸出，由使用者選重新啟動或結束，不會安靜重啟。
 - **隨附的 ffmpeg 是自己從官方原始碼編的最小版本**（`scripts/ffmpeg/build.sh`，參數在 `configure-flags.txt`）：
@@ -539,6 +547,10 @@ off 開關；目錄不可寫時 server 直接起不來。細節見上面〈投�
 那一行的 `backoffMs` 記等了幾毫秒、`backoffSource` 記時間從哪來（`retry-info`、`backoff`，每日額度用完換模型是
 `daily-quota` 加 0）；空輸出與 503 仍固定等 1、2 秒，這兩欄是 `null`。2026-09-29 以前的紀錄沒有這兩欄。
 **429 的回應格式照 Gemini API 公開文件寫，還沒有實際樣本**，解析不到就當沒給，照樣走退避。
+
+`MEETPILOT_SERVER_LOG` 是 server 輸出所在的檔，只有桌面 app 設（`electron/serverEnv.ts`）；有設才會在會議跑完時
+把它和 `MEETPILOT_LLM_LOG` 複製進投影資料夾的 `_診斷/`（見〈桌面 app〉）。網頁版不設，啟動時印一行講明不複製。
+`MEETPILOT_APP_VERSION` 同樣由桌面 app 設，寫進 `_診斷/info.json`。
 
 `MEETPILOT_GEMINI_MAX_CONCURRENCY`（預設 2）是所有 Gemini 呼叫共用的全域併發上限，不管是轉錄還是分析發出的請求。目前處理仍是完全序列，這個值暫時不會改變任何行為。
 

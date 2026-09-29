@@ -20,6 +20,7 @@ import { createJobStore } from './services/jobStore';
 import { createJobWorker } from './services/jobWorker';
 import { createApp } from './services/createApp';
 import { createVaultProjector, resolveVaultDir } from './services/vaultProjector';
+import { createDiagnosticsExporter, resolveDiagnosticsConfig } from './services/diagnosticsExport';
 import { createVoiceMemoRecorder } from './services/voiceMemoRecorder';
 
 // 這個檔只做三件事：把真的依賴組出來、交給 createApp、listen。
@@ -130,6 +131,14 @@ const vaultDir = resolveVaultDir(process.env);
 const vaultProjector = createVaultProjector({ store: meetingStore, vaultDir, nameResolver });
 console.log(`[MeetPilot] 會議 markdown 投影到 ${vaultDir}`);
 
+// 診斷 log 跟著會議記錄出去（vault plan「MeetPilot · 診斷 log 跟著會議記錄上傳」）。只有桌面 app 設
+// MEETPILOT_SERVER_LOG：網頁版的 server 輸出在終端機，沒有檔可以複製，關著要講出來
+const diagnosticsConfig = resolveDiagnosticsConfig(process.env, vaultDir);
+const diagnostics = diagnosticsConfig ? createDiagnosticsExporter(diagnosticsConfig) : null;
+console.log(diagnostics
+  ? `[MeetPilot] 會議跑完或失敗時，log 複製到 ${diagnostics.dir}`
+  : '[MeetPilot] 沒設 MEETPILOT_SERVER_LOG，會議跑完不複製 log 到投影資料夾');
+
 const transcriptionPipeline = createTranscriptionPipeline({
   store: meetingStore,
   peopleStore,
@@ -141,6 +150,7 @@ const transcriptionPipeline = createTranscriptionPipeline({
   topicExtractor: createTopicExtractor({ store: meetingStore, gemini: geminiClient }),
   topicLinker,
   vaultProjector,
+  diagnostics,
 });
 // job table：轉錄與分析各自一條持久化 queue（vault plan「MeetPilot · 轉錄分析佇列架構升級」）。
 // 跟 meetingStore 共用同一個 DB 檔案（jobs 表對 meetings 的外鍵靠它做 cascade 刪除）。
