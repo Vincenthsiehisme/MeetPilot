@@ -453,6 +453,9 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
       : ['gemini-3.8-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest'];
 
     let lastError: any;
+    // 限流等了幾次，整條鏈累計，不隨換模型歸零：歸零的話沒給 retryDelay 時每次都只等 5 秒，
+    // 三個模型大約 15 秒就試完，加倍永遠輪不到（fable review 2026-09-29）
+    let rateLimitWaits = 0;
 
     // 用索引跑，modelIndex 要進紀錄：>0 代表當時首選模型不能用，退到了 fallback 鏈後面
     for (let modelIndex = 0; modelIndex < models.length; modelIndex++) {
@@ -494,7 +497,7 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
           // 這個模型的最後一次不等：下一個模型的額度是分開算的，等了只是白等
           let backoff: { ms: number; source: BackoffSource } | null = null;
           if (rateLimit?.dailyQuotaExhausted) backoff = { ms: 0, source: 'daily-quota' };
-          else if (rateLimit && attempt + 1 < ATTEMPTS_PER_MODEL) backoff = rateLimitWait(rateLimit, attempt);
+          else if (rateLimit && attempt + 1 < ATTEMPTS_PER_MODEL) backoff = rateLimitWait(rateLimit, rateLimitWaits);
 
           llmLogger.log({
             kind: request.kind,
@@ -526,6 +529,7 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
             }
             if (backoff) {
               console.warn(`[Gemini Request] Model ${model} (attempt ${attempt + 1}) 撞到限流，等 ${(backoff.ms / 1000).toFixed(1)} 秒再試（${backoff.source}）`);
+              rateLimitWaits += 1;
               await sleep(backoff.ms);
             }
             continue;

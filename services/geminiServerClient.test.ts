@@ -545,6 +545,30 @@ describe('限流退避（vault plan「MeetPilot · Gemini 限流退避」）', (
     expect(logged.map(l => [l.backoffMs ?? null, l.backoffSource ?? null])).toEqual([[5_000, 'backoff'], [null, null], [null, null]]);
   });
 
+  it('沒給 retryDelay 時等待時間整條鏈累計加倍，換了模型不歸零：5 秒、10 秒', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    generateContent
+      .mockRejectedValueOnce(rateLimited())
+      .mockRejectedValueOnce(rateLimited())
+      .mockRejectedValueOnce(rateLimited())
+      .mockResolvedValueOnce({ text: '{"segments":[]}' });
+
+    const pending = client().transcribeSlice({ base64Data: 'AAAA' });
+    await vi.advanceTimersByTimeAsync(5_000);
+    // 第 1 個模型等 5 秒後再試、又撞到就換第 2 個模型；第 2 個模型第一次撞到要等 10 秒，不是 5 秒
+    expect(generateContent).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(generateContent).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(1);
+
+    await expect(pending).resolves.toEqual([]);
+    expect(generateContent.mock.calls.map(c => (c[0] as any).model)).toEqual([
+      'gemini-3.8-flash', 'gemini-3.8-flash', 'gemini-3.1-flash-lite', 'gemini-3.1-flash-lite',
+    ]);
+    expect(logged.map(l => l.backoffMs ?? null)).toEqual([5_000, null, 10_000, null]);
+  });
+
   it('每日額度用完不在這個模型上等，直接換下一個模型（AC-2）', async () => {
     vi.useFakeTimers();
     generateContent
