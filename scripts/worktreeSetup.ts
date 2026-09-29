@@ -38,7 +38,7 @@ import { pathToFileURL } from 'node:url';
 export const WRITE_TARGET_KEYS = ['MEETPILOT_DB', 'MEETPILOT_AUDIO_DIR', 'MEETPILOT_LLM_LOG', 'MEETPILOT_VAULT'] as const;
 
 /** server 只讀不寫的路徑型設定。相對路徑是相對主 clone 寫的，搬到 worktree 要改成絕對路徑。 */
-export const READ_INPUT_KEYS = ['MEETPILOT_ROSTER_CSV', 'MEETPILOT_ROSTER_DOCUMENT', 'MEETPILOT_ANALYSIS_SPEC_PATH', 'MEETPILOT_FFMPEG', 'MEETPILOT_FFPROBE'] as const;
+export const READ_INPUT_KEYS = ['MEETPILOT_ROSTER_CSV', 'MEETPILOT_ROSTER_DOCUMENT', 'MEETPILOT_ANALYSIS_SPEC_PATH', 'MEETPILOT_FFMPEG', 'MEETPILOT_FFPROBE', 'MEETPILOT_SERVER_LOG'] as const;
 
 export interface GitStep {
   args: string[];

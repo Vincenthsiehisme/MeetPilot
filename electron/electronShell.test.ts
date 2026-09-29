@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { buildServerEnv } from './serverEnv';
+import { buildServerEnv, serverLogPathFor } from './serverEnv';
 import { createLogTail } from './logTail';
 import { resolveBundledFfmpeg } from './bundledFfmpeg';
 
@@ -18,8 +18,18 @@ describe('buildServerEnv', () => {
       MEETPILOT_DB: join('/data/MeetPilot', 'meetpilot.db'),
       MEETPILOT_AUDIO_DIR: join('/data/MeetPilot', 'audio'),
       MEETPILOT_LLM_LOG: join('/data/MeetPilot', 'logs', 'llm.jsonl'),
+      MEETPILOT_SERVER_LOG: join('/data/MeetPilot', 'logs', 'server.log'),
       MEETPILOT_VAULT: join('/data/MeetPilot', 'vault'),
     });
+    expect(serverLogPathFor('/data/MeetPilot')).toBe(env.MEETPILOT_SERVER_LOG);
+  });
+
+  it('app 版本給了才設，交給 server 寫進 _診斷/info.json；shell 裡的同名變數蓋不掉', () => {
+    expect(buildServerEnv({ baseEnv: { MEETPILOT_APP_VERSION: '9.9.9' }, userDataDir: '/d', port: 1, appVersion: '0.1.2' }).MEETPILOT_APP_VERSION)
+      .toBe('0.1.2');
+    expect(buildServerEnv({ baseEnv: { MEETPILOT_APP_VERSION: '9.9.9' }, userDataDir: '/d', port: 1 })).not.toHaveProperty('MEETPILOT_APP_VERSION');
+    expect(buildServerEnv({ baseEnv: { MEETPILOT_SERVER_LOG: '/tmp/x.log' }, userDataDir: '/d', port: 1 }).MEETPILOT_SERVER_LOG)
+      .toBe(join('/d', 'logs', 'server.log'));
   });
 
   it('錄音走 app 內錄音、限流放寬；使用者 shell 裡的同名變數蓋不掉（E4）', () => {
