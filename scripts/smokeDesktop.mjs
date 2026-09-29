@@ -472,8 +472,25 @@ if (silentSettled.status !== 'FAILED' || !/幾乎沒有聲音/.test(silentSettle
 if (/"kind":"transcribe"/.test(existsSync(join(userData, 'logs', 'llm.jsonl')) ? readFileSync(join(userData, 'logs', 'llm.jsonl'), 'utf8').split('\n').filter((l) => l.includes(silentRec.meeting_id)).join('\n') : '')) {
   await fail(phase, '全是空白的錄音還是送去 Gemini 轉錄了');
 }
+// 失敗的會不會投影，log 還是要跟著出去（vault plan「MeetPilot · 診斷 log 跟著會議記錄上傳」AC-5）
+const diagInfoPath = join(vaultDir, '_診斷', 'info.json');
+const diagInfo = await waitFor(phase, '_診斷/info.json 記下這場失敗的會', () => {
+  if (!existsSync(diagInfoPath)) return null;
+  const info = JSON.parse(readFileSync(diagInfoPath, 'utf8'));
+  return info.trigger?.meetingId === silentRec.meeting_id ? info : null;
+});
+if (diagInfo.trigger.status !== 'FAILED') await fail(phase, `_診斷/info.json 的狀態應該是 FAILED，實際是 ${diagInfo.trigger.status}`);
+if (!('bytes' in (diagInfo.files?.['server.log'] ?? {})) || !existsSync(join(vaultDir, '_診斷', 'server.log'))) {
+  await fail(phase, `_診斷/ 裡沒有 server.log：${JSON.stringify(diagInfo.files)}`);
+}
+if (!diagInfo.appVersion) await fail(phase, `_診斷/info.json 沒有 app 版本：${JSON.stringify(diagInfo)}`);
+// server 標 FAILED 前一刻印的失敗原因要經 main process 的 pipe 才進 server.log；副本缺這一行就等於沒帶到最該看的東西
+const failureLine = `Meeting ${silentRec.meeting_id} 轉錄失敗（`;
+if (!readFileSync(join(vaultDir, '_診斷', 'server.log'), 'utf8').includes(failureLine)) {
+  await fail(phase, `_診斷/server.log 裡沒有「${failureLine}」那一行：標 FAILED 前一刻印的失敗原因沒跟著出去`);
+}
 await stop();
-console.log(`[desktop-smoke] ${phase}通過：${silentRec.recording_received_chunks} 段空白錄音停在 FAILED：${silentSettled.error.slice(0, 80)}`);
+console.log(`[desktop-smoke] ${phase}通過：${silentRec.recording_received_chunks} 段空白錄音停在 FAILED：${silentSettled.error.slice(0, 80)}；_診斷/ 帶出 server.log ${diagInfo.files['server.log'].bytes} bytes（${diagInfo.appVersion}）`);
 
 // ======== 2b. 資料夾不見了 ========
 // 共享資料夾被取消同步或刪掉：要回設定頁講原因，不能讓 server 自己建一個不會同步的本機資料夾

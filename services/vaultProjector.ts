@@ -465,11 +465,14 @@ const scanVaultIndex = (vaultDir: string): Map<string, string> => {
   return index;
 };
 
-/** 先寫暫存檔再原子 rename（同 audioFileStore 的寫入慣例）。同一個 vault 可能同時開著 Obsidian，非原子寫入會讓它讀到截斷的檔 */
-const writeAtomic = (path: string, content: string): void => {
+/**
+ * 先寫暫存檔再原子 rename（同 audioFileStore 的寫入慣例）。同一個 vault 可能同時開著 Obsidian，非原子寫入會讓它讀到截斷的檔。
+ * `diagnosticsExport.ts` 寫 `_診斷/` 也用這支：OneDrive 同樣不能同步到半截的檔
+ */
+export const writeAtomic = (path: string, content: string | Buffer): void => {
   const partPath = `${path}.${randomUUID()}.part`;
   try {
-    writeFileSync(partPath, content, 'utf8');
+    writeFileSync(partPath, content, typeof content === 'string' ? 'utf8' : undefined);
     renameSync(partPath, path);
   } catch (err) {
     rmSync(partPath, { force: true });

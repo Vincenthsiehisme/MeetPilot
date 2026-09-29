@@ -27,6 +27,7 @@ import { TopicExtractor } from './topicExtractor';
 import { TopicLinker } from './topicLinker';
 import { SLICE_OVERLAP_SECONDS, mergeSliceTranscript } from './transcriptMerge';
 import { runProjection, VaultProjector } from './vaultProjector';
+import { DiagnosticsExporter, runDiagnosticsExport } from './diagnosticsExport';
 
 /** 一片 10 分鐘，與搬家前瀏覽器那套的 sliceDurationMin = 10 一致 */
 export const SLICE_DURATION_SECONDS = 10 * 60;
@@ -69,6 +70,12 @@ export interface TranscriptionPipelineDeps {
    * 一個真的。optional 只是為了讓不驗證投影行為的測試不用注入一個真的 VaultProjector。
    */
   vaultProjector?: VaultProjector | null;
+  /**
+   * 流程走到終點（投影完、轉錄 FAILED、分析失敗退回 TRANSCRIBED）時把 log 複製進投影資料夾的
+   * `_診斷/`，跟著共享資料夾同步出去（vault plan「MeetPilot · 診斷 log 跟著會議記錄上傳」）。
+   * **null 是網頁版**：沒設 `MEETPILOT_SERVER_LOG`，沒有 log 檔可以複製，見 diagnosticsExport.ts
+   */
+  diagnostics?: Pick<DiagnosticsExporter, 'dir' | 'schedule'> | null;
   /** 破洞修復的設定。不傳就用預設（開啟、一場會最多 6 次額外轉錄） */
   seamRepair?: SeamRepairConfig;
   /** 測試注入用；正式呼叫不要傳 */
@@ -126,6 +133,7 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
   const nameResolver = deps.nameResolver ?? null;
   const topicLinker = deps.topicLinker ?? null;
   const vaultProjector = deps.vaultProjector ?? null;
+  const diagnostics = deps.diagnostics ?? null;
   const now = deps.now ?? (() => Date.now());
   const repairConfig = deps.seamRepair ?? DEFAULT_SEAM_REPAIR;
 
@@ -416,6 +424,11 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
     }
   };
 
+  // 狀態在匯出當下才讀：投影之後可能是 READY、LINKED 或 LINK_FAILED，標記失敗的寫入也可能自己失敗
+  const exportDiagnostics = (meetingId: string): void => {
+    runDiagnosticsExport(diagnostics, meetingId, () => store.getMeeting(meetingId)?.status ?? null, '[Transcription]');
+  };
+
   const markFailed = (meetingId: string, reason: string, cause: unknown): void => {
     try {
       store.setStatus(meetingId, 'FAILED', now(), reason);
@@ -424,6 +437,7 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
       // 只印後者的話，原本壞在哪就沒有任何痕跡，而那場會還停在 TRANSCRIBING 看起來像在跑
       console.error(`[Transcription] Meeting ${meetingId} 標記 FAILED 時寫入失敗`, { cause, saveErr });
     }
+    exportDiagnostics(meetingId);
   };
 
   /**
@@ -445,6 +459,7 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
     } catch (saveErr) {
       console.error(`[Transcription] Meeting ${meetingId} 退回 TRANSCRIBED 時寫入失敗`, { cause, saveErr });
     }
+    exportDiagnostics(meetingId);
   };
 
   /**
@@ -534,6 +549,7 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
       // 投影排在關聯之後、跟關聯同一條「不能拖累可見性」的原則：結論與關聯（或關聯尚未完成的
       // 事實）都已經落地，vault 寫不進去只記 log，不讓一場成功的會因為檔案系統的問題變成失敗
       runProjection(vaultProjector, meetingId, '[Transcription]');
+      exportDiagnostics(meetingId);
     } catch (err) {
       markAnalysisFailed(meetingId, err);
       throw err;

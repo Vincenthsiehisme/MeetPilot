@@ -13,6 +13,8 @@ import { SLICE_OVERLAP_SECONDS } from './transcriptMerge';
 import { createTopicExtractor } from './topicExtractor';
 import { PeopleStore, createPeopleStore } from './peopleStore';
 import { NameResolver, createNameResolver } from './nameResolver';
+import { DiagnosticsExporter } from './diagnosticsExport';
+import { VaultProjector } from './vaultProjector';
 import {
   SLICE_DURATION_SECONDS,
   TranscriptionPipelineDeps,
@@ -1670,5 +1672,111 @@ describe('run：建議標題', () => {
     expect(store.getMeeting('m-1')?.status).toBe('READY');
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('建議標題不可用'));
     warn.mockRestore();
+  });
+});
+
+describe('診斷 log 跟著會議記錄出去', () => {
+  // 假的 exporter：只記「在哪個狀態、第幾步被叫」。真的檔案 I/O 在 diagnosticsExport.test.ts 驗
+  const recorder = (order: string[] = []) => {
+    const calls: { meetingId: string; status: string | null }[] = [];
+    const exporter: Pick<DiagnosticsExporter, 'dir' | 'schedule'> = {
+      dir: '/fake/vault/_診斷',
+      schedule: (meetingId, status) => {
+        order.push('diagnostics');
+        calls.push({ meetingId, status });
+      },
+    };
+    return { calls, exporter };
+  };
+
+  it('整場跑完：投影之後匯出一次，帶的是當下的狀態', async () => {
+    newMeeting();
+    const order: string[] = [];
+    const { calls, exporter } = recorder(order);
+    const pipeline = pipelineWith({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(THREE_SLICE_DURATION),
+      gemini: fakeGemini(),
+      now: () => T0 + 1,
+      topicLinker: null,
+      vaultProjector: { project: () => { order.push('project'); return { status: 'written' as const, path: '/fake/vault/a.md' }; } } as unknown as VaultProjector,
+      diagnostics: exporter,
+    });
+
+    await pipeline.run('m-1');
+
+    expect(calls).toEqual([{ meetingId: 'm-1', status: 'READY' }]);
+    expect(order).toEqual(['project', 'diagnostics']);
+  });
+
+  it('轉錄失敗轉 FAILED 時也匯出：失敗的會不會投影，只跟著投影走就收不到最需要看的 log', async () => {
+    newMeeting();
+    const { calls, exporter } = recorder();
+    const pipeline = pipelineWith({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(SLICE_DURATION_SECONDS),
+      gemini: fakeGemini({ transcribeSlice: async () => { throw new Error('fetch failed'); } }),
+      now: () => T0 + 1,
+      diagnostics: exporter,
+    });
+
+    await expect(pipeline.run('m-1')).rejects.toThrow('fetch failed');
+
+    expect(calls).toEqual([{ meetingId: 'm-1', status: 'FAILED' }]);
+  });
+
+  it('worker 重試用盡呼叫 markTranscriptionFailed 時也匯出', () => {
+    newMeeting();
+    store.setStatus('m-1', 'TRANSCRIBING', T0 + 1);
+    const { calls, exporter } = recorder();
+    const pipeline = pipelineWith({
+      store, audioStore: fakeAudioStore(new Set(['m-1'])), slicer: fakeSlicer(30), gemini: fakeGemini(), diagnostics: exporter,
+    });
+
+    pipeline.markTranscriptionFailed('m-1', '重試三次都失敗');
+
+    expect(calls).toEqual([{ meetingId: 'm-1', status: 'FAILED' }]);
+  });
+
+  it('分析失敗退回 TRANSCRIBED 時也匯出', async () => {
+    newMeeting();
+    const { calls, exporter } = recorder();
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const pipeline = pipelineWith({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(THREE_SLICE_DURATION),
+      gemini: fakeGemini({ analyzeTranscript: async () => { throw new Error('分析逾時'); } }),
+      now: () => T0 + 1,
+      diagnostics: exporter,
+    });
+
+    await expect(pipeline.run('m-1')).rejects.toThrow('分析逾時');
+
+    expect(calls).toEqual([{ meetingId: 'm-1', status: 'TRANSCRIBED' }]);
+    error.mockRestore();
+  });
+
+  it('排匯出拋錯時這場會照樣 READY，只記一行 log', async () => {
+    newMeeting();
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const pipeline = pipelineWith({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(THREE_SLICE_DURATION),
+      gemini: fakeGemini(),
+      now: () => T0 + 1,
+      topicLinker: null,
+      diagnostics: { dir: '/fake/vault/_診斷', schedule: () => { throw new Error('排程失敗'); } },
+    });
+
+    await expect(pipeline.run('m-1')).resolves.toBeUndefined();
+
+    expect(store.getMeeting('m-1')?.status).toBe('READY');
+    expect(statuses).toEqual(['TRANSCRIBING', 'TRANSCRIBED', 'ANALYZING', 'READY']);
+    expect(error).toHaveBeenCalledWith(expect.stringContaining('/fake/vault/_診斷'), expect.any(Error));
+    error.mockRestore();
   });
 });

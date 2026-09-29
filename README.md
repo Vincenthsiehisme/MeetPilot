@@ -124,6 +124,12 @@ node scripts/smokeDesktop.mjs <打包後的執行檔>   # 啟動打包後的 app
 - server 跑在 Electron 的 `utilityProcess` 裡（`electron/main.ts`），動態 port、只綁 `127.0.0.1`，主視窗載它。
 - 資料全部在 userData：macOS `~/Library/Application Support/MeetPilot`，Windows `%APPDATA%\MeetPilot`。
   會議 markdown 投影到設定頁選的資料夾。server 的輸出寫在 userData 的 `logs/server.log`。
+- **log 跟著會議記錄出去。** 每場會走到流程終點（投影完、轉錄 `FAILED`、分析失敗退回 `TRANSCRIBED`），
+  `logs/server.log` 與 `logs/llm.jsonl` 整份複製到投影資料夾底下的 `_診斷/`，另寫一份 `info.json`
+  （app 版本、平台、觸發的會議與狀態、每個檔複製了幾 bytes 或為什麼沒有）。投影資料夾在共享 OneDrive 裡，
+  所以別台電腦出問題時不用請對方找檔案，直接看 `MeetPilot 記錄/<名字>/_診斷/`。**共享資料夾的成員都讀得到**：
+  `llm.jsonl` 只有 metadata；`server.log` 有與會者人名、會議 id、投影資料夾路徑與錯誤訊息，沒有逐字稿。
+  寫不進去（資料夾不見了、Windows 上 OneDrive 正鎖著檔）只在 `server.log` 記一行，不影響會議，下一場會再寫。
 - 關掉視窗只是縮到托盤，托盤選單的「結束 MeetPilot」才會停 server。同時只能開一個。
 - server 掛掉會跳錯誤視窗，顯示結束碼與最後幾行輸出，由使用者選重新啟動或結束，不會安靜重啟。
 - **隨附的 ffmpeg 是自己從官方原始碼編的最小版本**（`scripts/ffmpeg/build.sh`，參數在 `configure-flags.txt`）：
@@ -532,6 +538,10 @@ POST /api/meetings/import   { jobs: Job[], blobIds: string[] }
 off 開關；目錄不可寫時 server 直接起不來。細節見上面〈投影到 Obsidian vault〉。
 
 每次 Gemini 呼叫會在 `MEETPILOT_LLM_LOG`（預設 `logs/llm.jsonl`）追加一行 JSON，設成 `off` 關閉。一次嘗試一行，fallback 鏈退了幾個模型、重試幾次都各自有一行，所以它回答得了「首選模型多常不可用」「撞限流時實際等多久」「一場會議燒多少 token」。**只記 metadata，不記逐字稿、提問或模型回覆**；拿不到的 token 數記成 `null`，不是 `0`。啟動時就開檔，路徑不可寫會直接讓 server 起不來。
+
+`MEETPILOT_SERVER_LOG` 是 server 輸出所在的檔，只有桌面 app 設（`electron/serverEnv.ts`）；有設才會在會議跑完時
+把它和 `MEETPILOT_LLM_LOG` 複製進投影資料夾的 `_診斷/`（見〈桌面 app〉）。網頁版不設，啟動時印一行講明不複製。
+`MEETPILOT_APP_VERSION` 同樣由桌面 app 設，寫進 `_診斷/info.json`。
 
 `MEETPILOT_GEMINI_MAX_CONCURRENCY`（預設 2）是所有 Gemini 呼叫共用的全域併發上限，不管是轉錄還是分析發出的請求。目前處理仍是完全序列，這個值暫時不會改變任何行為。
 
