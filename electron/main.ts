@@ -42,7 +42,7 @@ import { GATEWAY_URL, GatewayError, createGatewayClient, syncWithGateway } from 
 import { DesktopCredentials, DesktopStoreError, createDesktopStore } from './desktopStore';
 import { VaultFolderError, checkVaultFolder } from './vaultFolder';
 import {
-  ActivityEvent, HIDDEN_LAUNCH_ARG, notificationFor, parseActivityMessage, quitPrompt, shouldBlockSleep, shouldOpenAtLogin, startedHidden, updateInstallNote,
+  ActivityEvent, HIDDEN_LAUNCH_ARG, notificationFor, parseActivityMessage, quitPrompt, shouldBlockSleep, shouldOpenAtLogin, startedHidden, resolveQuitResponse, updateInstallNote,
 } from './desktopActivity';
 import {
   PENDING_UPDATE_FILE, PendingUpdate, UpdateCheck, WINDOWS_INSTALL_ARGS, checkForUpdate, describeUpdateCheck, parsePendingUpdate,
@@ -968,6 +968,7 @@ async function installUpdate(justChecked?: Extract<UpdateCheck, { state: 'ready'
     app.quit();
   } catch (err) {
     writeLog(`--- 更新沒有完成：${(err as Error).stack ?? String(err)} ---\n`);
+    updateQuitting = false;
     await dialog.showMessageBox({
       type: 'error',
       title: 'MeetPilot',
@@ -1205,7 +1206,9 @@ if (!app.requestSingleInstanceLock()) {
         defaultId: 0,
         cancelId: 0,
       }).then(({ response }) => {
-        if (response !== 1) return;
+        const next = resolveQuitResponse(response, updateQuitting);
+        updateQuitting = next.updateQuitting;
+        if (!next.confirmed) return;
         quitConfirmed = true;
         writeLog(`--- ${prompt.logNote}使用者確認結束 ---\n`);
         app.quit();
