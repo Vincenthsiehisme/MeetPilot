@@ -193,8 +193,8 @@ const transcriptionWorker = createJobWorker({
         meetingId, err instanceof Error ? err.message : String(err),
       );
     }
-    // outcome === 'queued'：meeting 還停在 TRANSCRIBING，worker 下一輪 tick 會自動撿回來重試
-    // （不用在這裡做什麼；見 jobWorker.ts 的 runOne 檔頭關於「沒有 backoff」的說明）
+    // outcome === 'queued'：meeting 還停在 TRANSCRIBING，這個 worker 先冷卻一段時間（第 n 次失敗等 30 秒乘 n），
+    // 冷卻完會自動撿回來重試（不用在這裡做什麼；見 jobWorker.ts 的 `cooldownMs`）
   },
 });
 

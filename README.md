@@ -135,7 +135,7 @@ node scripts/smokeDesktop.mjs <打包後的執行檔>   # 啟動打包後的 app
 - 關掉視窗只是縮到托盤，托盤選單的「結束 MeetPilot」才會停 server。同時只能開一個。
 - server 掛掉會跳錯誤視窗，顯示結束碼與最後幾行輸出，由使用者選重新啟動或結束，不會安靜重啟。
 - **隨附的 ffmpeg 是自己從官方原始碼編的最小版本**（`scripts/ffmpeg/build.sh`，參數在 `configure-flags.txt`）：
-  只開 server 用得到的音訊解碼器、容器、WAV 輸出與重採樣，沒有 GPL 元件、沒有外部函式庫，授權 LGPL 2.1 以上，
+  只開 server 用得到的音訊解碼器、容器、WAV 與 FLAC 輸出與重採樣，沒有 GPL 元件、沒有外部函式庫，授權 LGPL 2.1 以上，
   授權檔跟著放在安裝檔的 `ffmpeg/LICENSE-ffmpeg.txt`，`ffmpeg/NOTICE-ffmpeg.txt` 寫明版本、官方原始碼網址與 sha256、
   configure 參數，以及連進執行檔的三個 MIT 授權檔案聲明。原始碼固定 8.1.3 並驗 sha256，CI 另外驗官方簽章
   （金鑰指紋釘死在腳本裡，撤銷或過期的金鑰也拒絕）。兩個執行檔合計約 5.5 MB。
@@ -281,7 +281,7 @@ POST   /api/meetings/:id/retry    FAILED 重跑轉錄（音檔還在才行），
 POST   /api/meetings/:id/link     重算跨會議關聯（READY / LINKED / LINK_FAILED 才行，同步等它跑完）
 DELETE /api/meetings/:id          刪掉；正在跑的回 409，等它結束或失敗再刪；語音備忘錄錄音中的先叫它停止，停不下來就不刪；
                                   app 內錄音的段落跟著刪
-PATCH  /api/meetings/:id/transcript   改逐字稿或存潤稿
+PATCH  /api/meetings/:id/transcript   改逐字稿
 PATCH  /api/meetings/:id/analysis     改會議記錄
 PATCH  /api/meetings/:id/title        改標題；畫面上的名字與下載檔名用它，分析完成時模型先填一個建議（只填還沒有標題的會）
 ```
