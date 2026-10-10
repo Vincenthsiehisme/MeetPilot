@@ -42,7 +42,7 @@ import { GATEWAY_URL, GatewayError, createGatewayClient, syncWithGateway } from 
 import { DesktopCredentials, DesktopStoreError, createDesktopStore } from './desktopStore';
 import { VaultFolderError, checkVaultFolder } from './vaultFolder';
 import {
-  ActivityEvent, HIDDEN_LAUNCH_ARG, notificationFor, parseActivityMessage, quitPrompt, shouldBlockSleep, shouldOpenAtLogin, startedHidden,
+  ActivityEvent, HIDDEN_LAUNCH_ARG, notificationFor, parseActivityMessage, quitPrompt, shouldBlockSleep, shouldOpenAtLogin, startedHidden, updateInstallNote,
 } from './desktopActivity';
 import {
   PENDING_UPDATE_FILE, PendingUpdate, UpdateCheck, WINDOWS_INSTALL_ARGS, checkForUpdate, describeUpdateCheck, parsePendingUpdate,
@@ -95,6 +95,8 @@ let sleepBlockerId: number | null = null;
 let activeMeetings = 0;
 // 錄音中或處理中按結束、使用者確認過了：第二次進 before-quit 就放行
 let quitConfirmed = false;
+// 裝更新要結束 app：使用者已經在更新的確認框同意，before-quit 不再問「還有會議在處理」
+let updateQuitting = false;
 // 結束確認的對話框開著時，又有結束請求進來（托盤連按）不再疊一個
 let quitPromptOpen = false;
 // 顯示中的通知要自己抓著，不然被回收後點了沒反應
@@ -468,6 +470,8 @@ async function bootServerIntoWindow(): Promise<void> {
 function showSetup(message: string | null): void {
   setupMessage = message;
   if (message !== null) writeLog(`--- 顯示設定頁：${message} ---\n`);
+  // 開機自動啟動時視窗是藏著的：要使用者處理的設定頁一定要叫出來，不然他只看到托盤
+  showWindow();
   mainWindow?.loadURL(setupPageUrl()).catch((err: Error & { code?: string }) => {
     if (err.code !== 'ERR_ABORTED') writeLog(`--- 設定頁載入失敗：${err.message} ---\n`);
   });
@@ -919,14 +923,15 @@ async function installUpdate(justChecked?: Extract<UpdateCheck, { state: 'ready'
       return;
     }
     const isMac = process.platform === 'darwin';
+    const processingNote = updateInstallNote(activeMeetings);
     const { response } = await dialog.showMessageBox({
       type: 'question',
       title: 'MeetPilot',
       message: `安裝 MeetPilot ${check.version}？`,
-      detail: isMac
+      detail: (isMac
         ? 'MeetPilot 會打開新版的安裝檔並結束。在打開的視窗裡把 MeetPilot 拖到「應用程式」、選「取代」，再從「應用程式」打開。'
           + 'macOS 說無法確認開發者的話，照第一次安裝時的放行步驟做一次。'
-        : 'MeetPilot 會結束、在背景安裝新版，裝完自動重新開啟。進行中的轉錄重新開啟後會接著跑。',
+        : 'MeetPilot 會結束、在背景安裝新版，裝完自動重新開啟。進行中的轉錄重新開啟後會接著跑。') + processingNote,
       buttons: [isMac ? '打開安裝檔並結束 MeetPilot' : '安裝並重新開啟', '取消'],
       defaultId: 0,
       cancelId: 1,
@@ -958,6 +963,8 @@ async function installUpdate(justChecked?: Extract<UpdateCheck, { state: 'ready'
       // 安裝程式已經起來了，接著一定會關掉這個 app：不能再讓 before-quit 的錄音確認擋住
       quitConfirmed = true;
     }
+    // 使用者在上面的框已同意結束：before-quit 不再問處理中那項（錄音中仍會問，上面也擋過了）
+    updateQuitting = true;
     app.quit();
   } catch (err) {
     writeLog(`--- 更新沒有完成：${(err as Error).stack ?? String(err)} ---\n`);
@@ -1183,7 +1190,7 @@ if (!app.requestSingleInstanceLock()) {
   app.on('before-quit', (event) => {
     // 錄音中結束會切掉錄音，處理中結束會停下轉錄與分析。先問一次（兩者同時成立也只問一次）；確認了才真的結束，
     // 已送到的段落與沒做完的 job 留在 server，下次打開接著跑。冒煙測試不問處理中那一項
-    const prompt = quitConfirmed ? null : quitPrompt({ recording: recordingActive, active: SMOKE ? 0 : activeMeetings });
+    const prompt = quitConfirmed ? null : quitPrompt({ recording: recordingActive, active: SMOKE ? 0 : activeMeetings, ignoreProcessing: updateQuitting });
     if (prompt !== null) {
       event.preventDefault();
       showWindow();

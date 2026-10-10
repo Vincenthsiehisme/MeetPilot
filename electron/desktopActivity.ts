@@ -64,6 +64,11 @@ export interface ShellActivity {
   active: number;
 }
 
+export interface QuitState extends ShellActivity {
+  /** 裝更新要結束 app：使用者已經在更新的確認框同意結束，處理中那項不再問；錄音中照舊問 */
+  ignoreProcessing?: boolean;
+}
+
 /** 錄音中或有會議在處理，任一成立就擋閒置睡眠；兩者都不成立才放 */
 export function shouldBlockSleep(state: ShellActivity): boolean {
   return state.recording || state.active > 0;
@@ -81,8 +86,8 @@ export interface QuitPrompt {
 const RECORDING_DETAIL = '結束會中斷錄音。已經送出的部分會留著，下次打開 MeetPilot 可以把它送去轉錄；最後幾秒可能沒送到。';
 
 /** 結束前要不要先問。錄音與處理同時成立只問一次，文案兩件事都講；都不成立回 null，直接結束 */
-export function quitPrompt(state: ShellActivity): QuitPrompt | null {
-  const processing = state.active > 0;
+export function quitPrompt(state: QuitState): QuitPrompt | null {
+  const processing = state.active > 0 && !state.ignoreProcessing;
   if (state.recording && processing) {
     return {
       message: `正在錄音，另外還有 ${state.active} 場會議在處理，要結束 MeetPilot 嗎？`,
@@ -108,6 +113,11 @@ export function quitPrompt(state: ShellActivity): QuitPrompt | null {
     };
   }
   return null;
+}
+
+/** 裝更新前的確認框補的一句：處理中的會議不會丟，沒有處理中就不補 */
+export function updateInstallNote(active: number): string {
+  return active > 0 ? `\n\n現在有 ${active} 場會議還在處理，結束會讓它們停下來，下次打開 MeetPilot 會接著跑。` : '';
 }
 
 /** 通知內文最長的原因長度；系統通知會自己截，但超長的 API 錯誤訊息塞進去也看不到重點 */
