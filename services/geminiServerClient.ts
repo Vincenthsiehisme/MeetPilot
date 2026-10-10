@@ -150,17 +150,6 @@ class RetryableLlmResponseError extends Error {
   }
 }
 
-export function formatTranscriptForAI(transcript: TranscriptSegment[]): string {
-  return transcript.reduce((acc, curr, idx, arr) => {
-    const prev = arr[idx - 1];
-    const speaker = curr.speaker || 'Unknown';
-    if (prev && (prev.speaker || 'Unknown') === speaker) {
-      return acc + ` ${curr.text}`;
-    }
-    return acc + (acc ? '\n\n' : '') + `${speaker}: ${curr.text}`;
-  }, '');
-}
-
 export function formatTranscriptWithTimeForAI(transcript: TranscriptSegment[]): string {
   const formatTime = (seconds: number) => {
     const m = Math.floor(seconds / 60).toString().padStart(2, '0');
@@ -175,8 +164,8 @@ export function formatTranscriptWithTimeForAI(transcript: TranscriptSegment[]): 
 
 /**
  * 給 `analyzeTranscript` 用：逐字稿標成 `[#n MM:SS-MM:SS] 講者: 內容`，一段一行、
- * n 是 1-based 陣列索引。**不能沿用 `formatTranscriptForAI`**（同講者連續發言會合併成一段），
- * 那會讓編號對不上 `transcript` 陣列的實際索引，`buildAnalysisV3FromModelOutput` 換算出處
+ * n 是 1-based 陣列索引。**一段一行、不能合併**（例如把同講者連續發言併成一段），
+ * 合併會讓編號對不上 `transcript` 陣列的實際索引，`buildAnalysisV3FromModelOutput` 換算出處
  * 時會拿到錯的段落。模型回段落編號，不回秒數：秒數模型會算錯，編號只要查表。
  */
 export function formatTranscriptForAnalysis(transcript: readonly TranscriptSegment[]): string {

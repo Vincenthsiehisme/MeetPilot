@@ -33,7 +33,6 @@ const {
   EMBEDDING_MODEL,
   cleanJsonString,
   createGeminiServerClient,
-  formatTranscriptForAI,
   formatTranscriptForAnalysis,
   formatTranscriptWithTimeForAI,
   isTransientLlmError,
@@ -78,20 +77,6 @@ describe('cleanJsonString', () => {
   it('空的回應給 {}，不回 undefined 讓 JSON.parse 爆在別的地方', () => {
     expect(cleanJsonString(undefined)).toBe('{}');
     expect(cleanJsonString('')).toBe('{}');
-  });
-});
-
-describe('formatTranscriptForAI', () => {
-  it('同一個講者連續發言併成一段，換人才換行', () => {
-    expect(formatTranscriptForAI([
-      { start: 0, end: 1, text: '你好', speaker: 'A' },
-      { start: 1, end: 2, text: '再問一句', speaker: 'A' },
-      { start: 2, end: 3, text: '收到', speaker: 'B' },
-    ])).toBe('A: 你好 再問一句\n\nB: 收到');
-  });
-
-  it('沒有 speaker 的段落算 Unknown', () => {
-    expect(formatTranscriptForAI([{ start: 0, end: 1, text: 'x' }])).toBe('Unknown: x');
   });
 });
 
