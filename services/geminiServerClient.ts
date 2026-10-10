@@ -177,6 +177,14 @@ export function isTransientLlmError(err: any): boolean {
     || [...TRANSIENT_NETWORK_CODES].some((code) => msg.includes(code.toLowerCase()));
 }
 
+/**
+ * 轉錄呼叫的輸出上限（vault plan「MeetPilot · 記錄完整度、成本與背景運作」AC-9）。
+ * Gemini 3 系列的 thinking token 也算進這個上限。09-16～10-08 的紀錄裡正常切片 output 最多約 1.2 萬、
+ * thinking 最多約 1.4 萬，合起來留了餘裕；沒設上限時有一次輸出 65,522 token 撞到模型自己的上限，
+ * 白燒一整片的錢、內容還是截斷的。撞到上限當這次呼叫失敗（見 transcribeSlice 的 validateResponse）
+ */
+export const TRANSCRIBE_MAX_OUTPUT_TOKENS = 32768;
+
 class RetryableLlmResponseError extends Error {
   constructor(message: string) {
     super(message);
@@ -618,9 +626,10 @@ Output JSON format:
 { "segments": [{ "start": 0.0, "end": 5.5, "text": "完整的句子內容...", "speaker": "Speaker 1" }] }`,
         // 逐字稿是機械式的照抄任務，不需要推理，調低 thinking level 降低「thinking 吃光
         // maxOutputTokens、response.text 變空」的機率（2026-09-16 查證：Gemini 3 系列的
-        // thinking token 算進 maxOutputTokens，這支呼叫又沒設上限）。不是保證消除，是降低機率：
+        // thinking token 算進 maxOutputTokens）。不是保證消除，是降低機率：
         // llm.jsonl 的 finishReason 欄位之後能直接看出還有沒有撞到 MAX_TOKENS
         thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        maxOutputTokens: TRANSCRIBE_MAX_OUTPUT_TOKENS,
         responseMimeType: 'application/json',
         responseSchema: {
           type: Type.OBJECT,
@@ -649,6 +658,15 @@ Output JSON format:
         contents: { parts },
         config: promptConfig,
         validateResponse: (candidate) => {
+          // 撞到輸出上限的內容是截斷的。以前留到 fallback 外面解 JSON 才拋，這一片直接失敗、
+          // 不重試也不換模型；在這裡拋就走既有的重試與 fallback，截斷的內容一個字都不收。
+          // llm.jsonl 那一筆的 finishReason 是 MAX_TOKENS、errorMessage 是下面這句
+          // （transientReason 會記成 empty_output：llmTelemetry 的列舉只有兩種，這包不改契約檔）
+          if (candidate?.candidates?.[0]?.finishReason === 'MAX_TOKENS') {
+            throw new RetryableLlmResponseError(
+              `Gemini 轉錄輸出撞到 maxOutputTokens 上限（${TRANSCRIBE_MAX_OUTPUT_TOKENS}，finishReason MAX_TOKENS），不收截斷的內容`,
+            );
+          }
           if (
             typeof candidate?.text !== 'string'
             || candidate.text.trim() === ''

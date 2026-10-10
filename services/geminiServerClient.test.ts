@@ -152,9 +152,50 @@ describe('transcribeSlice', () => {
 
     const request = generateContent.mock.calls[0][0] as any;
     expect(request.config.thinkingConfig).toEqual({ thinkingLevel: 'LOW' });
-    // 沒設 maxOutputTokens：這支呼叫本來就是三支裡唯一沒設上限的一支，配上調低的 thinking
-    // level 是同一個問題的兩面，log 裡的 configuredMaxOutputTokens 要老實記成 null
-    expect(request.config.maxOutputTokens).toBeUndefined();
+  });
+
+  it('設 maxOutputTokens 32768；撞到 MAX_TOKENS 當這次失敗走重試與 fallback，不收截斷的內容（AC-9）', async () => {
+    vi.useFakeTimers();
+    // 截斷的內容刻意給一份解得開的：要證明擋下它的是 finishReason，不是剛好 JSON 解不開
+    const truncated = {
+      text: '{"segments":[{"start":0,"end":5,"text":"截斷的前半","speaker":"Speaker 1"}]}',
+      candidates: [{ finishReason: 'MAX_TOKENS' }],
+    };
+    generateContent
+      .mockResolvedValueOnce(truncated)
+      .mockResolvedValueOnce(truncated)
+      .mockResolvedValueOnce({
+        text: '{"segments":[{"start":0,"end":5,"text":"完整的","speaker":"Speaker 1"}]}',
+        candidates: [{ finishReason: 'STOP' }],
+      });
+
+    const pending = client().transcribeSlice({ base64Data: 'AAAA' });
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    await expect(pending).resolves.toEqual([{ start: 0, end: 5, text: '完整的', speaker: 'Speaker 1' }]);
+    // 拿掉上限這裡就紅：每一次呼叫（含重試與 fallback）都帶同一個上限
+    expect(generateContent.mock.calls.map(c => (c[0] as any).config.maxOutputTokens)).toEqual([32768, 32768, 32768]);
+    expect(generateContent.mock.calls.map(c => (c[0] as any).model)).toEqual([
+      'gemini-3.8-flash', 'gemini-3.8-flash', 'gemini-3.1-flash-lite',
+    ]);
+    expect(logged.map(l => l.outcome)).toEqual(['transient', 'transient', 'ok']);
+    expect(logged.map(l => extractFinishReason(l.response))).toEqual(['MAX_TOKENS', 'MAX_TOKENS', 'STOP']);
+    expect(logged.map(l => l.configuredMaxOutputTokens)).toEqual([32768, 32768, 32768]);
+    expect((logged[0].error as Error).message).toContain('MAX_TOKENS');
+  });
+
+  it('每個模型都撞到 MAX_TOKENS 時整片失敗，不退回截斷的內容（AC-9）', async () => {
+    vi.useFakeTimers();
+    generateContent.mockResolvedValue({
+      text: '{"segments":[{"start":0,"end":5,"text":"截斷的前半","speaker":"Speaker 1"}]}',
+      candidates: [{ finishReason: 'MAX_TOKENS' }],
+    });
+
+    const pending = client().transcribeSlice({ base64Data: 'AAAA' });
+    const assertion = expect(pending).rejects.toThrow(/MAX_TOKENS/);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await assertion;
+    expect(logged.every(l => l.outcome === 'transient')).toBe(true);
   });
 
   it('圍欄包住的合法 segments 要正確解析，不能變成一段 JSON 原始碼的假逐字稿', async () => {
@@ -442,7 +483,7 @@ describe('analyzeTranscript', () => {
     await expect(client().analyzeTranscript({ transcript })).rejects.toThrow(/title/);
   });
 
-  it('紀錄的 configuredMaxOutputTokens 是這支呼叫實際設的上限，跟 transcribe 沒設的 null 不一樣', async () => {
+  it('紀錄的 configuredMaxOutputTokens 是這支呼叫實際設的上限', async () => {
     generateContent.mockResolvedValue({ text: JSON.stringify(okOutput) });
     await client().analyzeTranscript({ transcript });
     expect(logged.map(l => l.configuredMaxOutputTokens)).toEqual([8192]);
