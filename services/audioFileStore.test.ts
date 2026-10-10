@@ -1,23 +1,34 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import express from 'express';
 import { createServer, Server } from 'node:http';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve, sep } from 'node:path';
 import { Readable } from 'node:stream';
 import { AudioFileStore, createAudioFileStore, resolveAudioDir } from './audioFileStore';
 import { checkBasicAuth, createRateLimiter } from './httpGuards';
 
+// node:fs 的 ESM 匯出不能 vi.spyOn，只能整個模組換掉，其餘原樣代理給真實實作（同 audioSlicer.test.ts）。
+// 預設 rmSync 照真的刪；只有測「殘檔被鎖住」那一條才覆寫
+const { rmSyncMock } = vi.hoisted(() => ({ rmSyncMock: vi.fn() }));
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return { ...actual, rmSync: (...args: Parameters<typeof actual.rmSync>) => rmSyncMock(...args) };
+});
+const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+
 let dir: string;
 let store: AudioFileStore;
 
 beforeEach(() => {
+  rmSyncMock.mockImplementation((...args: Parameters<typeof realFs.rmSync>) => realFs.rmSync(...args));
   dir = mkdtempSync(join(tmpdir(), 'meetpilot-audio-'));
   store = createAudioFileStore(dir);
 });
 
 afterEach(() => {
-  rmSync(dir, { recursive: true, force: true });
+  vi.restoreAllMocks();
+  realFs.rmSync(dir, { recursive: true, force: true });
 });
 
 describe('resolveAudioDir', () => {
@@ -161,6 +172,33 @@ describe('removePartialUploads', () => {
 
   it('目錄乾淨時回空陣列，不拋錯', () => {
     expect(store.removePartialUploads()).toEqual([]);
+  });
+
+  it('某個 .part 被鎖住刪不掉（EBUSY）時其餘照刪、整支不拋、只 warn 路徑與錯誤碼，回傳不含刪不掉的那個', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const locked = join(dir, 'm-locked.audio.slice-1.part');
+    const other = join(dir, 'm-other.audio.7f3a.part');
+    const temp = store.tempPathFor('m-rec');
+    writeFileSync(locked, 'x');
+    writeFileSync(other, 'x');
+    writeFileSync(temp, 'x');
+    rmSyncMock.mockImplementation((path: string, ...rest: unknown[]) => {
+      if (path === locked) {
+        throw Object.assign(new Error(`EBUSY: resource busy or locked, unlink '${path}'`), { code: 'EBUSY' });
+      }
+      return (realFs.rmSync as (...args: unknown[]) => void)(path, ...rest);
+    });
+
+    // server 在 listen 前呼叫這支：拋了 server 就起不來
+    const removed = store.removePartialUploads();
+
+    expect([...removed].sort()).toEqual([other, temp].sort());
+    expect(existsSync(other)).toBe(false);
+    expect(existsSync(temp)).toBe(false);
+    expect(existsSync(locked)).toBe(true);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0].join(' '))).toContain(locked);
+    expect(String(warn.mock.calls[0].join(' '))).toContain('EBUSY');
   });
 
   it('語音備忘錄取檔留下的 _part 暫存檔一起清掉', async () => {
