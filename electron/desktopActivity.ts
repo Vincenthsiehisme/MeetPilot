@@ -115,6 +115,14 @@ export function quitPrompt(state: QuitState): QuitPrompt | null {
   return null;
 }
 
+/**
+ * 結束確認框按完之後的狀態。response 1 是「結束」，其他是不結束。
+ * 不結束時 app 沒有真的離開，裝更新的旗標要歸零，之後從托盤正常結束才會照問處理中那項
+ */
+export function resolveQuitResponse(response: number, updateQuitting: boolean): { confirmed: boolean; updateQuitting: boolean } {
+  return response === 1 ? { confirmed: true, updateQuitting } : { confirmed: false, updateQuitting: false };
+}
+
 /** 裝更新前的確認框補的一句：處理中的會議不會丟，沒有處理中就不補 */
 export function updateInstallNote(active: number): string {
   return active > 0 ? `\n\n現在有 ${active} 場會議還在處理，結束會讓它們停下來，下次打開 MeetPilot 會接著跑。` : '';

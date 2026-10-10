@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  HIDDEN_LAUNCH_ARG, notificationFor, parseActivityMessage, quitPrompt, shouldBlockSleep, shouldOpenAtLogin, startedHidden, updateInstallNote,
+  HIDDEN_LAUNCH_ARG, notificationFor, parseActivityMessage, quitPrompt, shouldBlockSleep, shouldOpenAtLogin, startedHidden, resolveQuitResponse, updateInstallNote,
 } from './desktopActivity';
 
 const valid = {
@@ -115,6 +115,18 @@ describe('裝更新時的結束', () => {
     expect(updateInstallNote(0)).toBe('');
     expect(updateInstallNote(2)).toContain('2 場會議還在處理');
     expect(updateInstallNote(2)).toContain('下次打開');
+  });
+});
+
+describe('resolveQuitResponse', () => {
+  it('按「結束」：確認結束，裝更新的旗標維持（接著的 app.quit() 不再問處理中）', () => {
+    expect(resolveQuitResponse(1, true)).toEqual({ confirmed: true, updateQuitting: true });
+    expect(resolveQuitResponse(1, false)).toEqual({ confirmed: true, updateQuitting: false });
+  });
+
+  it('按「不結束」：app 沒結束，裝更新的旗標歸零，之後正常結束照問處理中', () => {
+    expect(resolveQuitResponse(0, true)).toEqual({ confirmed: false, updateQuitting: false });
+    expect(resolveQuitResponse(0, false)).toEqual({ confirmed: false, updateQuitting: false });
   });
 });
 
