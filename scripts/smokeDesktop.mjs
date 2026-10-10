@@ -129,7 +129,9 @@ const launch = async (extraArgs = []) => {
   ], {
     stdio: 'ignore',
     detached: process.platform !== 'win32',
-    env: { ...process.env, MEETPILOT_DESKTOP_USER_DATA: userData, MEETPILOT_DESKTOP_GATEWAY_URL: gatewayUrl },
+    // MEETPILOT_DESKTOP_SMOKE：外殼不登記開機自動啟動（會改到這台電腦真實的登入項目）、不發系統通知、
+    // 結束時不問「還有會議在處理」（對話框會卡住收尾）
+    env: { ...process.env, MEETPILOT_DESKTOP_USER_DATA: userData, MEETPILOT_DESKTOP_GATEWAY_URL: gatewayUrl, MEETPILOT_DESKTOP_SMOKE: '1' },
   });
   app = { child, exited: null, cdpPort, inspectPort };
   const current = app;
