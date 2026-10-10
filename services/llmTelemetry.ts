@@ -38,8 +38,8 @@ export interface LlmUsage {
 export interface LlmCallInput {
   kind: LlmCallKind;
   // 這場呼叫算在哪一場會議頭上，事後才查得出「這場會燒了多少 token」。
-  // null／缺省代表這次呼叫真的沒有單一會議可歸——目前只有前端的 polish 舊路由
-  // 還沒把 meetingId 帶進請求，其餘 kind 一律會傳
+  // null／缺省代表這次呼叫真的沒有單一會議可歸。'polish' kind 只留給解析舊的 llm.jsonl，
+  // 全文修潤已拿掉，現在不會再有這種呼叫
   meetingId?: string | null;
   // 這次實際打的 model id
   model: string;
