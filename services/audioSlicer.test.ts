@@ -172,6 +172,36 @@ describe('probeDurationRemuxingIfMissing（AC-7：瀏覽器錄的 webm 沒寫長
     expect(readdirSync(dir)).toEqual(['a.audio']);
   });
 
+  it('remux 失敗又刪不掉暫存檔（EBUSY）：拋的是 remux 的錯誤，不被刪檔錯誤蓋掉，只 warn 路徑與錯誤碼', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    rmSyncMock.mockImplementation((path: string, ...rest: unknown[]) => {
+      if (String(path).endsWith('.part')) {
+        throw Object.assign(new Error(`EBUSY: resource busy or locked, unlink '${path}'`), { code: 'EBUSY' });
+      }
+      return (realFs.rmSync as (...args: unknown[]) => void)(path, ...rest);
+    });
+    const file = join(dir, 'a.audio');
+    writeFileSync(file, 'original');
+    let partPath = '';
+    const slicer = createAudioSlicer({
+      ffmpegPath: 'ffmpeg',
+      ffprobePath: 'ffprobe',
+      runner: async (executable, args) => {
+        if (executable === 'ffprobe') return { code: 0, stdout: Buffer.from('N/A'), stderr: '' };
+        // 真的 ffmpeg 失敗時可能已經寫了半個檔
+        partPath = args[args.length - 1] as string;
+        writeFileSync(partPath, 'half');
+        return { code: 1, stdout: Buffer.alloc(0), stderr: 'Invalid data found' };
+      },
+    });
+
+    await expect(slicer.probeDurationRemuxingIfMissing(file)).rejects.toThrow(/remux.*Invalid data found/);
+    expect(readFileSync(file, 'utf8')).toBe('original');
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0].join(' '))).toContain(partPath);
+    expect(String(warn.mock.calls[0].join(' '))).toContain('EBUSY');
+  });
+
   it('remux 之後還是讀不到長度就照原本的錯誤爆，不塞一個假長度', async () => {
     const calls: { executable: string; args: readonly string[] }[] = [];
     const file = join(dir, 'a.audio');

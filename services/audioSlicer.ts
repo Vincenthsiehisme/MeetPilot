@@ -135,7 +135,8 @@ const readOutputFile = (path: string): Buffer => {
 };
 
 /**
- * 刪切片暫存檔。刪不掉（Windows 防毒或 OneDrive 剛好鎖住，EBUSY／EPERM）只 warn，不拋：
+ * 刪暫存檔（切片的 `.slice-*.part`、remux 失敗留下的 `.remux-*.part`），這個檔裡刪暫存檔一律走這支。
+ * 刪不掉（Windows 防毒或 OneDrive 剛好鎖住，EBUSY／EPERM）只 warn，不拋：
  * 這時切片已經讀到手或 ffmpeg 自己的錯誤正要往上拋，刪檔失敗不能把成功的切片變失敗、
  * 也不能蓋掉真正的錯誤。留下的 `.part` 由啟動時的 `removePartialUploads` 清
  */
@@ -236,7 +237,7 @@ export function createAudioSlicer(options: AudioSlicerOptions) {
         );
         renameSync(partPath, filePath);
       } catch (err) {
-        rmSync(partPath, { force: true });
+        removeTempFile(partPath);
         throw err;
       }
       return parseDuration(await readRawDuration(filePath), filePath);
