@@ -226,6 +226,11 @@ npm run cost:report -- --shared <共享資料夾> --out <輸出資料夾>
 - 失敗的呼叫（`outcome` 不是 `ok`）只要有回傳 token 就照算進每場、每人、每月總額，另外單列「其中失敗重試」一欄。
 - 會議標題是從同一位記錄人資料夾裡會議記錄的 frontmatter `meetpilot_id` 對回檔名；對不到的寫 meetingId 前 8 碼，`meetingId` 是 null 的列「未歸屬」。一場跨月會分成兩列，讓逐場加總等於分月。
 - `_診斷/llm.jsonl` 只在會議走到終點時匯出，還在跑的會議不一定算進來。
+- **卡住的會議。** 每位記錄人資料夾根目錄的 `_狀態.json`（app 每 60 秒與狀態有變時寫）也會讀，總覽的「會議狀態」一段把每一場只放進一類。沒有狀態檔的記錄人會寫「沒有狀態檔」，不會當成沒事；`schema` 不是 1 就報錯。
+  - 卡住：`inProgress` 為 true，而且狀態檔 `writtenAt` 超過 10 分鐘沒更新（app 沒在跑），或這場的 `updatedAt` 超過 30 分鐘沒變。寫「卡多久」（從 `updatedAt` 算）與原因。
+  - 處理中：`inProgress` 為 true、沒超時。
+  - 錄音中：`RECORDING`，`updatedAt` 在 3 小時內；超過 3 小時改列需要處理，寫已過多久。
+  - 需要處理：其餘 `inProgress` 為 false 的（`CREATED`、`FAILED`、`LINK_FAILED`，以及停在 `TRANSCRIBING`、`TRANSCRIBED`、`ANALYZING` 卻沒有進行中 job 的），寫狀態與 `error`。
 
 ## 驗證
 

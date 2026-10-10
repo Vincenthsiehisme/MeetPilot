@@ -14,9 +14,11 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSyn
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { isMeetingStatus, type MeetingStatus } from '../services/meetingState';
 
 export const DIAGNOSTICS_DIR = '_診斷';
 export const LLM_LOG_NAME = 'llm.jsonl';
+export const STATUS_FILE_NAME = '_狀態.json';
 export const DEFAULT_PRICES_PATH = new URL('./geminiPrices.json', import.meta.url);
 const CONFLICT_INFIX = '.conflict-';
 const UNATTRIBUTED = '未歸屬';
@@ -146,6 +148,118 @@ export function costOfCall(
   return { amount, uncounted: null };
 }
 
+// ---------- 狀態檔：卡住的會議 ----------
+
+/** 狀態檔 `writtenAt` 超過這麼久沒更新，視為 app 沒在跑 */
+export const HEARTBEAT_STALE_MS = 10 * 60_000;
+/** 處理中的會議 `updatedAt` 超過這麼久沒變，視為卡住 */
+export const PROGRESS_STALE_MS = 30 * 60_000;
+/** 錄音中的會議 `updatedAt` 超過這麼久，改列需要處理 */
+export const RECORDING_STALE_MS = 3 * 60 * 60_000;
+
+export interface StatusMeeting {
+  meetingId: string;
+  title: string | null;
+  status: MeetingStatus;
+  inProgress: boolean;
+  updatedAt: string;
+  error: string | null;
+}
+
+export interface StatusFile {
+  writtenAt: string;
+  meetings: StatusMeeting[];
+}
+
+const stringOrNull = (v: unknown, where: string): string | null => {
+  if (v === null) return null;
+  if (typeof v !== 'string') throw new Error(`${where} 要是字串或 null`);
+  return v;
+};
+
+export function parseStatusFile(text: string, source: string): StatusFile {
+  let raw: Record<string, unknown> | null;
+  try {
+    raw = JSON.parse(text);
+  } catch (err) {
+    throw new Error(`${source} 不是合法 JSON：${(err as Error).message}`);
+  }
+  if (raw === null || typeof raw !== 'object' || raw.schema !== 1) {
+    throw new Error(`${source} 的 schema 是 ${JSON.stringify((raw as { schema?: unknown } | null)?.schema)}，這支腳本只認 1`);
+  }
+  const isoField = (v: unknown, where: string): string => {
+    if (typeof v !== 'string' || Number.isNaN(Date.parse(v))) throw new Error(`${where} 不是 ISO 時間：${JSON.stringify(v)}`);
+    return v;
+  };
+  const writtenAt = isoField(raw.writtenAt, `${source} 的 writtenAt`);
+  if (!Array.isArray(raw.meetings)) throw new Error(`${source} 缺 meetings 陣列`);
+  const meetings = raw.meetings.map((m: Record<string, unknown> | null, i: number): StatusMeeting => {
+    const where = `${source} meetings[${i}]`;
+    const { meetingId, status, inProgress, title, error } = m ?? {};
+    if (typeof meetingId !== 'string' || meetingId === '') throw new Error(`${where} 缺 meetingId`);
+    if (!isMeetingStatus(status)) throw new Error(`${where} 的 status 不認得：${JSON.stringify(status)}`);
+    if (typeof inProgress !== 'boolean') throw new Error(`${where} 的 inProgress 要是 boolean`);
+    return {
+      meetingId,
+      title: stringOrNull(title, `${where} 的 title`),
+      status,
+      inProgress,
+      updatedAt: isoField(m?.updatedAt, `${where} 的 updatedAt`),
+      error: stringOrNull(error, `${where} 的 error`),
+    };
+  });
+  return { writtenAt, meetings };
+}
+
+export function formatDuration(ms: number): string {
+  const minutes = Math.floor(Math.max(0, ms) / 60_000);
+  if (minutes < 1) return '不到 1 分鐘';
+  if (minutes < 60) return `${minutes} 分鐘`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours} 小時 ${minutes % 60} 分`;
+  return `${Math.floor(hours / 24)} 天 ${hours % 24} 小時`;
+}
+
+export type StatusClass = '卡住' | '處理中' | '錄音中' | '需要處理';
+export const STATUS_CLASSES: readonly StatusClass[] = ['卡住', '處理中', '錄音中', '需要處理'];
+
+export interface ClassifiedMeeting {
+  meeting: StatusMeeting;
+  klass: StatusClass;
+  /** 從 `updatedAt` 到 now 的毫秒數：卡住是「卡多久」，需要處理的 RECORDING 是「已過多久」 */
+  ageMs: number;
+  /** 為什麼落在這一類（卡住與需要處理才有） */
+  reasons: string[];
+}
+
+/**
+ * 每一場恰好落一類：
+ * - `inProgress` 為 true：`writtenAt` 超過 10 分鐘（app 沒在跑）或 `updatedAt` 超過 30 分鐘 → 卡住，否則處理中。
+ * - `inProgress` 為 false 且 `RECORDING`：`updatedAt` 超過 3 小時 → 需要處理，否則錄音中。
+ * - 其餘 `inProgress` 為 false 的（含停在 TRANSCRIBING／TRANSCRIBED／ANALYZING 卻沒有進行中 job 的）→ 需要處理。
+ */
+export function classifyMeeting(meeting: StatusMeeting, writtenAt: string, now: Date): ClassifiedMeeting {
+  const ageMs = now.getTime() - Date.parse(meeting.updatedAt);
+  const heartbeatMs = now.getTime() - Date.parse(writtenAt);
+  if (meeting.inProgress) {
+    const reasons: string[] = [];
+    if (heartbeatMs > HEARTBEAT_STALE_MS) reasons.push(`app 已 ${formatDuration(heartbeatMs)}沒有更新狀態檔`);
+    if (ageMs > PROGRESS_STALE_MS) reasons.push(`狀態 ${formatDuration(ageMs)}沒有變化`);
+    return { meeting, klass: reasons.length > 0 ? '卡住' : '處理中', ageMs, reasons };
+  }
+  if (meeting.status === 'RECORDING') {
+    if (ageMs > RECORDING_STALE_MS) return { meeting, klass: '需要處理', ageMs, reasons: [`錄音狀態已過 ${formatDuration(ageMs)}`] };
+    return { meeting, klass: '錄音中', ageMs, reasons: [] };
+  }
+  return { meeting, klass: '需要處理', ageMs, reasons: [`停在 ${meeting.status}，沒有進行中的 job`] };
+}
+
+export interface StatusSection {
+  writtenAt: string;
+  heartbeatMs: number;
+  items: ClassifiedMeeting[];
+}
+
 // ---------- 彙總 ----------
 
 export interface Totals {
@@ -200,6 +314,8 @@ export interface PersonReport {
   total: Bucket;
   months: Map<string, Bucket>;
   meetings: MeetingRow[];
+  /** null：沒有 `_狀態.json` */
+  status: StatusSection | null;
   /** 兩個 kind 以外的計數，給頁尾說明 */
   embedCalls: number;
   noTokenCalls: number;
@@ -238,7 +354,7 @@ export function loadMeetingTitles(personDir: string): Map<string, string> {
 
 const monthOf = (ts: string): string => ts.slice(0, 7);
 
-function buildPerson(shared: string, name: string, prices: readonly PriceRow[]): PersonReport {
+function buildPerson(shared: string, name: string, prices: readonly PriceRow[], now: Date): PersonReport {
   const personDir = join(shared, name);
   const logPath = join(personDir, DIAGNOSTICS_DIR, LLM_LOG_NAME);
   const person: PersonReport = {
@@ -247,12 +363,21 @@ function buildPerson(shared: string, name: string, prices: readonly PriceRow[]):
     total: emptyBucket(),
     months: new Map(),
     meetings: [],
+    status: null,
     embedCalls: 0,
     noTokenCalls: 0,
   };
+  const titles = loadMeetingTitles(personDir);
+
+  const statusPath = join(personDir, STATUS_FILE_NAME);
+  if (existsSync(statusPath)) {
+    const file = parseStatusFile(readFileSync(statusPath, 'utf8'), statusPath);
+    const items = file.meetings.map((m) => classifyMeeting({ ...m, title: titles.get(m.meetingId) ?? m.title ?? m.meetingId.slice(0, 8) }, file.writtenAt, now));
+    person.status = { writtenAt: file.writtenAt, heartbeatMs: now.getTime() - Date.parse(file.writtenAt), items };
+  }
+
   if (!person.hasLlmLog) return person;
 
-  const titles = loadMeetingTitles(personDir);
   const records = parseLlmLog(readFileSync(logPath, 'utf8'), logPath);
   const rows = new Map<string, MeetingRow>();
 
@@ -297,7 +422,7 @@ export function buildCostReport(sharedRoot: string, prices: readonly PriceRow[],
   const names = readdirSync(sharedRoot)
     .filter((n) => statSync(join(sharedRoot, n)).isDirectory())
     .sort((a, b) => a.localeCompare(b));
-  const people = names.map((n) => buildPerson(sharedRoot, n, prices));
+  const people = names.map((n) => buildPerson(sharedRoot, n, prices, now));
 
   const report: CostReport = { generatedAt: now.toISOString(), sharedRoot, people, total: emptyBucket(), personMonths: [], months: new Map() };
   for (const p of people) {
@@ -339,6 +464,36 @@ function amountCell(t: Totals | undefined): string {
   return `${money(t.cost)}（另 ${t.uncounted} 次未計）`;
 }
 
+function renderStatusSection(report: CostReport): string[] {
+  const out: string[] = ['## 會議狀態（來自各記錄人的 _狀態.json）', ''];
+  const count = (k: StatusClass): number => report.people.reduce((n, p) => n + (p.status?.items.filter((i) => i.klass === k).length ?? 0), 0);
+  out.push(`卡住 ${count('卡住')} 場、需要處理 ${count('需要處理')} 場、處理中 ${count('處理中')} 場、錄音中 ${count('錄音中')} 場。`, '');
+  for (const p of report.people) {
+    out.push(`### ${p.name}`, '');
+    if (p.status === null) {
+      out.push(`沒有狀態檔（找不到 ${STATUS_FILE_NAME}）。`, '');
+      continue;
+    }
+    out.push(`狀態檔寫於 ${p.status.writtenAt}（${formatDuration(p.status.heartbeatMs)}前）。`, '');
+    if (p.status.items.length === 0) {
+      out.push('沒有進行中或待處理的會議。', '');
+      continue;
+    }
+    for (const klass of STATUS_CLASSES) {
+      const items = p.status.items.filter((i) => i.klass === klass);
+      if (items.length === 0) continue;
+      out.push(`#### ${klass}`, '');
+      out.push(...table(['會議', '狀態', klass === '卡住' ? '卡多久' : '距上次更新', '說明'], items.map((i) => [
+        i.meeting.title ?? i.meeting.meetingId,
+        i.meeting.status,
+        formatDuration(i.ageMs),
+        [...i.reasons, ...(i.meeting.error ? [`error：${i.meeting.error}`] : [])].join('；') || '-',
+      ])), '');
+    }
+  }
+  return out;
+}
+
 export function renderCostReport(report: CostReport): string {
   const kinds = new Set<string>();
   for (const k of report.total.byKind.keys()) kinds.add(k);
@@ -356,6 +511,8 @@ export function renderCostReport(report: CostReport): string {
   const summaryCells = (t: Totals): string[] => [money(t.cost), money(t.failedCost), String(t.calls), String(t.failedCalls), String(t.uncounted)];
 
   out.push('## 總計', '', ...table(summaryHead, [summaryCells(report.total)]), '');
+
+  out.push(...renderStatusSection(report));
 
   out.push('## 各步驟分項（全部記錄人）', '');
   out.push(...table(['步驟', ...summaryHead], kindCols.map((k) => {

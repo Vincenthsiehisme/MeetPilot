@@ -5,18 +5,24 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   assertOutOutsideShared,
   buildCostReport,
+  classifyMeeting,
   costOfCall,
   defaultSettingsPath,
+  formatDuration,
   loadMeetingTitles,
   loadPriceTable,
   parseArgs,
   parseLlmLog,
+  parseStatusFile,
   parsePriceTable,
   priceFor,
   renderCostReport,
   resolveSharedRoot,
+  STATUS_CLASSES,
   type CallRecord,
+  type StatusMeeting,
 } from './costReport';
+import { MEETING_STATUSES } from '../services/meetingState';
 
 const prices = loadPriceTable();
 
@@ -311,5 +317,154 @@ describe('檔案輸入輸出', () => {
       writeFileSync(join(bad, 'x', '_診斷', 'llm.jsonl'), `${line({ model: 'gemini-9-ultra' })}\n`);
       expect(() => buildCostReport(bad, prices, now)).toThrow(/gemini-9-ultra/);
     });
+  });
+});
+
+describe('狀態檔分類', () => {
+  const NOW = new Date('2026-10-10T12:00:00.000Z');
+  const ago = (ms: number): string => new Date(NOW.getTime() - ms).toISOString();
+  const MIN = 60_000;
+  const HOUR = 60 * MIN;
+  const meeting = (over: Partial<StatusMeeting>): StatusMeeting => ({
+    meetingId: 'aaaaaaaa-0000-0000-0000-000000000001',
+    title: null,
+    status: 'TRANSCRIBING',
+    inProgress: true,
+    updatedAt: ago(1 * MIN),
+    error: null,
+    ...over,
+  });
+  const klass = (m: StatusMeeting, writtenAgo = 10_000): string => classifyMeeting(m, ago(writtenAgo), NOW).klass;
+
+  it('每個狀態 × inProgress 都恰好落一類，沒有漏的', () => {
+    for (const status of MEETING_STATUSES) {
+      for (const inProgress of [true, false]) {
+        for (const [updatedAgo, writtenAgo] of [[MIN, 10_000], [31 * MIN, 10_000], [MIN, 11 * MIN], [4 * HOUR, 11 * MIN]]) {
+          const result = classifyMeeting(meeting({ status, inProgress, updatedAt: ago(updatedAgo) }), ago(writtenAgo), NOW);
+          expect(STATUS_CLASSES.filter((k) => k === result.klass), `${status} inProgress=${inProgress}`).toHaveLength(1);
+        }
+      }
+    }
+  });
+
+  it('inProgress 沒超時列處理中', () => {
+    expect(klass(meeting({}))).toBe('處理中');
+    expect(klass(meeting({ updatedAt: ago(30 * MIN) }))).toBe('處理中');
+  });
+
+  it('inProgress 且 updatedAt 超過 30 分鐘是卡住，寫卡多久', () => {
+    const r = classifyMeeting(meeting({ updatedAt: ago(45 * MIN) }), ago(10_000), NOW);
+    expect(r.klass).toBe('卡住');
+    expect(r.ageMs).toBe(45 * MIN);
+    expect(r.reasons).toEqual(['狀態 45 分鐘沒有變化']);
+  });
+
+  it('inProgress 且 writtenAt 超過 10 分鐘（app 沒在跑）是卡住，即使 updatedAt 很新', () => {
+    expect(klass(meeting({ updatedAt: ago(2 * MIN) }), 10 * MIN)).toBe('處理中');
+    const r = classifyMeeting(meeting({ updatedAt: ago(2 * MIN) }), ago(15 * MIN), NOW);
+    expect(r.klass).toBe('卡住');
+    expect(r.reasons[0]).toContain('app 已 15 分鐘');
+  });
+
+  it('RECORDING 三小時內是錄音中，超過改列需要處理並寫已過多久', () => {
+    expect(klass(meeting({ status: 'RECORDING', inProgress: false, updatedAt: ago(3 * HOUR) }))).toBe('錄音中');
+    const r = classifyMeeting(meeting({ status: 'RECORDING', inProgress: false, updatedAt: ago(3 * HOUR + MIN) }), ago(10_000), NOW);
+    expect(r.klass).toBe('需要處理');
+    expect(r.reasons).toEqual(['錄音狀態已過 3 小時 1 分']);
+  });
+
+  it('錄音中不看 writtenAt（錄音不算 inProgress）', () => {
+    expect(klass(meeting({ status: 'RECORDING', inProgress: false }), 20 * MIN)).toBe('錄音中');
+  });
+
+  it('inProgress 為 false 的其餘會議都是需要處理，含停在處理狀態卻沒有 job 的', () => {
+    for (const status of ['CREATED', 'FAILED', 'LINK_FAILED', 'TRANSCRIBING', 'TRANSCRIBED', 'ANALYZING'] as const) {
+      const r = classifyMeeting(meeting({ status, inProgress: false, error: status === 'FAILED' ? 'boom' : null }), ago(10_000), NOW);
+      expect(r.klass, status).toBe('需要處理');
+      expect(r.reasons[0]).toContain(status);
+    }
+  });
+
+  it('formatDuration', () => {
+    expect(formatDuration(20_000)).toBe('不到 1 分鐘');
+    expect(formatDuration(59 * MIN)).toBe('59 分鐘');
+    expect(formatDuration(5 * HOUR + 7 * MIN)).toBe('5 小時 7 分');
+    expect(formatDuration(50 * HOUR)).toBe('2 天 2 小時');
+  });
+});
+
+describe('parseStatusFile', () => {
+  const good = {
+    schema: 1,
+    writtenAt: '2026-10-10T12:00:00.000Z',
+    meetings: [{ meetingId: 'a', title: null, status: 'FAILED', inProgress: false, updatedAt: '2026-10-10T11:00:00.000Z', error: 'x' }],
+  };
+
+  it('讀得進符合契約的檔', () => {
+    expect(parseStatusFile(JSON.stringify(good), 's').meetings[0]).toMatchObject({ meetingId: 'a', status: 'FAILED', error: 'x' });
+  });
+
+  it('schema 不是 1、不認得的 status、欄位型別不對、壞 JSON 都報錯', () => {
+    expect(() => parseStatusFile(JSON.stringify({ ...good, schema: 2 }), 's')).toThrow(/schema/);
+    expect(() => parseStatusFile('{', 's')).toThrow(/不是合法 JSON/);
+    expect(() => parseStatusFile(JSON.stringify({ ...good, meetings: [{ ...good.meetings[0], status: 'DONE' }] }), 's')).toThrow(/status/);
+    expect(() => parseStatusFile(JSON.stringify({ ...good, meetings: [{ ...good.meetings[0], inProgress: 'yes' }] }), 's')).toThrow(/inProgress/);
+    expect(() => parseStatusFile(JSON.stringify({ ...good, writtenAt: 'x' }), 's')).toThrow(/writtenAt/);
+    expect(() => parseStatusFile(JSON.stringify({ ...good, meetings: [{ ...good.meetings[0], updatedAt: 3 }] }), 's')).toThrow(/updatedAt/);
+  });
+});
+
+describe('總覽列出卡住的會議', () => {
+  let root: string;
+  const NOW = new Date('2026-10-10T12:00:00.000Z');
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), 'cost-report-status-'));
+    const w = (rel: string, content: string) => {
+      mkdirSync(join(root, rel, '..'), { recursive: true });
+      writeFileSync(join(root, rel), content);
+    };
+    w('妍均/2026-10-10 0900 週會.md', '---\nmeetpilot_id: m-stuck\n---\n');
+    w('妍均/_狀態.json', JSON.stringify({
+      schema: 1,
+      writtenAt: '2026-10-10T11:59:30.000Z',
+      meetings: [
+        { meetingId: 'm-stuck', title: '不會用到', status: 'ANALYZING', inProgress: true, updatedAt: '2026-10-10T10:00:00.000Z', error: null },
+        { meetingId: 'm-run', title: '正在跑', status: 'TRANSCRIBING', inProgress: true, updatedAt: '2026-10-10T11:58:00.000Z', error: null },
+        { meetingId: 'm-fail', title: '失敗的會', status: 'FAILED', inProgress: false, updatedAt: '2026-10-09T10:00:00.000Z', error: '轉錄失敗：quota' },
+        { meetingId: 'm-rec', title: null, status: 'RECORDING', inProgress: false, updatedAt: '2026-10-10T11:00:00.000Z', error: null },
+      ],
+    }));
+    w('雪芳/_診斷/llm.jsonl', '');
+  });
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('每場落進一類，標題優先用會議記錄檔名', () => {
+    const report = buildCostReport(root, prices, NOW);
+    const items = report.people[0].status!.items;
+    expect(items.map((i) => [i.meeting.title, i.klass])).toEqual([
+      ['2026-10-10 0900 週會', '卡住'],
+      ['正在跑', '處理中'],
+      ['失敗的會', '需要處理'],
+      ['m-rec', '錄音中'],
+    ]);
+    expect(items[0].ageMs).toBe(2 * 60 * 60_000);
+  });
+
+  it('沒有 _狀態.json 的記錄人列出「沒有狀態檔」，不當成沒事', () => {
+    const report = buildCostReport(root, prices, NOW);
+    expect(report.people[1].status).toBeNull();
+    const md = renderCostReport(report);
+    expect(md).toContain('### 雪芳\n\n沒有狀態檔');
+  });
+
+  it('渲染卡住、卡多久、需要處理的狀態與 error', () => {
+    const md = renderCostReport(buildCostReport(root, prices, NOW));
+    expect(md).toContain('卡住 1 場、需要處理 1 場、處理中 1 場、錄音中 1 場');
+    expect(md).toContain('#### 卡住');
+    expect(md).toMatch(/\| 2026-10-10 0900 週會 \| ANALYZING \| 2 小時 0 分 \| 狀態 2 小時 0 分沒有變化 \|/);
+    expect(md).toContain('error：轉錄失敗：quota');
+    expect(md).toContain('狀態檔寫於 2026-10-10T11:59:30.000Z');
   });
 });
