@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { openMeetingDb } from './meetingDb';
@@ -14,6 +14,7 @@ import {
   computeDurationMinutes,
   createVaultProjector,
   renderSystemRegion,
+  runProjection,
   resolveVaultDir,
   sanitizeTitle,
   toMeetpilotStatus,
@@ -56,12 +57,16 @@ interface ReadyMeetingInput {
   actionItems?: { text: string; source_meeting_id: string; created_at: number; status: 'unknown' | 'open' | 'done'; assignee?: string | null; due?: string | null; evidence?: Evidence | null }[];
   openQuestions?: string[];
   segments?: { start: number; end: number; text: string; speaker?: string }[];
+  participantIds?: string[];
 }
 
 /** 把一場會推到 READY，帶著可以投影的最小分析內容 */
 function makeReadyMeeting(input: ReadyMeetingInput): string {
   const id = input.id ?? 'm-1';
-  store.createMeeting({ meeting_id: id, created_at: T0, source_file_name: 'a.m4a', source_file_size: 10 });
+  store.createMeeting({
+    meeting_id: id, created_at: T0, source_file_name: 'a.m4a', source_file_size: 10,
+    ...(input.participantIds ? { participant_ids: input.participantIds } : {}),
+  });
   if (input.title !== undefined) store.setTitle(id, input.title, T0);
   store.setStatus(id, 'TRANSCRIBING', T0);
   store.saveTranscript(
@@ -123,6 +128,7 @@ function linkMeetings(
 }
 
 const listMdFiles = (dir: string): string[] => readdirSync(dir).filter((n) => n.endsWith('.md'));
+const readOnlyFileByName = (name: string): string => readFileSync(join(vaultDir, name), 'utf8');
 const readOnlyFile = (dir: string): string => readFileSync(join(dir, listMdFiles(dir)[0]), 'utf8');
 
 describe('resolveVaultDir', () => {
@@ -623,7 +629,7 @@ describe('renderSystemRegion／computeChecksum：純函式，checksum 對輸入�
 
   it('相同輸入永遠算出相同 checksum（重算是 idempotent 的前提）', () => {
     const region = renderSystemRegion({
-      title: '週會', decisions: asDecisions(['a']), actionItems: [], openQuestions: [], topics: [],
+      title: '週會', transcriptStem: '2023-11-14 2213 週會', decisions: asDecisions(['a']), actionItems: [], openQuestions: [], topics: [],
       topicTags: [], relatedSection: '關聯計算尚未完成。', seamReport: null, needsReview: [],
     });
     expect(computeChecksum(region)).toBe(computeChecksum(region));
@@ -631,7 +637,7 @@ describe('renderSystemRegion／computeChecksum：純函式，checksum 對輸入�
 
   it('內容不同 checksum 就不同', () => {
     const base = {
-      title: '週會', actionItems: [], openQuestions: [], topics: [], topicTags: [],
+      title: '週會', transcriptStem: '2023-11-14 2213 週會', actionItems: [], openQuestions: [], topics: [], topicTags: [],
       relatedSection: '關聯計算尚未完成。', seamReport: null, needsReview: [],
     };
     const r1 = renderSystemRegion({ ...base, decisions: asDecisions(['a']) });
@@ -641,7 +647,7 @@ describe('renderSystemRegion／computeChecksum：純函式，checksum 對輸入�
 
   it('未決事項不同 checksum 也不同（新增段，不能被漏算）', () => {
     const base = {
-      title: '週會', decisions: asDecisions(['a']), actionItems: [], topics: [], topicTags: [],
+      title: '週會', transcriptStem: '2023-11-14 2213 週會', decisions: asDecisions(['a']), actionItems: [], topics: [], topicTags: [],
       relatedSection: '關聯計算尚未完成。', seamReport: null, needsReview: [],
     };
     const r1 = renderSystemRegion({ ...base, openQuestions: [] });
@@ -651,7 +657,7 @@ describe('renderSystemRegion／computeChecksum：純函式，checksum 對輸入�
 
   it('轉錄破洞不同 checksum 也不同（完整性提示要被 checksum 保護，不然人改了提示不會觸發 conflict）', () => {
     const base = {
-      title: '週會', decisions: asDecisions(['a']), actionItems: [], openQuestions: [], topics: [],
+      title: '週會', transcriptStem: '2023-11-14 2213 週會', decisions: asDecisions(['a']), actionItems: [], openQuestions: [], topics: [],
       topicTags: [], relatedSection: '關聯計算尚未完成。', needsReview: [],
     };
     const r1 = renderSystemRegion({ ...base, seamReport: null });
@@ -660,5 +666,215 @@ describe('renderSystemRegion／computeChecksum：純函式，checksum 對輸入�
       seamReport: [{ sliceIndex: 2, verdict: 'gap', similarity: 0.1, droppedSegments: 0 }],
     });
     expect(computeChecksum(r1)).not.toBe(computeChecksum(r2));
+  });
+});
+
+describe('project：逐字稿投影到 _逐字稿/', () => {
+  const TRANSCRIPT_DIR = '_逐字稿';
+  const transcriptFiles = (): string[] =>
+    existsSync(join(vaultDir, TRANSCRIPT_DIR)) ? readdirSync(join(vaultDir, TRANSCRIPT_DIR)).sort() : [];
+  const readTranscriptFile = (name: string): string => readFileSync(join(vaultDir, TRANSCRIPT_DIR, name), 'utf8');
+  const recordStem = (): string => listMdFiles(vaultDir)[0].replace(/\.md$/, '');
+  const dumpMentions = (): unknown[] => db.prepare('SELECT * FROM name_mentions ORDER BY mention_id').all();
+  const PROVENANCE_BASE = { model: 'gemini-test', prompt_version: 'pv-test' };
+
+  const seedPerson = (): void => {
+    peopleStore.importRoster(
+      [{ employeeId: 'p-1', displayName: '陳國煌', title: null, email: 'p1@liontravel.com', department: null, aliases: ['Philchen'] }],
+      T0,
+    );
+  };
+
+  it('寫一份同名逐字稿：frontmatter、標題、每段一行 MM:SS–MM:SS 與講者，沒有分析 provenance 時標人名尚未校正', () => {
+    const id = makeReadyMeeting({
+      overview: '週會', title: '週會', segments: [
+        { start: 0, end: 12.9, text: '哈囉', speaker: 'Speaker 1' },
+        { start: 2512, end: 3059, text: '第二句\n換行', speaker: 'Speaker 2' },
+        { start: 3060, end: 3070, text: '沒有講者' },
+      ],
+    });
+    projector.project(id);
+
+    const stem = recordStem();
+    expect(stem).toBe('2023-11-14 2213 週會');
+    expect(transcriptFiles()).toEqual([`${stem}.md`]);
+    expect(readTranscriptFile(`${stem}.md`)).toBe([
+      '---',
+      'meetpilot_transcript_of: m-1',
+      '---',
+      '',
+      '# 週會',
+      '',
+      '人名尚未校正',
+      '',
+      '`00:00–00:12` Speaker 1：哈囉',
+      '`41:52–50:59` Speaker 2：第二句 換行',
+      '`51:00–51:10` 沒有講者',
+      '',
+    ].join('\n'));
+  });
+
+  it('會議記錄系統區有指向逐字稿的 wikilink，stem 跟會議記錄檔名相同', () => {
+    const id = makeReadyMeeting({ overview: '週會', title: '週會' });
+    projector.project(id);
+    const raw = readOnlyFile(vaultDir);
+    expect(raw).toContain(`逐字稿：[[${TRANSCRIPT_DIR}/${recordStem()}|逐字稿]]`);
+    // 連結在系統區裡面（被 checksum 保護），不在人工區
+    expect(raw.indexOf('逐字稿：[[')).toBeLessThan(raw.indexOf('<!-- meetpilot:auto:end -->'));
+  });
+
+  it('時間格式跟會議記錄出處一致：同一段 evidence 在兩份檔裡是同一個字串', () => {
+    const id = makeReadyMeeting({
+      overview: '週會', title: '週會',
+      segments: [{ start: 2512, end: 3059, text: '定價拍板', speaker: 'Speaker 1' }],
+      decisionObjects: [{ text: '定價 100 元', evidence: { start: 2512, end: 3059 }, decided_by: null }],
+    });
+    projector.project(id);
+    expect(readOnlyFile(vaultDir)).toContain('定價 100 元（41:52–50:59）');
+    expect(readTranscriptFile(`${recordStem()}.md`)).toContain('`41:52–50:59` Speaker 1：定價拍板');
+  });
+
+  it('分析快照對得上現行版本：輸出已套人名校正的快照，投影前後 name_mentions 一列不變，也不標人名尚未校正', () => {
+    seedPerson();
+    const id = makeReadyMeeting({
+      overview: '週會', title: '週會', participantIds: ['p-1'],
+      segments: [{ start: 0, end: 5, text: 'Philchen 說要往前推進', speaker: 'Speaker 1' }],
+    });
+    const resolved = nameResolver.resolveTranscript(id, store.getCurrentTranscript(id)!.segments, T0);
+    expect(resolved.resolvedSegments[0].text).toBe('陳國煌 說要往前推進');
+    store.saveAnalysis(id, store.getAnalysis(id)!, T0, {
+      source_kind: 'raw', source_edit_version: null, resolved_segments_snapshot: resolved.resolvedSegments,
+      ...PROVENANCE_BASE,
+    });
+    const before = dumpMentions();
+    expect(before).toHaveLength(1);
+
+    projector.project(id);
+
+    const body = readTranscriptFile(`${recordStem()}.md`);
+    expect(body).toContain('`00:00–00:05` Speaker 1：陳國煌 說要往前推進');
+    expect(body).not.toContain('Philchen');
+    expect(body).not.toContain('人名尚未校正');
+    expect(dumpMentions()).toEqual(before);
+  });
+
+  it('不碰人工確認過的 name_mentions：投影不會把已確認的人名打回待確認', () => {
+    seedPerson();
+    const id = makeReadyMeeting({
+      overview: '週會', title: '週會', participantIds: ['p-1'],
+      segments: [{ start: 0, end: 5, text: 'Philchen 說話', speaker: 'Speaker 1' }],
+    });
+    // 沒有 provenance（走原文分支）也不能呼叫 resolveTranscript 重寫 name_mentions
+    db.prepare(
+      'INSERT INTO name_mentions (mention_id, meeting_id, segment_index, original_text, employee_id, method, confidence, created_at) '
+      + 'VALUES (?, ?, 0, ?, ?, ?, 1, ?)',
+    ).run('nm-confirmed', id, 'Philchen', 'p-1', 'exact', T0);
+    const before = dumpMentions();
+
+    projector.project(id);
+    projector.project(id);
+
+    expect(dumpMentions()).toEqual(before);
+    expect(readTranscriptFile(`${recordStem()}.md`)).toContain('人名尚未校正');
+  });
+
+  it('分析讀的不是現行版本（分析後又編輯）：輸出現行編輯版的原文並標人名尚未校正，不輸出舊快照', () => {
+    seedPerson();
+    const id = makeReadyMeeting({
+      overview: '週會', title: '週會', participantIds: ['p-1'],
+      segments: [{ start: 0, end: 5, text: 'Philchen 舊版', speaker: 'Speaker 1' }],
+    });
+    store.saveAnalysis(id, store.getAnalysis(id)!, T0, {
+      source_kind: 'raw', source_edit_version: null,
+      resolved_segments_snapshot: [{ start: 0, end: 5, text: '陳國煌 舊版', speaker: 'Speaker 1' }],
+      ...PROVENANCE_BASE,
+    });
+    store.updateTranscript(id, { segments: [{ start: 0, end: 5, text: 'Philchen 編輯版', speaker: 'Speaker 1' }] }, T0 + 1);
+
+    projector.project(id);
+
+    const body = readTranscriptFile(`${recordStem()}.md`);
+    expect(body).toContain('人名尚未校正');
+    expect(body).toContain('Speaker 1：Philchen 編輯版');
+    expect(body).not.toContain('舊版');
+  });
+
+  it('編輯後再投影：逐字稿檔內容換成編輯版', () => {
+    const id = makeReadyMeeting({
+      overview: '週會', title: '週會', segments: [{ start: 0, end: 5, text: '原始內容', speaker: 'Speaker 1' }],
+    });
+    projector.project(id);
+    expect(readTranscriptFile(`${recordStem()}.md`)).toContain('原始內容');
+
+    store.updateTranscript(id, { segments: [{ start: 0, end: 5, text: '人改過的內容', speaker: 'Speaker 1' }] }, T0 + 1);
+    projector.project(id);
+
+    const body = readTranscriptFile(`${recordStem()}.md`);
+    expect(body).toContain('Speaker 1：人改過的內容');
+    expect(body).not.toContain('原始內容');
+    expect(transcriptFiles()).toHaveLength(1);
+  });
+
+  it('分析讀的是編輯版且有快照：輸出快照', () => {
+    const id = makeReadyMeeting({ overview: '週會', title: '週會', segments: [{ start: 0, end: 5, text: 'a', speaker: 'S' }] });
+    store.updateTranscript(id, { segments: [{ start: 0, end: 5, text: 'b', speaker: 'S' }] }, T0 + 1);
+    store.saveAnalysis(id, store.getAnalysis(id)!, T0 + 2, {
+      source_kind: 'edited', source_edit_version: 1,
+      resolved_segments_snapshot: [{ start: 0, end: 5, text: 'b 已校正', speaker: 'S' }],
+      ...PROVENANCE_BASE,
+    });
+    projector.project(id);
+    const body = readTranscriptFile(`${recordStem()}.md`);
+    expect(body).toContain('S：b 已校正');
+    expect(body).not.toContain('人名尚未校正');
+  });
+
+  it('會議記錄被人改名後再投影：逐字稿換成新 stem，舊檔用 meetpilot_transcript_of 找到刪掉，別場的逐字稿不動', () => {
+    const id = makeReadyMeeting({ overview: '週會', title: '週會' });
+    const other = makeReadyMeeting({ id: 'm-2', overview: '另一場', title: '另一場' });
+    projector.project(id);
+    projector.project(other);
+    const oldStem = '2023-11-14 2213 週會';
+    expect(transcriptFiles()).toEqual([`${oldStem}.md`, '2023-11-14 2213 另一場.md'].sort());
+
+    renameSync(join(vaultDir, `${oldStem}.md`), join(vaultDir, '我改的名字.md'));
+    projector.project(id);
+
+    expect(transcriptFiles()).toEqual(['2023-11-14 2213 另一場.md', '我改的名字.md'].sort());
+    expect(readTranscriptFile('我改的名字.md')).toContain('meetpilot_transcript_of: m-1');
+    expect(readOnlyFileByName('我改的名字.md')).toContain(`[[${TRANSCRIPT_DIR}/我改的名字|逐字稿]]`);
+  });
+
+  it('_逐字稿/ 裡的檔不進 scanVaultIndex：裡面就算帶 meetpilot_id、auto 標記也不會報重複或孤兒錯誤', () => {
+    const id = makeReadyMeeting({ overview: '週會', title: '週會' });
+    projector.project(id);
+    mkdirSync(join(vaultDir, TRANSCRIPT_DIR), { recursive: true });
+    writeFileSync(
+      join(vaultDir, TRANSCRIPT_DIR, '人放的檔.md'),
+      '---\nmeetpilot_id: m-1\n---\n\n<!-- meetpilot:auto:start -->\n',
+      'utf8',
+    );
+    expect(() => projector.project(id)).not.toThrow();
+    expect(listMdFiles(vaultDir)).toHaveLength(1);
+    expect(readTranscriptFile('人放的檔.md')).toContain('meetpilot_id: m-1'); // 不是同一個 id 的逐字稿欄位，不刪
+  });
+
+  it('逐字稿寫失敗不吞：project 拋錯、runProjection 大聲記 log，會議記錄本身已是最新', () => {
+    const id = makeReadyMeeting({ overview: '週會', title: '週會' });
+    writeFileSync(join(vaultDir, TRANSCRIPT_DIR), '擋路的檔案', 'utf8'); // _逐字稿 是檔案，建不了資料夾
+
+    expect(() => projector.project(id)).toThrow();
+    expect(listMdFiles(vaultDir)).toHaveLength(1);
+
+    const errors: unknown[][] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args); };
+    try {
+      runProjection(projector, id, '[Test]');
+    } finally {
+      console.error = original;
+    }
+    expect(errors).toHaveLength(1);
+    expect(String(errors[0][0])).toContain('投影到 vault 時拋出錯誤');
   });
 });
