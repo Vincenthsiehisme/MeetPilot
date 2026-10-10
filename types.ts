@@ -45,7 +45,7 @@ export interface Job {
   currentStep: number;
   error?: string;
   transcript?: TranscriptSegment[];
-  polishedContent?: string; // 新增：儲存 AI 修潤後的完整文章
+  polishedContent?: string; // 舊的 AI 修潤稿。全文修潤 2026-10-10 拿掉，只剩讀既有資料與備份匯出
   // C-ANALYSIS v3（analysisContract.ts）。IndexedDB 舊資料是 v1（GeminiOutput）形狀，
   // 進 state 前一律先升到 v3（App.tsx 載入本機任務時做），畫面上不會出現 v1／v2 形狀
   analysis?: AnalysisV3;

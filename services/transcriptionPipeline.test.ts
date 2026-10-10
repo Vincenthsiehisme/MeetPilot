@@ -95,7 +95,6 @@ const fakeGemini = (overrides: Partial<GeminiServerClient> = {}): GeminiServerCl
   transcribeSlice: async ({ offsetSeconds = 0 }) => [
     { start: offsetSeconds, end: offsetSeconds + 30, text: `第 ${offsetSeconds} 秒開始`, speaker: 'Speaker 1' },
   ],
-  polishTranscript: async () => '潤過的',
   analyzeTranscript: async () => analysisOutput,
   extractTopicTags: async () => [{ title: '題目 A', content: '這場會對題目 A 的討論' }],
   embeddingModel: 'fake-embedding',
@@ -318,6 +317,29 @@ describe('與會者提示接進轉錄與分析呼叫（人名校正 N3）', () =
     for (const names of transcribeCalls) expect(names?.sort()).toEqual(['Philchen', '陳國煌'].sort());
     expect(analyzeCalls).toHaveLength(1);
     expect(analyzeCalls[0]?.sort()).toEqual(['Philchen', '陳國煌'].sort());
+  });
+
+  it('建會議時填的背景補充（meeting_context）帶進分析呼叫的 meetingContext', async () => {
+    store.createMeeting({
+      meeting_id: 'm-1', created_at: T0, source_file_name: 'a.m4a', source_file_size: 10, meeting_context: '第三次談採購',
+    });
+    const seen: (string | undefined)[] = [];
+    const pipeline = pipelineWith({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(30),
+      gemini: fakeGemini({
+        analyzeTranscript: async ({ meetingContext }) => {
+          seen.push(meetingContext);
+          return analysisOutput;
+        },
+      }),
+      now: () => T0 + 1,
+    });
+
+    await pipeline.run('m-1');
+
+    expect(seen).toEqual(['第三次談採購']);
   });
 
   it('沒帶 peopleStore 時 participantNames 是空陣列，既有不關心人名校正的測試不受影響', async () => {

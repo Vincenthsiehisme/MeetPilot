@@ -19,6 +19,7 @@ import {
   importLegacyJobs,
   listMeetings,
   listPeopleWithSingleRetry,
+  meetingContextField,
   patchAnalysis,
   patchTitle,
   patchTranscript,
@@ -354,10 +355,15 @@ const App: React.FC = () => {
    * 補送這條路絕對不能再 POST 一次：上傳失敗留下的 CREATED 會議要能被救回來，
    * 每失敗一次多一筆殭屍會議的話，那幾筆永遠不會有人去補音檔。
    *
-   * `participantIds` 只在新建時用得到（D-016），補送既有會議時忽略——那場會的與會者
+   * `participantIds` 與 `meetingContext` 只在新建時用得到（D-016），補送既有會議時忽略——那場會的與會者
    * 已經在建立當下定了，不能事後改。
    */
-  const submitAudioFile = async (file: File, targetMeetingId: string | null, participantIds: string[] | null = null) => {
+  const submitAudioFile = async (
+    file: File,
+    targetMeetingId: string | null,
+    participantIds: string[] | null = null,
+    meetingContext: string | null = null,
+  ) => {
     setBusyMessage(`正在上傳「${file.name}」…`);
     // server 上到底有沒有那場會。補送本來就有；新建這條要等 onCreated 才算數 ——
     // createMeeting 自己失敗時那場會根本不存在，這個旗標決定失敗訊息該講哪一句
@@ -367,6 +373,7 @@ const App: React.FC = () => {
         file,
         targetMeetingId === null ? null : { meetingId: targetMeetingId },
         participantIds,
+        meetingContext,
         created => {
           meetingExists = true;
           // 上傳是整條裡最久的一段。建立完就先把那場會放進畫面，
@@ -436,7 +443,7 @@ const App: React.FC = () => {
    * 直接刪會把一支其實已經開始的錄音切掉。確定沒在錄才刪，免得清單上多一筆沒有音檔、
    * 也沒有人會去補的空會議；刪不掉就照實講它還在，讓使用者自己處理，不當作沒事。
    */
-  const beginRecording = async (participantIds: string[]) => {
+  const beginRecording = async (participantIds: string[], meetingContext: string) => {
     const method = recordingMethod;
     if (method === null) return;
     let mic: OpenedMicrophone | null = null;
@@ -462,6 +469,7 @@ const App: React.FC = () => {
           fileName: recordingMeetingFileName(new Date(), method),
           fileSize: 0,
           participantIds,
+          ...meetingContextField(meetingContext),
         });
         createdId = created.meeting_id;
         await startRecording(created.meeting_id);
@@ -669,12 +677,12 @@ const App: React.FC = () => {
     }
   };
 
-  const handleConfirmParticipants = (participantIds: string[]) => {
+  const handleConfirmParticipants = (participantIds: string[], meetingContext: string) => {
     const pending = pendingNew;
     setPendingNew(null);
     if (pending === null) return;
-    if (pending.kind === 'file') submitAudioFile(pending.file, null, participantIds);
-    else beginRecording(participantIds);
+    if (pending.kind === 'file') submitAudioFile(pending.file, null, participantIds, meetingContext);
+    else beginRecording(participantIds, meetingContext);
   };
 
   const handleCancelParticipants = () => setPendingNew(null);
@@ -904,9 +912,6 @@ const App: React.FC = () => {
       try {
         if (updates.transcript !== undefined) {
           await patchTranscript(meetingId, { segments: updates.transcript });
-        }
-        if (updates.polishedContent !== undefined) {
-          await patchTranscript(meetingId, { polished_content: updates.polishedContent });
         }
         if (updates.analysis !== undefined) {
           // v3 每筆自帶 metadata（evidence、decided_by、assignee、created_at…），

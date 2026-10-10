@@ -8,7 +8,8 @@ interface ParticipantPickerProps {
   people: PersonSummary[] | null;
   loadError: string | null;
   onRetry: () => void;
-  onConfirm: (participantIds: string[]) => void;
+  /** `meetingContext` 是背景補充欄位的原文，使用者沒填就是空字串；要不要送由呼叫端判斷 */
+  onConfirm: (participantIds: string[], meetingContext: string) => void;
   onCancel: () => void;
   /** 確認按鈕上的動作。預設「建立會議」；從錄音按鍵進來時是「開始錄音」，按下去就真的開始錄 */
   confirmVerb?: string;
@@ -27,12 +28,14 @@ const ParticipantPicker: React.FC<ParticipantPickerProps> = ({
 }) => {
   const [query, setQuery] = useState('');
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [meetingContext, setMeetingContext] = useState('');
 
-  // 開啟時重置：上一次選的結果不該帶進下一次建立會議的畫面
+  // 開啟時重置：上一次選的結果與背景補充不該帶進下一次建立會議的畫面
   useMemo(() => {
     if (isOpen) {
       setQuery('');
       setSelected(new Set());
+      setMeetingContext('');
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
@@ -139,6 +142,20 @@ const ParticipantPicker: React.FC<ParticipantPickerProps> = ({
               )}
             </div>
 
+            <div className="p-4 border-t border-slate-100">
+              <label htmlFor="meeting-context" className="block text-xs font-bold text-slate-500 mb-1.5">
+                背景補充（選填）
+              </label>
+              <textarea
+                id="meeting-context"
+                value={meetingContext}
+                onChange={e => setMeetingContext(e.target.value)}
+                rows={2}
+                placeholder="這場會在談什麼、跟哪件事有關，分析會議記錄時會參考"
+                className="w-full px-3 py-2 rounded-xl border border-slate-200 text-sm resize-none focus:outline-none focus:ring-2 focus:ring-indigo-200"
+              />
+            </div>
+
             {extra}
 
             <div className="flex border-t border-slate-100">
@@ -149,7 +166,7 @@ const ParticipantPicker: React.FC<ParticipantPickerProps> = ({
                 取消
               </button>
               <button
-                onClick={() => onConfirm(Array.from(selected))}
+                onClick={() => onConfirm(Array.from(selected), meetingContext)}
                 disabled={selected.size === 0 || confirmBlockedReason !== null}
                 className="flex-1 px-6 py-4 text-sm font-bold text-indigo-600 hover:bg-indigo-50 transition-colors disabled:text-slate-300 disabled:hover:bg-transparent disabled:cursor-not-allowed"
               >

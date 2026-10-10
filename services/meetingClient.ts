@@ -55,6 +55,15 @@ async function requestJson<T>(endpoint: string, init: RequestInit): Promise<T> {
 const meetingPath = (meetingId: string, suffix = ''): string =>
   `/api/meetings/${encodeURIComponent(meetingId)}${suffix}`;
 
+/**
+ * 建會議請求裡的背景補充。去掉頭尾空白後是空的就不帶這個欄位：server 收到空字串會照存成 `''`，
+ * 跟「沒填」的 null 分不開。上傳與錄音兩條建會議的路都經過這裡，空白不送只在這一處判斷
+ */
+export const meetingContextField = (text: string | null): Pick<CreateMeetingRequest, 'meetingContext'> => {
+  const trimmed = text === null ? '' : text.trim();
+  return trimmed === '' ? {} : { meetingContext: trimmed };
+};
+
 export const createMeeting = async (request: CreateMeetingRequest): Promise<MeetingView> => {
   const data = await requestJson<MeetingResponse>('/api/meetings', {
     method: 'POST',
@@ -189,13 +198,14 @@ export const patchTitle = async (meetingId: string, title: string): Promise<stri
  * onCreated 在「建立成功、還沒開始上傳」時呼叫：上傳是整條裡最久的一段，呼叫端要在這個時間點
  * 就把那場會放進畫面，失敗時使用者才找得到它去補音檔。
  *
- * `participantIds` 只在新建（`target === null`）時有意義：既有會議在建立當下已經定過與會者
- * （D-016 不允許事後改），補送音檔這條路不重新宣告一次。
+ * `participantIds` 與 `meetingContext` 只在新建（`target === null`）時有意義：既有會議在建立當下已經定過與會者
+ * （D-016 不允許事後改），補送音檔這條路不重新宣告一次。`meetingContext` 空白不送，見 `meetingContextField`。
  */
 export const submitAudio = async (
   file: File,
   target: { meetingId: string } | null,
   participantIds: string[] | null,
+  meetingContext: string | null,
   onCreated?: (meeting: MeetingView) => void
 ): Promise<MeetingView> => {
   if (target !== null) return uploadAudio(target.meetingId, file);
@@ -204,6 +214,7 @@ export const submitAudio = async (
     fileName: file.name,
     fileSize: file.size,
     participantIds: participantIds ?? [],
+    ...meetingContextField(meetingContext),
   });
   if (onCreated) onCreated(created);
   return uploadAudio(created.meeting_id, file);

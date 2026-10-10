@@ -98,10 +98,6 @@ export const exportTranscriptAsText = (fileName: string, segments: TranscriptSeg
   downloadFile(content, `${fileName}_transcript.txt`, "text/plain");
 };
 
-export const exportPolishedContent = (fileName: string, content: string) => {
-  downloadFile(content, `${fileName}_polished.md`, "text/markdown");
-};
-
 /** 議題：小標、走到哪、條列要點；要點的出處用行內程式碼當縮小標籤，跟 vaultProjector.ts 同一種寫法。
  * 舊資料沒有 points，只印 content */
 const renderTopicMarkdown = (t: TopicV3): string => [

@@ -491,10 +491,9 @@ describe('analyzeTranscript', () => {
 
 });
 
-describe('polishTranscript', () => {
-  it('模型沒回內容時給固定字串，維持既有路由的回應形狀', async () => {
-    generateContent.mockResolvedValue({ text: '' });
-    expect(await client().polishTranscript([{ start: 0, end: 1, text: 'x' }])).toBe('無法生成修潤內容');
+describe('全文修潤已拿掉', () => {
+  it('client 上沒有 polishTranscript', () => {
+    expect('polishTranscript' in client()).toBe(false);
   });
 });
 
