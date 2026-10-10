@@ -80,6 +80,9 @@ let tray: Tray | null = null;
 let server: UtilityProcess | null = null;
 let serverOrigin: string | null = null;
 let quitting = false;
+// 開機自動啟動的那一刻（毫秒）；一般啟動是 null。macOS 啟動時會送一個 activate，不能讓它把剛藏好的視窗叫出來
+let hiddenLaunchAt: number | null = null;
+const HIDDEN_LAUNCH_ACTIVATE_GRACE_MS = 5_000;
 
 // MEETPILOT_DESKTOP_SMOKE 只給 scripts/smokeDesktop.mjs 用：冒煙測試不登記開機自動啟動（那會改到這台電腦真實的登入項目）、
 // 不發系統通知、結束時不問「還有會議在處理」（對話框會卡住它的收尾）
@@ -166,7 +169,9 @@ function syncLoginItem(): void {
   if (!shouldOpenAtLogin({ vaultDir: vaultDirForUpdate(), isPackaged: app.isPackaged, smoke: SMOKE })) return;
   try {
     app.setLoginItemSettings({ openAtLogin: true, args: [HIDDEN_LAUNCH_ARG] });
-    writeLog(`--- 開機自動啟動已登記（${JSON.stringify(app.getLoginItemSettings().openAtLogin)}）---\n`);
+    // Windows 要帶同一組 args 才查得到；macOS 13 以上 requires-approval 代表使用者還沒在系統設定核准，等於沒開
+    const now = app.getLoginItemSettings({ args: [HIDDEN_LAUNCH_ARG] });
+    writeLog(`--- 開機自動啟動已登記（openAtLogin ${now.openAtLogin}${process.platform === 'darwin' ? `，status ${now.status}` : ''}）---\n`);
   } catch (err) {
     writeLog(`--- 登記開機自動啟動失敗：${(err as Error).message} ---\n`);
   }
@@ -1171,7 +1176,10 @@ if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
   app.on('second-instance', showWindow);
-  app.on('activate', showWindow);
+  app.on('activate', () => {
+    if (hiddenLaunchAt !== null && Date.now() - hiddenLaunchAt < HIDDEN_LAUNCH_ACTIVATE_GRACE_MS) return;
+    showWindow();
+  });
   app.on('before-quit', (event) => {
     // 錄音中結束會切掉錄音，處理中結束會停下轉錄與分析。先問一次（兩者同時成立也只問一次）；確認了才真的結束，
     // 已送到的段落與沒做完的 job 留在 server，下次打開接著跑。冒煙測試不問處理中那一項
@@ -1223,7 +1231,10 @@ if (!app.requestSingleInstanceLock()) {
       argv: process.argv,
       wasOpenedAtLogin: process.platform === 'darwin' && app.getLoginItemSettings().wasOpenedAtLogin,
     });
-    if (hidden) writeLog('--- 開機自動啟動，視窗不跳出來，只留在系統匣 ---\n');
+    if (hidden) {
+      hiddenLaunchAt = Date.now();
+      writeLog('--- 開機自動啟動，視窗不跳出來，只留在系統匣 ---\n');
+    }
     createWindow({ show: !hidden });
     createTray();
     syncLoginItem();
