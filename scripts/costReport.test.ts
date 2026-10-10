@@ -366,6 +366,31 @@ describe('檔案輸入輸出', () => {
       expect(unpricedWarning(report)).toMatch(/gemini-flash-latest.*geminiPrices\.json/);
     });
 
+    it('所有彙總表每一列的欄數都等於表頭，未計價數值正確', () => {
+      const md = renderCostReport(buildCostReport(shared, prices, now));
+      const cols = (l: string): number => l.replace(/\\\|/g, '').split('|').length - 2;
+      const sectionTable = (title: string): string[] => {
+        const body = md.split(`## ${title}`)[1].split(/\n## /)[0];
+        return body.split('\n').filter((l) => l.startsWith('|'));
+      };
+      for (const title of ['總計', '各步驟分項（全部記錄人）', '分人', '分月', '分人分月']) {
+        const rows = sectionTable(title);
+        expect(rows.length, title).toBeGreaterThan(2);
+        for (const r of rows) expect(cols(r), `${title}: ${r}`).toBe(cols(rows[0]));
+        expect(rows[0], title).toContain('未計價呼叫');
+      }
+      // 總計：未計價 1 次；各步驟分項只有 analyze 那列是 1，其餘 0
+      const total = sectionTable('總計')[2].split('|').map((c) => c.trim());
+      expect(total[total.length - 2]).toBe('1');
+      const kindRows = sectionTable('各步驟分項（全部記錄人）').slice(2).map((r) => r.split('|').map((c) => c.trim()));
+      expect(kindRows.map((c) => [c[1], c[c.length - 2]]).filter(([, n]) => n !== '0')).toEqual([['分析', '1']]);
+    });
+
+    it('總覽說明轉錄輸入 token 含文字指令、以音訊價估而略為高估', () => {
+      const md = renderCostReport(buildCostReport(shared, prices, now));
+      expect(md).toContain('轉錄呼叫的輸入 token 含少量文字指令，有音訊價的模型一律以音訊價估，略為高估');
+    });
+
     it('沒有未計價的模型時不印警告、不開那一段', () => {
       const bad = join(root, 'clean');
       mkdirSync(join(bad, 'x', '_診斷'), { recursive: true });
