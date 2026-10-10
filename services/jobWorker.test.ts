@@ -1,9 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
 import { openMeetingDb } from './meetingDb';
 import { createMeetingStore, MeetingStore } from './meetingStore';
 import { createJobStore, JobStore } from './jobStore';
-import { createJobWorker } from './jobWorker';
+import { JOB_RETRY_COOLDOWN_STEP_MS, createJobWorker } from './jobWorker';
 
 const T0 = 1_700_000_000_000;
 
@@ -21,6 +21,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   db.close();
 });
 
@@ -106,25 +107,84 @@ describe('createJobWorker', () => {
     expect(jobs.hasActive('m-1', 'analysis')).toBe(true); // 沒被動到
   });
 
-  it('run() 持續失敗：退回 queued 沒有 backoff，同一輪 poke 就被同一個 worker 撿回來重試，直到用盡 max_attempts 才轉 failed', async () => {
-    jobs.enqueue('m-1', 'transcription', null, T0, 2); // max_attempts=2
+  it('run() 持續失敗：退回 queued 後冷卻 30 秒乘第幾次失敗才再搶，用盡 max_attempts 才轉 failed（AC-5）', async () => {
+    vi.useFakeTimers();
+    jobs.enqueue('m-1', 'transcription', null, T0, 3); // max_attempts=3
     const failures: { meetingId: string; outcome: string }[] = [];
+    let runs = 0;
     const worker = createJobWorker({
       jobs, kind: 'transcription', concurrency: 1, workerId: 'w1', leaseMs: 60_000,
-      run: async () => { throw new Error('掛了'); },
+      run: async () => { runs += 1; throw new Error('fetch failed'); },
       onFailure: (meetingId, outcome) => failures.push({ meetingId, outcome }),
     });
 
     worker.poke();
     await worker.whenIdle();
+    expect(runs).toBe(1);
+    expect(failures).toEqual([{ meetingId: 'm-1', outcome: 'queued' }]);
 
-    // 一次 poke 裡自動重試到用盡：先 queued（attempt 1），finally 立刻搶回同一個 job
-    // 再試一次，attempt 2 用盡 max_attempts 轉 failed
+    // 第 1 次失敗冷卻 30 秒：差 1 毫秒不搶，poke 也不搶
+    await vi.advanceTimersByTimeAsync(JOB_RETRY_COOLDOWN_STEP_MS - 1);
+    worker.poke();
+    await worker.whenIdle();
+    expect(runs).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await worker.whenIdle();
+    expect(runs).toBe(2);
+
+    // 第 2 次失敗冷卻變 60 秒：30 秒到了還不搶
+    await vi.advanceTimersByTimeAsync(JOB_RETRY_COOLDOWN_STEP_MS);
+    await worker.whenIdle();
+    expect(runs).toBe(2);
+    await vi.advanceTimersByTimeAsync(JOB_RETRY_COOLDOWN_STEP_MS);
+    await worker.whenIdle();
+    expect(runs).toBe(3);
+
     expect(failures).toEqual([
+      { meetingId: 'm-1', outcome: 'queued' },
       { meetingId: 'm-1', outcome: 'queued' },
       { meetingId: 'm-1', outcome: 'failed' },
     ]);
     expect(jobs.hasActive('m-1', 'transcription')).toBe(false);
+  });
+
+  it('job 用盡重試轉 failed 時不冷卻，同一輪接著搶下一筆', async () => {
+    vi.useFakeTimers();
+    jobs.enqueue('m-1', 'transcription', null, T0, 1); // max_attempts=1：第一次失敗就 failed
+    jobs.enqueue('m-2', 'transcription', null, T0 + 1);
+    const ran: string[] = [];
+    const worker = createJobWorker({
+      jobs, kind: 'transcription', concurrency: 1, workerId: 'w1', leaseMs: 60_000,
+      run: async (meetingId) => { ran.push(meetingId); if (meetingId === 'm-1') throw new Error('掛了'); },
+    });
+
+    worker.poke();
+    await worker.whenIdle();
+
+    expect(ran).toEqual(['m-1', 'm-2']);
+  });
+
+  it('冷卻中整個 worker 不搶，別場會的 job 也要等冷卻到期', async () => {
+    vi.useFakeTimers();
+    jobs.enqueue('m-1', 'transcription', null, T0);
+    const ran: string[] = [];
+    const worker = createJobWorker({
+      jobs, kind: 'transcription', concurrency: 1, workerId: 'w1', leaseMs: 60_000,
+      cooldownMs: (n) => 1_000 * n,
+      run: async (meetingId) => { ran.push(meetingId); if (meetingId === 'm-1' && ran.length === 1) throw new Error('掛了'); },
+    });
+
+    worker.poke();
+    await worker.whenIdle();
+    jobs.enqueue('m-2', 'transcription', null, T0 + 1);
+    worker.poke();
+    await worker.whenIdle();
+    expect(ran).toEqual(['m-1']);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    await worker.whenIdle();
+    // 冷卻到期後照 claim 的順序把排隊的都跑完
+    expect(ran).toEqual(['m-1', 'm-1', 'm-2']);
   });
 
   it('前一個 job 做完自動接著搶下一個，不用等外部再呼叫一次 poke', async () => {

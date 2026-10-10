@@ -13,7 +13,7 @@
 import { TranscriptSegment } from '../types';
 import { buildAnalysisV3FromModelOutput } from './analysisContract';
 import { AudioFileStore } from './audioFileStore';
-import { AudioSlicer, planSlices } from './audioSlicer';
+import { AudioSlicer, SLICE_MIME_TYPE, planSlices } from './audioSlicer';
 import { isSilent, wavLevel } from './audioLevel';
 import { GeminiServerClient } from './geminiServerClient';
 import { AnalysisJobPayload, JobStore } from './jobStore';
@@ -138,19 +138,21 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
   const repairConfig = deps.seamRepair ?? DEFAULT_SEAM_REPAIR;
 
   /**
-   * 依序量每一片的最大音量，找到有聲音的就停。第一片就有聲音時回傳它的 WAV 給迴圈沿用（正常會議只多掃一次記憶體裡的資料）；
-   * 有聲音的是後面的片段時回 null（迴圈照常重切第一片）；全部都沒聲音就拋，這場會不送轉錄
+   * 依序量每一片的最大音量，找到有聲音的就停；全部都沒聲音就拋，這場會不送轉錄。
+   * 量音量要切 WAV（`wavLevel` 只讀得懂 WAV），送 Gemini 的是 FLAC，所以量完迴圈會再切一次 FLAC：
+   * 正常會議第一片就有聲音，多一次 ffmpeg 切片，換掉的是每片上傳量（vault plan「MeetPilot · 記錄完整度、
+   * 成本與背景運作」AC-5）
    */
   const assertAudible = async (
     audioPath: string,
     plan: ReturnType<typeof planSlices>,
     totalDurationSeconds: number,
-  ): Promise<Buffer | null> => {
+  ): Promise<void> => {
     let loudest = -Infinity;
     for (const slice of plan) {
-      const wav = await slicer.readSlice(audioPath, slice.startSeconds, slice.durationSeconds);
+      const wav = await slicer.readSlice(audioPath, slice.startSeconds, slice.durationSeconds, 'wav');
       const level = wavLevel(wav);
-      if (!isSilent(level)) return slice.index === 0 ? wav : null;
+      if (!isSilent(level)) return;
       loudest = Math.max(loudest, level.peakDbfs);
     }
     const peak = loudest === -Infinity ? '完全是 0' : `最大 ${loudest.toFixed(1)} dBFS`;
@@ -187,24 +189,20 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
     const participantNames = resolveParticipantNames(meetingId, store, peopleStore);
 
     // 整支幾乎沒有聲音就不送 Gemini（理由見 services/audioLevel.ts 檔頭）：送了它會編一段像樣的內容出來。
-    // 從頭跑才查；續傳代表之前已經有片段轉過，不是空的。第一片有聲音就沿用這次切出來的，不重切
+    // 從頭跑才查；續傳代表之前已經有片段轉過，不是空的
     // 進度先寫：量音量要逐片切，長會議要一陣子，畫面上要先看得到總片數
     store.setSliceProgress(meetingId, processedSlices, plan.length, now());
-    let firstSliceWav = processedSlices === 0 ? await assertAudible(audioPath, plan, totalDurationSeconds) : null;
+    if (processedSlices === 0) await assertAudible(audioPath, plan, totalDurationSeconds);
 
     for (const slice of plan) {
       if (slice.index < processedSlices) continue;
 
-      const wav = slice.index === 0 && firstSliceWav !== null
-        ? firstSliceWav
-        : await slicer.readSlice(audioPath, slice.startSeconds, slice.durationSeconds);
-      // 10 分鐘一片約 19 MB，用過就放掉，不要跟著整場轉錄一起活著
-      firstSliceWav = null;
+      const audio = await slicer.readSlice(audioPath, slice.startSeconds, slice.durationSeconds, 'flac');
       const segments = await gemini.transcribeSlice({
-        base64Data: wav.toString('base64'),
+        base64Data: audio.toString('base64'),
         offsetSeconds: slice.startSeconds,
         previousContext: buildPreviousContext(transcript),
-        mimeType: 'audio/wav',
+        mimeType: SLICE_MIME_TYPE,
         sliceDurationSeconds: slice.durationSeconds,
         participantNames,
         meetingId,
@@ -224,12 +222,12 @@ export function createTranscriptionPipeline(deps: TranscriptionPipelineDeps) {
           {
             totalDurationSeconds,
             transcribeWindow: async (startSeconds, durationSeconds) => {
-              const bridgeWav = await slicer.readSlice(audioPath, startSeconds, durationSeconds);
+              const bridgeAudio = await slicer.readSlice(audioPath, startSeconds, durationSeconds, 'flac');
               return gemini.transcribeSlice({
-                base64Data: bridgeWav.toString('base64'),
+                base64Data: bridgeAudio.toString('base64'),
                 offsetSeconds: startSeconds,
                 previousContext: buildPreviousContext(transcript),
-                mimeType: 'audio/wav',
+                mimeType: SLICE_MIME_TYPE,
                 sliceDurationSeconds: durationSeconds,
                 participantNames,
                 meetingId,
