@@ -913,9 +913,6 @@ const App: React.FC = () => {
         if (updates.transcript !== undefined) {
           await patchTranscript(meetingId, { segments: updates.transcript });
         }
-        if (updates.polishedContent !== undefined) {
-          await patchTranscript(meetingId, { polished_content: updates.polishedContent });
-        }
         if (updates.analysis !== undefined) {
           // v3 每筆自帶 metadata（evidence、decided_by、assignee、created_at…），
           // SummaryView 編輯的就是這份物件，直接送出即可，不用像 v1 字串那樣猜哪一筆是哪一筆

@@ -411,7 +411,6 @@ export interface GeminiServerClient {
    */
   readonly embeddingModel: string;
   transcribeSlice(input: TranscribeSliceInput): Promise<TranscriptSegment[]>;
-  polishTranscript(transcript: TranscriptSegment[]): Promise<string>;
   /** 會議記錄分析（`C-ANALYSIS` v3）。規範正本 `prompts/meeting-record-spec.md`，出處回段落編號
    * 不是秒數，見 `AnalysisModelOutput` 檔頭與 `analysisContract.ts` 的 `buildAnalysisV3FromModelOutput` */
   analyzeTranscript(input: AnalyzeTranscriptInput): Promise<AnalysisModelOutput>;
@@ -678,34 +677,6 @@ Output JSON format:
       }
 
       return normalizeTranscribedSegments(rawSegments, offsetSeconds, sliceDurationSeconds);
-    },
-
-    async polishTranscript(transcript: TranscriptSegment[]): Promise<string> {
-      const ai = getAI();
-      const fullText = formatTranscriptForAI(transcript);
-
-      const { response } = await generateContentWithFallback(ai, {
-        kind: 'polish',
-        preferredModel: 'gemini-3.8-flash',
-        contents: `請將以下會議逐字稿進行「全文修潤」。
-      
-原始逐字稿可能包含破碎的句子、文法錯誤或贅字。
-請將其重寫為一篇流暢、通順的「對話劇本」或「文章」。
-
-要求：
-1. **修正語病**：將口語轉化為通順的書面語，但保留原意。
-2. **標示講者**：保留對話形式 (Speaker: Content)。
-3. **分段清晰**：適當分段，增加可讀性。
-4. **Markdown 格式**：使用 Markdown 格式輸出。
-
-原始內容：
-${fullText}`,
-        config: {
-          systemInstruction: '你是一位專業的文字編輯，擅長將口語逐字稿潤飾為高品質的訪談文章或劇本。',
-        },
-      });
-
-      return response.text || '無法生成修潤內容';
     },
 
     /**

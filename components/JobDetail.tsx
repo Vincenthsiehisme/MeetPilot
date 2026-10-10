@@ -244,9 +244,7 @@ const JobDetail: React.FC<JobDetailProps> = ({
             key={job.id}
             exportBaseName={jobDownloadBaseName(job)}
             segments={job.transcript}
-            polishedContent={job.polishedContent}
             onUpdate={(segments) => onUpdateJob({ transcript: segments })}
-            onSavePolished={(text) => onUpdateJob({ polishedContent: text })}
             onAlert={onAlert}
           />
         )}

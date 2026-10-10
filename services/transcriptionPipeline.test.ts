@@ -95,7 +95,6 @@ const fakeGemini = (overrides: Partial<GeminiServerClient> = {}): GeminiServerCl
   transcribeSlice: async ({ offsetSeconds = 0 }) => [
     { start: offsetSeconds, end: offsetSeconds + 30, text: `第 ${offsetSeconds} 秒開始`, speaker: 'Speaker 1' },
   ],
-  polishTranscript: async () => '潤過的',
   analyzeTranscript: async () => analysisOutput,
   extractTopicTags: async () => [{ title: '題目 A', content: '這場會對題目 A 的討論' }],
   embeddingModel: 'fake-embedding',
