@@ -12,7 +12,7 @@
  */
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { renameSync, rmSync } from 'node:fs';
+import { readFileSync, renameSync, rmSync } from 'node:fs';
 
 /** 一片的計畫。時間是相對整個音檔的絕對秒數，durationSeconds 含 overlap */
 export interface SlicePlanEntry {
@@ -117,6 +117,41 @@ export const resolveFfmpegPaths = (env: NodeJS.ProcessEnv): FfmpegPaths => ({
   ffprobe: (env.MEETPILOT_FFPROBE ?? '').trim() || 'ffprobe',
 });
 
+/** 切片輸出格式：`flac` 送 Gemini，`wav` 給音量檢查（見 `readSlice`） */
+export type SliceFormat = 'flac' | 'wav';
+
+/** 送 Gemini 的切片格式對應的 mimeType，pipeline 與接縫修補共用 */
+export const SLICE_MIME_TYPE = 'audio/flac';
+
+// ffmpeg 結束碼 0 卻沒寫出檔案時當成沒有輸出，交給呼叫端那條「沒有輸出任何資料」的錯誤，
+// 不讓 ENOENT 蓋掉真正的原因
+const readOutputFile = (path: string): Buffer => {
+  try {
+    return readFileSync(path);
+  } catch (err) {
+    if ((err as { code?: unknown } | null | undefined)?.code === 'ENOENT') return Buffer.alloc(0);
+    throw err;
+  }
+};
+
+/**
+ * 刪暫存檔（切片的 `.slice-*.part`、remux 失敗留下的 `.remux-*.part`），這個檔裡刪暫存檔一律走這支。
+ * 刪不掉（Windows 防毒或 OneDrive 剛好鎖住，EBUSY／EPERM）只 warn，不拋：
+ * 這時切片已經讀到手或 ffmpeg 自己的錯誤正要往上拋，刪檔失敗不能把成功的切片變失敗、
+ * 也不能蓋掉真正的錯誤。留下的 `.part` 由啟動時的 `removePartialUploads` 清
+ */
+const removeTempFile = (path: string): void => {
+  try {
+    rmSync(path, { force: true });
+  } catch (err) {
+    const code = (err as { code?: unknown } | null | undefined)?.code;
+    console.warn(
+      `[audioSlicer] 切片暫存檔刪不掉（${typeof code === 'string' ? code : '沒有錯誤碼'}），留給啟動時清理：${path}`,
+      err,
+    );
+  }
+};
+
 export interface AudioSlicerOptions {
   ffmpegPath: string;
   ffprobePath: string;
@@ -202,19 +237,33 @@ export function createAudioSlicer(options: AudioSlicerOptions) {
         );
         renameSync(partPath, filePath);
       } catch (err) {
-        rmSync(partPath, { force: true });
+        removeTempFile(partPath);
         throw err;
       }
       return parseDuration(await readRawDuration(filePath), filePath);
     },
 
     /**
-     * 切出一片 16kHz 單聲道 WAV。
+     * 切出一片 16kHz 單聲道音訊。`format` 決定輸出：
+     *
+     * - `flac`：送 Gemini 用。無損壓縮，同樣的 16kHz 單聲道 16-bit 取樣，上傳量比 WAV 小（vault plan
+     *   「MeetPilot · 記錄完整度、成本與背景運作」AC-5：10 分鐘 WAV 約 19MB、base64 後約 25MB）。
+     *   寫到音檔旁邊的 `.part` 暫存檔再讀回來，不寫 pipe：FLAC 的 STREAMINFO（總取樣數）要寫完回頭補，
+     *   pipe 不能回頭，輸出的檔沒有長度（2026-10-10 實測 ffprobe 讀成 `N/A`），送一個沒有長度的檔給
+     *   Gemini 不知道它怎麼算時間，不賭。暫存檔用完就刪，server 掛掉留下的由啟動時的 `removePartialUploads` 清。
+     *   `-sample_fmt s16` 寫明：輸入是浮點（aac、opus 解出來都是）時 flac 編碼器會自動挑 32-bit
+     *   （2026-10-10 實測語音備忘錄 aac 那支測試音檔：不寫是 s32、72KB，寫了 s16、29KB）。
+     * - `wav`：只給 `audioLevel.wavLevel` 量音量用，它只讀得懂 WAV。
      *
      * `-ss` 放在 `-i` 前面是 input seeking：ffmpeg 直接跳到那個位置，不用把前面整段解碼過去。
      * 放在 `-i` 後面會變成逐格解碼到指定時間，長會議的後段切片會慢到不能用。
      */
-    readSlice: async (filePath: string, startSeconds: number, durationSeconds: number): Promise<Buffer> => {
+    readSlice: async (
+      filePath: string,
+      startSeconds: number,
+      durationSeconds: number,
+      format: SliceFormat,
+    ): Promise<Buffer> => {
       if (!Number.isFinite(startSeconds) || startSeconds < 0) {
         throw new Error(`readSlice: 起點必須是非負有限數，收到 ${JSON.stringify(startSeconds)}`);
       }
@@ -222,28 +271,33 @@ export function createAudioSlicer(options: AudioSlicerOptions) {
         throw new Error(`readSlice: 片長必須是有限正數，收到 ${JSON.stringify(durationSeconds)}`);
       }
 
-      const result = await run(
-        options.ffmpegPath,
-        [
-          '-ss', String(startSeconds),
-          '-t', String(durationSeconds),
-          '-i', filePath,
-          '-ar', '16000',
-          '-ac', '1',
-          '-f', 'wav',
-          'pipe:1',
-        ],
-        `ffmpeg 切出 ${startSeconds}s 起算 ${durationSeconds}s 的片段`,
-      );
+      const input = ['-ss', String(startSeconds), '-t', String(durationSeconds), '-i', filePath, '-ar', '16000', '-ac', '1'];
+      const what = `ffmpeg 切出 ${startSeconds}s 起算 ${durationSeconds}s 的片段`;
+      let output: Buffer;
+      if (format === 'wav') {
+        output = (await run(options.ffmpegPath, [...input, '-f', 'wav', 'pipe:1'], what)).stdout;
+      } else {
+        const partPath = `${filePath}.slice-${randomUUID()}.part`;
+        try {
+          await run(
+            options.ffmpegPath,
+            ['-y', ...input, '-sample_fmt', 's16', '-c:a', 'flac', '-f', 'flac', partPath],
+            what,
+          );
+          output = readOutputFile(partPath);
+        } finally {
+          removeTempFile(partPath);
+        }
+      }
 
-      if (result.stdout.length === 0) {
+      if (output.length === 0) {
         // 結束碼 0 但沒有輸出：這一片會變成「送了空音檔給 Gemini」，回來的空逐字稿
         // 跟「這段真的沒人說話」分不開，所以在這裡就爆
         throw new Error(
           `ffmpeg 在 ${startSeconds}s 起算 ${durationSeconds}s 的片段沒有輸出任何資料：${filePath}`,
         );
       }
-      return result.stdout;
+      return output;
     },
   };
 }

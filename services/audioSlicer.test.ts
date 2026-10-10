@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -23,6 +23,21 @@ const fakeRunner = (
 };
 
 const throwingRunner = (err: unknown): CommandRunner => async () => { throw err; };
+
+// node:fs 的 ESM 匯出不能 vi.spyOn，只能整個模組換掉，其餘原樣代理給真實實作（同 geminiServerClient.test.ts）。
+// 預設 rmSync 照真的刪；只有測「暫存檔刪不掉」那一條才覆寫
+const { rmSyncMock } = vi.hoisted(() => ({ rmSyncMock: vi.fn() }));
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return { ...actual, rmSync: (...args: Parameters<typeof actual.rmSync>) => rmSyncMock(...args) };
+});
+const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+beforeEach(() => {
+  rmSyncMock.mockImplementation((...args: Parameters<typeof realFs.rmSync>) => realFs.rmSync(...args));
+});
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe('planSlices', () => {
   it('總長剛好等於一片長度時只有一片，不多排一片空的', () => {
@@ -157,6 +172,36 @@ describe('probeDurationRemuxingIfMissing（AC-7：瀏覽器錄的 webm 沒寫長
     expect(readdirSync(dir)).toEqual(['a.audio']);
   });
 
+  it('remux 失敗又刪不掉暫存檔（EBUSY）：拋的是 remux 的錯誤，不被刪檔錯誤蓋掉，只 warn 路徑與錯誤碼', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    rmSyncMock.mockImplementation((path: string, ...rest: unknown[]) => {
+      if (String(path).endsWith('.part')) {
+        throw Object.assign(new Error(`EBUSY: resource busy or locked, unlink '${path}'`), { code: 'EBUSY' });
+      }
+      return (realFs.rmSync as (...args: unknown[]) => void)(path, ...rest);
+    });
+    const file = join(dir, 'a.audio');
+    writeFileSync(file, 'original');
+    let partPath = '';
+    const slicer = createAudioSlicer({
+      ffmpegPath: 'ffmpeg',
+      ffprobePath: 'ffprobe',
+      runner: async (executable, args) => {
+        if (executable === 'ffprobe') return { code: 0, stdout: Buffer.from('N/A'), stderr: '' };
+        // 真的 ffmpeg 失敗時可能已經寫了半個檔
+        partPath = args[args.length - 1] as string;
+        writeFileSync(partPath, 'half');
+        return { code: 1, stdout: Buffer.alloc(0), stderr: 'Invalid data found' };
+      },
+    });
+
+    await expect(slicer.probeDurationRemuxingIfMissing(file)).rejects.toThrow(/remux.*Invalid data found/);
+    expect(readFileSync(file, 'utf8')).toBe('original');
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0].join(' '))).toContain(partPath);
+    expect(String(warn.mock.calls[0].join(' '))).toContain('EBUSY');
+  });
+
   it('remux 之後還是讀不到長度就照原本的錯誤爆，不塞一個假長度', async () => {
     const calls: { executable: string; args: readonly string[] }[] = [];
     const file = join(dir, 'a.audio');
@@ -174,7 +219,77 @@ describe('probeDurationRemuxingIfMissing（AC-7：瀏覽器錄的 webm 沒寫長
 });
 
 describe('readSlice', () => {
-  it('照契約的參數呼叫 ffmpeg：-ss 與 -t 在 -i 前面，輸出 16kHz 單聲道 WAV 到 stdout', async () => {
+  let dir: string;
+  let audio: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'meetpilot-slice-'));
+    audio = join(dir, 'a.audio');
+  });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  /** ffmpeg 把 content 寫到輸出路徑（最後一個參數），跟真的 ffmpeg 寫 FLAC 一樣 */
+  const writingRunner = (content: string, calls: { executable: string; args: readonly string[] }[] = []): CommandRunner =>
+    async (executable, args) => {
+      calls.push({ executable, args });
+      writeFileSync(args[args.length - 1] as string, content);
+      return { code: 0, stdout: Buffer.alloc(0), stderr: '' };
+    };
+
+  it('flac：-ss 與 -t 在 -i 前面，16kHz 單聲道 16-bit FLAC 寫到音檔旁的 .part 再讀回來，暫存檔不留', async () => {
+    const calls: { executable: string; args: readonly string[] }[] = [];
+    const slicer = createAudioSlicer({ ffmpegPath: '/opt/ffmpeg', ffprobePath: 'ffprobe', runner: writingRunner('fLaC....', calls) });
+
+    const flac = await slicer.readSlice(audio, 600, 615, 'flac');
+    expect(flac.toString('utf8')).toBe('fLaC....');
+    expect(calls[0].executable).toBe('/opt/ffmpeg');
+    const outPath = calls[0].args[calls[0].args.length - 1] as string;
+    expect(calls[0].args).toEqual([
+      '-y', '-ss', '600', '-t', '615', '-i', audio, '-ar', '16000', '-ac', '1',
+      '-sample_fmt', 's16', '-c:a', 'flac', '-f', 'flac', outPath,
+    ]);
+    // 不寫 pipe：FLAC 的長度要寫完回頭補，pipe 不能回頭
+    expect(outPath.startsWith(`${audio}.slice-`)).toBe(true);
+    expect(outPath.endsWith('.part')).toBe(true);
+    expect(calls[0].args.indexOf('-ss')).toBeLessThan(calls[0].args.indexOf('-i'));
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  it('暫存檔刪不掉（Windows 防毒或 OneDrive 鎖住，EBUSY）時照樣回傳切片，只 warn 路徑與錯誤碼', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    rmSyncMock.mockImplementation((path: string, ...rest: unknown[]) => {
+      if (String(path).endsWith('.part')) {
+        throw Object.assign(new Error(`EBUSY: resource busy or locked, unlink '${path}'`), { code: 'EBUSY' });
+      }
+      return (realFs.rmSync as (...args: unknown[]) => void)(path, ...rest);
+    });
+    const calls: { executable: string; args: readonly string[] }[] = [];
+    const slicer = createAudioSlicer({ ffmpegPath: 'ffmpeg', ffprobePath: 'ffprobe', runner: writingRunner('fLaC....', calls) });
+
+    const flac = await slicer.readSlice(audio, 0, 10, 'flac');
+
+    expect(flac.toString('utf8')).toBe('fLaC....');
+    const outPath = calls[0].args[calls[0].args.length - 1] as string;
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0].join(' '))).toContain(outPath);
+    expect(String(warn.mock.calls[0].join(' '))).toContain('EBUSY');
+  });
+
+  it('ffmpeg 失敗又刪不掉暫存檔時，拋的是 ffmpeg 的錯誤，不被刪檔錯誤蓋掉', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    rmSyncMock.mockImplementation((path: string, ...rest: unknown[]) => {
+      if (String(path).endsWith('.part')) {
+        throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' });
+      }
+      return (realFs.rmSync as (...args: unknown[]) => void)(path, ...rest);
+    });
+    const slicer = createAudioSlicer({
+      ffmpegPath: 'ffmpeg', ffprobePath: 'ffprobe', runner: fakeRunner({ code: 1, stderr: 'Invalid data found' }),
+    });
+
+    await expect(slicer.readSlice(audio, 0, 10, 'flac')).rejects.toThrow(/結束碼 1.*Invalid data found/);
+  });
+
+  it('wav：給音量檢查用，維持 16kHz 單聲道 WAV 寫到 stdout', async () => {
     const calls: { executable: string; args: readonly string[] }[] = [];
     const slicer = createAudioSlicer({
       ffmpegPath: '/opt/ffmpeg',
@@ -182,38 +297,48 @@ describe('readSlice', () => {
       runner: fakeRunner({ stdout: Buffer.from('RIFF....WAVE') }, calls),
     });
 
-    const wav = await slicer.readSlice('/tmp/a.audio', 600, 615);
+    const wav = await slicer.readSlice(audio, 600, 615, 'wav');
     expect(wav.toString('utf8')).toBe('RIFF....WAVE');
-    expect(calls[0].executable).toBe('/opt/ffmpeg');
     expect(calls[0].args).toEqual([
-      '-ss', '600', '-t', '615', '-i', '/tmp/a.audio', '-ar', '16000', '-ac', '1', '-f', 'wav', 'pipe:1',
+      '-ss', '600', '-t', '615', '-i', audio, '-ar', '16000', '-ac', '1', '-f', 'wav', 'pipe:1',
     ]);
-    expect(calls[0].args.indexOf('-ss')).toBeLessThan(calls[0].args.indexOf('-i'));
   });
 
-  it('結束碼非 0 時拋錯且訊息含 stderr 尾段', async () => {
+  it('結束碼非 0 時拋錯且訊息含 stderr 尾段，暫存檔不留', async () => {
     const stderr = 'ffmpeg version 7.1 banner…\n'.repeat(200) + 'Output file #0 does not contain any stream';
     const slicer = createAudioSlicer({
-      ffmpegPath: 'ffmpeg', ffprobePath: 'ffprobe', runner: fakeRunner({ code: 2, stderr }),
+      ffmpegPath: 'ffmpeg',
+      ffprobePath: 'ffprobe',
+      runner: async (_executable, args) => {
+        // 真的 ffmpeg 失敗時可能已經寫了半個檔
+        writeFileSync(args[args.length - 1] as string, 'half');
+        return { code: 2, stdout: Buffer.alloc(0), stderr };
+      },
     });
 
-    await expect(slicer.readSlice('/tmp/a.audio', 0, 615)).rejects.toThrow(/結束碼 2/);
-    await expect(slicer.readSlice('/tmp/a.audio', 0, 615))
+    await expect(slicer.readSlice(audio, 0, 615, 'flac')).rejects.toThrow(/結束碼 2/);
+    await expect(slicer.readSlice(audio, 0, 615, 'flac'))
       .rejects.toThrow(/Output file #0 does not contain any stream/);
+    expect(readdirSync(dir)).toEqual([]);
   });
 
   it('被訊號殺掉（code 為 null）也算失敗，不當成成功', async () => {
     const slicer = createAudioSlicer({
       ffmpegPath: 'ffmpeg', ffprobePath: 'ffprobe', runner: fakeRunner({ code: null, stderr: 'killed' }),
     });
-    await expect(slicer.readSlice('/tmp/a.audio', 0, 10)).rejects.toThrow(/結束碼 null/);
+    await expect(slicer.readSlice(audio, 0, 10, 'flac')).rejects.toThrow(/結束碼 null/);
+    await expect(slicer.readSlice(audio, 0, 10, 'wav')).rejects.toThrow(/結束碼 null/);
   });
 
   it('結束碼 0 但沒有輸出時拋錯，不把空音檔送給 Gemini', async () => {
-    const slicer = createAudioSlicer({
+    const empty = createAudioSlicer({ ffmpegPath: 'ffmpeg', ffprobePath: 'ffprobe', runner: writingRunner('') });
+    await expect(empty.readSlice(audio, 0, 10, 'flac')).rejects.toThrow(/沒有輸出任何資料/);
+    // 連檔案都沒寫出來：一樣是沒有輸出，不讓 ENOENT 蓋掉原因
+    const missing = createAudioSlicer({
       ffmpegPath: 'ffmpeg', ffprobePath: 'ffprobe', runner: fakeRunner({ stdout: Buffer.alloc(0) }),
     });
-    await expect(slicer.readSlice('/tmp/a.audio', 0, 10)).rejects.toThrow(/沒有輸出任何資料/);
+    await expect(missing.readSlice(audio, 0, 10, 'flac')).rejects.toThrow(/沒有輸出任何資料/);
+    await expect(missing.readSlice(audio, 0, 10, 'wav')).rejects.toThrow(/沒有輸出任何資料/);
   });
 
   it('spawn 是 ENOENT 時訊息要指出缺 ffmpeg，不丟原始 spawn 錯誤', async () => {
@@ -222,8 +347,8 @@ describe('readSlice', () => {
       ffmpegPath: 'ffmpeg', ffprobePath: 'ffprobe', runner: throwingRunner(enoent),
     });
 
-    await expect(slicer.readSlice('/tmp/a.audio', 0, 10)).rejects.toThrow(/請先安裝/);
-    await expect(slicer.readSlice('/tmp/a.audio', 0, 10)).rejects.toThrow(/MEETPILOT_FFMPEG/);
+    await expect(slicer.readSlice(audio, 0, 10, 'flac')).rejects.toThrow(/請先安裝/);
+    await expect(slicer.readSlice(audio, 0, 10, 'flac')).rejects.toThrow(/MEETPILOT_FFMPEG/);
   });
 
   it('ENOENT 以外的 spawn 錯誤原樣往上拋，不包成安裝問題', async () => {
@@ -231,7 +356,7 @@ describe('readSlice', () => {
     const slicer = createAudioSlicer({
       ffmpegPath: 'ffmpeg', ffprobePath: 'ffprobe', runner: throwingRunner(denied),
     });
-    await expect(slicer.readSlice('/tmp/a.audio', 0, 10)).rejects.toThrow(/EACCES/);
+    await expect(slicer.readSlice(audio, 0, 10, 'flac')).rejects.toThrow(/EACCES/);
   });
 
   it('起點或片長不合法時在呼叫 ffmpeg 之前就拋錯', async () => {
@@ -240,8 +365,8 @@ describe('readSlice', () => {
       ffmpegPath: 'ffmpeg', ffprobePath: 'ffprobe', runner: fakeRunner({ stdout: Buffer.from('x') }, calls),
     });
 
-    await expect(slicer.readSlice('/tmp/a.audio', -1, 10)).rejects.toThrow(/起點必須是非負有限數/);
-    await expect(slicer.readSlice('/tmp/a.audio', 0, 0)).rejects.toThrow(/片長必須是有限正數/);
+    await expect(slicer.readSlice(audio, -1, 10, 'flac')).rejects.toThrow(/起點必須是非負有限數/);
+    await expect(slicer.readSlice(audio, 0, 0, 'flac')).rejects.toThrow(/片長必須是有限正數/);
     expect(calls).toHaveLength(0);
   });
 });

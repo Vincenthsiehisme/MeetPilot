@@ -137,9 +137,67 @@ describe('transcribeSlice', () => {
 
     const request = generateContent.mock.calls[0][0] as any;
     expect(request.config.thinkingConfig).toEqual({ thinkingLevel: 'LOW' });
-    // 沒設 maxOutputTokens：這支呼叫本來就是三支裡唯一沒設上限的一支，配上調低的 thinking
-    // level 是同一個問題的兩面，log 裡的 configuredMaxOutputTokens 要老實記成 null
-    expect(request.config.maxOutputTokens).toBeUndefined();
+  });
+
+  it('設 maxOutputTokens 32768；撞到 MAX_TOKENS 不在同一個模型重試，直接換下一個模型，不收截斷的內容（AC-9）', async () => {
+    vi.useFakeTimers();
+    // 截斷的內容刻意給一份解得開的：要證明擋下它的是 finishReason，不是剛好 JSON 解不開
+    generateContent
+      .mockResolvedValueOnce({
+        text: '{"segments":[{"start":0,"end":5,"text":"截斷的前半","speaker":"Speaker 1"}]}',
+        candidates: [{ finishReason: 'MAX_TOKENS' }],
+      })
+      .mockResolvedValueOnce({
+        text: '{"segments":[{"start":0,"end":5,"text":"完整的","speaker":"Speaker 1"}]}',
+        candidates: [{ finishReason: 'STOP' }],
+      });
+
+    const pending = client().transcribeSlice({ base64Data: 'AAAA' });
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    await expect(pending).resolves.toEqual([{ start: 0, end: 5, text: '完整的', speaker: 'Speaker 1' }]);
+    // 拿掉上限這裡就紅：每一次呼叫（含 fallback）都帶同一個上限
+    expect(generateContent.mock.calls.map(c => (c[0] as any).config.maxOutputTokens)).toEqual([32768, 32768]);
+    // 同一個模型只打一次：再試一次多半一樣停不下來，又燒滿一次上限
+    expect(generateContent.mock.calls.map(c => (c[0] as any).model)).toEqual([
+      'gemini-3.8-flash', 'gemini-3.1-flash-lite',
+    ]);
+    expect(logged.map(l => l.outcome)).toEqual(['transient', 'ok']);
+    expect(logged.map(l => extractFinishReason(l.response))).toEqual(['MAX_TOKENS', 'STOP']);
+    expect(logged.map(l => l.configuredMaxOutputTokens)).toEqual([32768, 32768]);
+    expect(logged.map(l => l.modelIndex)).toEqual([0, 1]);
+    expect((logged[0].error as Error).message).toContain('MAX_TOKENS');
+  });
+
+  it('每個模型都撞到 MAX_TOKENS 時每個模型各打一次就整片失敗，不退回截斷的內容（AC-9）', async () => {
+    vi.useFakeTimers();
+    generateContent.mockResolvedValue({
+      text: '{"segments":[{"start":0,"end":5,"text":"截斷的前半","speaker":"Speaker 1"}]}',
+      candidates: [{ finishReason: 'MAX_TOKENS' }],
+    });
+
+    const pending = client().transcribeSlice({ base64Data: 'AAAA' });
+    const assertion = expect(pending).rejects.toThrow(/MAX_TOKENS/);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await assertion;
+    expect(generateContent.mock.calls.map(c => (c[0] as any).model)).toEqual([
+      'gemini-3.8-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest',
+    ]);
+    expect(logged.every(l => l.outcome === 'transient')).toBe(true);
+  });
+
+  it('其他 transient（空輸出）照舊在同一個模型重試，MAX_TOKENS 的換模型規則不影響它', async () => {
+    vi.useFakeTimers();
+    generateContent
+      .mockResolvedValueOnce({ text: '', candidates: [{ finishReason: 'STOP' }] })
+      .mockResolvedValueOnce({ text: '{"segments":[]}', candidates: [{ finishReason: 'STOP' }] });
+
+    const pending = client().transcribeSlice({ base64Data: 'AAAA' });
+    await vi.advanceTimersByTimeAsync(10_000);
+    await expect(pending).resolves.toEqual([]);
+    expect(generateContent.mock.calls.map(c => (c[0] as any).model)).toEqual([
+      'gemini-3.8-flash', 'gemini-3.8-flash',
+    ]);
   });
 
   it('圍欄包住的合法 segments 要正確解析，不能變成一段 JSON 原始碼的假逐字稿', async () => {
@@ -237,6 +295,26 @@ describe('fallback 鏈', () => {
     expect(logged.every(l => l.kind === 'transcribe' && l.streamed === false)).toBe(true);
     // 503 是限流過載，不是空輸出：跟上面那個案例是兩種不同成因
     expect(logged.slice(0, 2).map(l => l.transientReason)).toEqual(['rate_limited', 'rate_limited']);
+  });
+
+  it('fetch failed 走 retry：同一個 model 重試再退到下一個，不第一次就往上拋（AC-5）', async () => {
+    vi.useFakeTimers();
+    const fetchFailed = () => Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }),
+    });
+    generateContent
+      .mockRejectedValueOnce(fetchFailed())
+      .mockRejectedValueOnce(fetchFailed())
+      .mockResolvedValueOnce({ text: '{"segments":[]}' });
+
+    const pending = client().transcribeSlice({ base64Data: 'AAAA' });
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    await expect(pending).resolves.toEqual([]);
+    expect(generateContent.mock.calls.map(c => (c[0] as any).model)).toEqual([
+      'gemini-3.8-flash', 'gemini-3.8-flash', 'gemini-3.1-flash-lite',
+    ]);
+    expect(logged.map(l => l.outcome)).toEqual(['transient', 'transient', 'ok']);
   });
 
   it('不可重試的錯誤第一次就往上拋，不退到 fallback 鏈後面', async () => {
@@ -407,7 +485,7 @@ describe('analyzeTranscript', () => {
     await expect(client().analyzeTranscript({ transcript })).rejects.toThrow(/title/);
   });
 
-  it('紀錄的 configuredMaxOutputTokens 是這支呼叫實際設的上限，跟 transcribe 沒設的 null 不一樣', async () => {
+  it('紀錄的 configuredMaxOutputTokens 是這支呼叫實際設的上限', async () => {
     generateContent.mockResolvedValue({ text: JSON.stringify(okOutput) });
     await client().analyzeTranscript({ transcript });
     expect(logged.map(l => l.configuredMaxOutputTokens)).toEqual([8192]);
@@ -485,6 +563,21 @@ describe('isTransientLlmError', () => {
     expect(isTransientLlmError(new Error('model is overloaded'))).toBe(true);
     expect(isTransientLlmError(new Error('invalid api key'))).toBe(false);
     expect(isTransientLlmError(undefined)).toBe(false);
+  });
+
+  it('網路層錯誤（fetch failed、連線被重設、逾時）算 transient（AC-5）', () => {
+    // Node 內建 fetch（undici）的形狀：訊息只有 fetch failed，原因在 cause
+    expect(isTransientLlmError(new TypeError('fetch failed'))).toBe(true);
+    expect(isTransientLlmError(Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' }),
+    }))).toBe(true);
+    expect(isTransientLlmError(Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }))).toBe(true);
+    expect(isTransientLlmError(Object.assign(new Error('boom'), { cause: { code: 'ETIMEDOUT' } }))).toBe(true);
+    expect(isTransientLlmError(Object.assign(new Error('boom'), { cause: { code: 'UND_ERR_CONNECT_TIMEOUT' } }))).toBe(true);
+    expect(isTransientLlmError(new Error('socket hang up'))).toBe(true);
+    expect(isTransientLlmError(new Error('Request timed out'))).toBe(true);
+    // 不是網路層的錯誤照舊算 fatal
+    expect(isTransientLlmError(Object.assign(new Error('400 Invalid argument'), { cause: { code: 'ERR_INVALID_ARG' } }))).toBe(false);
   });
 });
 

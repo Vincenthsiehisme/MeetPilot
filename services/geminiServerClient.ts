@@ -124,29 +124,83 @@ export function cleanJsonString(str: string | undefined): string {
   return cleaned;
 }
 
+// 網路層的錯誤碼：Node 內建 fetch（undici）連線失敗只丟一句 `fetch failed`，真正的原因在 `cause.code`
+const TRANSIENT_NETWORK_CODES = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ECONNABORTED',
+  'ETIMEDOUT',
+  'EPIPE',
+  'EAI_AGAIN',
+  'ENETUNREACH',
+  'EHOSTUNREACH',
+  'UND_ERR_SOCKET',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT',
+]);
+
 /**
  * 這個錯誤值不值得退到 fallback 鏈的下一個。
  *
  * W4 把它從 `generateContentWithFallback` 的 body 抽出來（判斷字串逐字相同，行為未變），
  * 因為 embedding 沒有 fallback 鏈卻一樣要在紀錄裡分得出 transient 與 fatal。
  * 留兩份的話，之後加一個新的限流訊息只會改到其中一份，而紀錄上看不出哪一份沒改。
+ *
+ * 網路層錯誤（`fetch failed`、連線被重設、逾時）也算 transient（vault plan「MeetPilot · 記錄完整度、
+ * 成本與背景運作」AC-5）：09-16～10-08 的紀錄裡 `fetch failed` 共 13 次，以前一次就判 fatal，
+ * 這一片直接失敗、整個 job 退回重來，其實換一次連線多半就過了。
  */
 export function isTransientLlmError(err: any): boolean {
   const msg = (err?.message || '').toLowerCase();
-  return (
+  if (
     msg.includes('503') ||
     msg.includes('unavailable') ||
     msg.includes('high demand') ||
     msg.includes('429') ||
     msg.includes('resource_exhausted') ||
     msg.includes('overloaded')
-  );
+  ) {
+    return true;
+  }
+  if (
+    msg.includes('fetch failed') ||
+    msg.includes('socket hang up') ||
+    msg.includes('other side closed') ||
+    msg.includes('timed out') ||
+    msg.includes('timeout')
+  ) {
+    return true;
+  }
+  const codes = [err?.code, err?.cause?.code].filter((code): code is string => typeof code === 'string');
+  return codes.some((code) => TRANSIENT_NETWORK_CODES.has(code))
+    || [...TRANSIENT_NETWORK_CODES].some((code) => msg.includes(code.toLowerCase()));
 }
+
+/**
+ * 轉錄呼叫的輸出上限（vault plan「MeetPilot · 記錄完整度、成本與背景運作」AC-9）。
+ * Gemini 3 系列的 thinking token 也算進這個上限。09-16～10-08 的紀錄裡正常切片 output 最多約 1.2 萬、
+ * thinking 最多約 1.4 萬，合起來留了餘裕；沒設上限時有一次輸出 65,522 token 撞到模型自己的上限，
+ * 白燒一整片的錢、內容還是截斷的。撞到上限當這次呼叫失敗（見 transcribeSlice 的 validateResponse）
+ */
+export const TRANSCRIBE_MAX_OUTPUT_TOKENS = 32768;
 
 class RetryableLlmResponseError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'RetryableLlmResponseError';
+  }
+}
+
+/**
+ * 輸出撞到 maxOutputTokens（finishReason MAX_TOKENS）。仍算可重試的空輸出一類，
+ * 但 `generateContentWithFallback` 不在同一個模型再試，直接換下一個：同一段音訊同一個模型
+ * 再試多半一樣停不下來，又燒滿一次上限（AC-9 要擋的正是這筆花費）
+ */
+class MaxTokensLlmResponseError extends RetryableLlmResponseError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'MaxTokensLlmResponseError';
   }
 }
 
@@ -510,6 +564,11 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
             throw err;
           }
 
+          if (err instanceof MaxTokensLlmResponseError) {
+            console.warn(`[Gemini Request] Model ${model} 撞到輸出上限，不在同一個模型重試，改用 fallback 鏈的下一個模型`);
+            break;
+          }
+
           if (rateLimit) {
             if (rateLimit.dailyQuotaExhausted) {
               console.warn(`[Gemini Request] Model ${model} 今天的額度用完，改用 fallback 鏈的下一個模型`);
@@ -542,7 +601,7 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
         base64Data,
         offsetSeconds = 0,
         previousContext = '',
-        mimeType = 'audio/wav',
+        mimeType = 'audio/flac',
         sliceDurationSeconds,
         meetingId,
         participantNames,
@@ -572,9 +631,10 @@ Output JSON format:
 { "segments": [{ "start": 0.0, "end": 5.5, "text": "完整的句子內容...", "speaker": "Speaker 1" }] }`,
         // 逐字稿是機械式的照抄任務，不需要推理，調低 thinking level 降低「thinking 吃光
         // maxOutputTokens、response.text 變空」的機率（2026-09-16 查證：Gemini 3 系列的
-        // thinking token 算進 maxOutputTokens，這支呼叫又沒設上限）。不是保證消除，是降低機率：
+        // thinking token 算進 maxOutputTokens）。不是保證消除，是降低機率：
         // llm.jsonl 的 finishReason 欄位之後能直接看出還有沒有撞到 MAX_TOKENS
         thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        maxOutputTokens: TRANSCRIBE_MAX_OUTPUT_TOKENS,
         responseMimeType: 'application/json',
         responseSchema: {
           type: Type.OBJECT,
@@ -603,6 +663,16 @@ Output JSON format:
         contents: { parts },
         config: promptConfig,
         validateResponse: (candidate) => {
+          // 撞到輸出上限的內容是截斷的。以前留到 fallback 外面解 JSON 才拋，這一片直接失敗、
+          // 不換模型；在這裡拋就換 fallback 鏈的下一個模型（同一個模型不重試，見
+          // MaxTokensLlmResponseError），截斷的內容一個字都不收。
+          // llm.jsonl 那一筆的 finishReason 是 MAX_TOKENS、errorMessage 是下面這句
+          // （transientReason 會記成 empty_output：llmTelemetry 的列舉只有兩種，這包不改契約檔）
+          if (candidate?.candidates?.[0]?.finishReason === 'MAX_TOKENS') {
+            throw new MaxTokensLlmResponseError(
+              `Gemini 轉錄輸出撞到 maxOutputTokens 上限（${TRANSCRIBE_MAX_OUTPUT_TOKENS}，finishReason MAX_TOKENS），不收截斷的內容`,
+            );
+          }
           if (
             typeof candidate?.text !== 'string'
             || candidate.text.trim() === ''

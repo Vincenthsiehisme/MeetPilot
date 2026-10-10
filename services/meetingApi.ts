@@ -341,12 +341,8 @@ export const AUDIO_ALREADY_ON_SERVER_HINTS = [
 ] as const;
 
 /**
- * 所有錯誤回應的形狀。server 的 `handleStoreError` 與 `handleApiError` 都送這個。
- *
- * `rawError` 只有 Gemini 那條路徑（`handleApiError`）會帶，是既有行為。寫進契約是因為它確實
- * 送得出去，不寫等於契約說謊；前端不讀它，新的程式碼也不要開始讀。
+ * 所有錯誤回應的形狀。server 的 `handleStoreError` 送這個。
  */
 export interface ApiErrorResponse {
   error: string;
-  rawError?: string;
 }

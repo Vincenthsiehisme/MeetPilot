@@ -135,7 +135,7 @@ node scripts/smokeDesktop.mjs <打包後的執行檔>   # 啟動打包後的 app
 - 關掉視窗只是縮到托盤，托盤選單的「結束 MeetPilot」才會停 server。同時只能開一個。
 - server 掛掉會跳錯誤視窗，顯示結束碼與最後幾行輸出，由使用者選重新啟動或結束，不會安靜重啟。
 - **隨附的 ffmpeg 是自己從官方原始碼編的最小版本**（`scripts/ffmpeg/build.sh`，參數在 `configure-flags.txt`）：
-  只開 server 用得到的音訊解碼器、容器、WAV 輸出與重採樣，沒有 GPL 元件、沒有外部函式庫，授權 LGPL 2.1 以上，
+  只開 server 用得到的音訊解碼器、容器、WAV 與 FLAC 輸出與重採樣，沒有 GPL 元件、沒有外部函式庫，授權 LGPL 2.1 以上，
   授權檔跟著放在安裝檔的 `ffmpeg/LICENSE-ffmpeg.txt`，`ffmpeg/NOTICE-ffmpeg.txt` 寫明版本、官方原始碼網址與 sha256、
   configure 參數，以及連進執行檔的三個 MIT 授權檔案聲明。原始碼固定 8.1.3 並驗 sha256，CI 另外驗官方簽章
   （金鑰指紋釘死在腳本裡，撤銷或過期的金鑰也拒絕）。兩個執行檔合計約 5.5 MB。
@@ -205,6 +205,34 @@ node scripts/smokeDesktop.mjs <打包後的執行檔>   # 啟動打包後的 app
   - 還沒驗證：兩平台實際換版（AC-7，E6 實機）、OneDrive「檔案隨選」的佔位檔被讀時會不會自動下載、
     macOS 換版後鑰匙圈會不會跳詢問。
 
+## 成本總覽
+
+只給使用者自己看的估算，不進 app。腳本讀共享資料夾底下每位記錄人的 `_診斷/llm.jsonl`，算出分人、分月、逐場的花費與各步驟分項，寫成一份 `總覽.md`。
+
+```bash
+npm run cost:report                                   # 共享資料夾取桌面 app 設定檔 vaultDir 的上一層，輸出到 ~/MeetPilot 成本/
+npm run cost:report -- --shared <共享資料夾> --out <輸出資料夾>
+```
+
+- 共享資料夾預設讀 `~/Library/Application Support/MeetPilot/desktop-settings.json`（Windows 是 `%APPDATA%\MeetPilot`）的 `vaultDir`，取它的上一層。讀不到設定又沒給 `--shared` 就報錯退出。共享資料夾底下每個子資料夾當一位記錄人，但名字以 `_` 或 `.` 開頭的（`_更新/`、`.obsidian`）不是記錄人，不列。
+- 輸出預設 `~/MeetPilot 成本/總覽.md`。`--out` 落在共享資料夾裡面會被拒絕，總覽不寫進共享資料夾。不設花費上限，只呈現。
+- 價目表是 `scripts/geminiPrices.json`，每列 `{ model, effectiveFrom, inputPerM, audioInputPerM?, outputPerM }`，單位是每 1M token 美元。同一模型多列時取呼叫當下有效的那列。
+  - 現行價取自 2026-10-10 讀的 Gemini API 價目頁，`effectiveFrom` 寫 `2026-01-01` 表示「往前沿用」（頁面沒寫起算日，紀錄最早 2026-09-16）。`gemini-3.8-flash` 在 2027-01-01 起換成較高的價，換價前後的呼叫分開算。價格改了就加新的一列，不改舊列。
+  - 總覽的月份用台灣時間（UTC+8）分組，台灣 1 號早上 8 點前的呼叫算進當月，不算上個月。
+  - 換價日用呼叫時間（`ts`）的 UTC 日期比（Google 換價的時區沒公布），所以 2026-12-31T20:00Z 的呼叫用舊價，月份落在台灣時間的 2027-01。
+  - `gemini-3.8-flash` 價目頁只列一個 input 價，轉錄也用它；有 `audioInputPerM` 的模型，`kind` 是 `transcribe` 的呼叫才用音訊價。
+  - 估算 = `promptTokens` 乘 input 價，加（`outputTokens` + `thoughtsTokens`）乘 output 價。`thoughtsTokens` 沒有當 0。
+  - 價目表完全沒有的模型（例如 fallback 鏈最後的 `gemini-flash-latest`）只要呼叫有 token，就不算進金額、也不猜價：總覽另開「價目表沒有的模型」一段逐模型列次數與 token 數，各張表多一欄「未計價呼叫」，CLI 結束時在 stderr 印一行警告。補上價格後重跑。價目表有這個模型、但呼叫日早於最早生效日，是價目表寫錯，整份報錯。
+- `embed` 的紀錄沒有 token 數，列「未計」，不算進金額。三個 token 欄都是 null 的呼叫（失敗在拿到回應前）也列未計，不查價。
+- 失敗的呼叫（`outcome` 不是 `ok`）只要有回傳 token 就照算進每場、每人、每月總額，另外單列「其中失敗重試」一欄。
+- 會議標題是從同一位記錄人資料夾裡會議記錄的 frontmatter `meetpilot_id` 對回檔名；對不到的寫 meetingId 前 8 碼，`meetingId` 是 null 的列「未歸屬」。一場跨月會分成兩列，讓逐場加總等於分月。
+- `_診斷/llm.jsonl` 只在會議走到終點時匯出，還在跑的會議不一定算進來。
+- **卡住的會議。** 每位記錄人資料夾根目錄的 `_狀態.json`（app 每 60 秒與狀態有變時寫）也會讀，總覽的「會議狀態」一段把每一場只放進一類。沒有狀態檔的記錄人會寫「沒有狀態檔」，不會當成沒事；`schema` 不是 1 就報錯。
+  - 卡住：`inProgress` 為 true，而且狀態檔 `writtenAt` 超過 10 分鐘沒更新（app 沒在跑），或這場的 `updatedAt` 超過 30 分鐘沒變。寫「卡多久」（從 `updatedAt` 算）與原因。
+  - 處理中：`inProgress` 為 true、沒超時。
+  - 錄音中：`RECORDING`，`updatedAt` 在 3 小時內；超過 3 小時改列需要處理，寫已過多久。
+  - 需要處理：其餘 `inProgress` 為 false 的（`CREATED`、`FAILED`、`LINK_FAILED`，以及停在 `TRANSCRIBING`、`TRANSCRIBED`、`ANALYZING` 卻沒有進行中 job 的），寫狀態與 `error`。
+
 ## 驗證
 
 ```bash
@@ -253,7 +281,7 @@ POST   /api/meetings/:id/retry    FAILED 重跑轉錄（音檔還在才行），
 POST   /api/meetings/:id/link     重算跨會議關聯（READY / LINKED / LINK_FAILED 才行，同步等它跑完）
 DELETE /api/meetings/:id          刪掉；正在跑的回 409，等它結束或失敗再刪；語音備忘錄錄音中的先叫它停止，停不下來就不刪；
                                   app 內錄音的段落跟著刪
-PATCH  /api/meetings/:id/transcript   改逐字稿或存潤稿
+PATCH  /api/meetings/:id/transcript   改逐字稿
 PATCH  /api/meetings/:id/analysis     改會議記錄
 PATCH  /api/meetings/:id/title        改標題；畫面上的名字與下載檔名用它，分析完成時模型先填一個建議（只填還沒有標題的會）
 ```

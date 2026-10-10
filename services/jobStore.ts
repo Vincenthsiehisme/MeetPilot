@@ -44,6 +44,15 @@ export interface Job {
   updated_at: number;
 }
 
+/** 活動快照要的最小欄位，見 `listLatestJobs` */
+export interface LatestJob {
+  job_id: string;
+  meeting_id: string;
+  kind: JobKind;
+  status: JobRunStatus;
+  error: string | null;
+}
+
 interface JobRow {
   job_id: string; meeting_id: string; kind: JobKind; status: JobRunStatus; payload: string | null;
   attempt: number; max_attempts: number; claimed_by: string | null; claimed_at: number | null;
@@ -77,6 +86,16 @@ export const createJobStore = (db: DatabaseSync) => {
   const runningUpdate = db.prepare("UPDATE jobs SET status = 'running', updated_at = ? WHERE job_id = ?");
   const succeededUpdate = db.prepare(
     "UPDATE jobs SET status = 'succeeded', error = NULL, updated_at = ? WHERE job_id = ?",
+  );
+  const selectActiveMeetingIds = db.prepare(
+    "SELECT DISTINCT meeting_id FROM jobs WHERE status IN ('queued','claimed','running')",
+  );
+  // 每場會每種 kind 取最新一筆（created_at 相同時比 rowid）。partial unique index 保證同 kind 同時
+  // 最多一筆進行中、有進行中就不能再 enqueue，所以進行中的那筆一定是最新的
+  const selectLatestPerMeetingKind = db.prepare(
+    'SELECT j.job_id, j.meeting_id, j.kind, j.status, j.error FROM jobs j WHERE NOT EXISTS ('
+    + 'SELECT 1 FROM jobs k WHERE k.meeting_id = j.meeting_id AND k.kind = j.kind '
+    + 'AND (k.created_at > j.created_at OR (k.created_at = j.created_at AND k.rowid > j.rowid)))',
   );
   const selectExpired = db.prepare(
     "SELECT * FROM jobs WHERE status IN ('claimed','running') AND lease_expires_at < ?",
@@ -137,6 +156,16 @@ export const createJobStore = (db: DatabaseSync) => {
      */
     hasAny: (meetingId: string, kind: JobKind): boolean =>
       selectByMeetingKindAny.get(meetingId, kind) !== undefined,
+
+    /** 有 queued、claimed 或 running job 的會議 id（每場一筆，不分 kind）。活動快照的 `active` 用它算 */
+    activeMeetingIds: (): string[] =>
+      (selectActiveMeetingIds.all() as { meeting_id: string }[]).map(row => row.meeting_id),
+
+    /**
+     * 每場會每種 kind 最新的那筆 job（含 succeeded、failed）。活動快照靠它看「job 是不是新變成 failed」
+     * 與失敗訊息；重新 enqueue 之後最新的是新 job，舊的 failed 不會再被當成新失敗
+     */
+    listLatestJobs: (): LatestJob[] => selectLatestPerMeetingKind.all() as unknown as LatestJob[],
 
     /**
      * 依建立時間搶最舊的一筆 queued job。CAS 失敗（被搶走）就换下一筆候選，

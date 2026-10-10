@@ -150,8 +150,7 @@ export function extractCandidatesCount(response: unknown): number | null {
   return Array.isArray(candidates) ? candidates.length : 0;
 }
 
-// 抽 HTTP 狀態碼與訊息。與 server.ts 的 handleApiError 看的是同兩個地方
-// （err.status、JSON 字串 message 裡的 error.code），但那支綁著 express response，不能共用。
+// 抽 HTTP 狀態碼與訊息，看兩個地方：err.status、JSON 字串 message 裡的 error.code。
 export function describeLlmError(err: unknown): { status: number | null; message: string } {
   const raw = (err as { message?: unknown } | null | undefined)?.message;
   const message = typeof raw === 'string' ? raw : String(err ?? '');

@@ -17,12 +17,16 @@
  * 設定頁（electron/setup.html）。三樣都有就每次啟動向 gateway 拿最新的 key 與名單：連不上用上次的、
  * 畫面標示離線；gateway 回 401（被撤銷）就刪掉 token 與 key、回設定頁，不退回上次的。
  *
+ * 背景運作（plan「記錄完整度、成本與背景運作」AC-3）：server 把「幾場會議在轉錄、分析或關聯」與完成／失敗事件
+ * 經 parentPort 送過來（desktopActivity.ts 驗形狀）。有會議在處理就擋閒置睡眠、結束前先問、完成與失敗各發一則系統通知；
+ * 設定過資料夾的打包版登記開機自動啟動，開機啟動時不跳主視窗、只留托盤。
+ *
  * E5 起從共享資料夾更新（electron/updater.ts）：啟動時與每 4 小時看一次投影資料夾旁邊的 `_更新/`，
  * 有驗過的新版就在托盤與畫面右上角提示，使用者按了才裝。錄音中不裝，因為更新要結束 app。
  * Windows 靜默安裝後自動重開；macOS 沒有簽章不能自動換版，打開 dmg 讓使用者自己拖。
  */
 import {
-  app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, powerSaveBlocker, safeStorage, session, shell, systemPreferences, Tray,
+  app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, Notification, powerSaveBlocker, safeStorage, session, shell, systemPreferences, Tray,
   utilityProcess,
 } from 'electron';
 import type { IpcMainInvokeEvent, UtilityProcess } from 'electron';
@@ -37,6 +41,9 @@ import { resolveBundledFfmpeg } from './bundledFfmpeg';
 import { GATEWAY_URL, GatewayError, createGatewayClient, syncWithGateway } from './gatewayClient';
 import { DesktopCredentials, DesktopStoreError, createDesktopStore } from './desktopStore';
 import { VaultFolderError, checkVaultFolder } from './vaultFolder';
+import {
+  ActivityEvent, HIDDEN_LAUNCH_ARG, notificationFor, parseActivityMessage, quitPrompt, shouldBlockSleep, shouldOpenAtLogin, startedHidden, updateInstallNote,
+} from './desktopActivity';
 import {
   PENDING_UPDATE_FILE, PendingUpdate, UpdateCheck, WINDOWS_INSTALL_ARGS, checkForUpdate, describeUpdateCheck, parsePendingUpdate,
   pendingUpdateDone, stageInstaller, updateFolderFor,
@@ -73,23 +80,102 @@ let tray: Tray | null = null;
 let server: UtilityProcess | null = null;
 let serverOrigin: string | null = null;
 let quitting = false;
+// 開機自動啟動的那一刻（毫秒）；一般啟動是 null。macOS 啟動時會送一個 activate，不能讓它把剛藏好的視窗叫出來
+let hiddenLaunchAt: number | null = null;
+const HIDDEN_LAUNCH_ACTIVATE_GRACE_MS = 5_000;
+
+// MEETPILOT_DESKTOP_SMOKE 只給 scripts/smokeDesktop.mjs 用：冒煙測試不登記開機自動啟動（那會改到這台電腦真實的登入項目）、
+// 不發系統通知、結束時不問「還有會議在處理」（對話框會卡住它的收尾）
+const SMOKE = process.env.MEETPILOT_DESKTOP_SMOKE === '1';
 
 // 錄音中（頁面經 preload 告訴主程序，E4）。powerSaveBlocker 的 id 是 null 代表沒擋
 let recordingActive = false;
 let sleepBlockerId: number | null = null;
-// 錄音中按結束、使用者確認過了：第二次進 before-quit 就放行
+// server 回報的處理中會議數（轉錄、分析、關聯）。server 沒在跑或離開時歸 0
+let activeMeetings = 0;
+// 錄音中或處理中按結束、使用者確認過了：第二次進 before-quit 就放行
 let quitConfirmed = false;
+// 裝更新要結束 app：使用者已經在更新的確認框同意，before-quit 不再問「還有會議在處理」
+let updateQuitting = false;
+// 結束確認的對話框開著時，又有結束請求進來（托盤連按）不再疊一個
+let quitPromptOpen = false;
+// 顯示中的通知要自己抓著，不然被回收後點了沒反應
+const liveNotifications = new Set<Notification>();
+
+function updateSleepBlocker(): void {
+  const block = shouldBlockSleep({ recording: recordingActive, active: activeMeetings });
+  // 只擋「閒置睡眠讓 app 被暫停」，不擋螢幕關閉；筆電闔上蓋子擋不了，畫面上有講
+  if (block && sleepBlockerId === null) {
+    sleepBlockerId = powerSaveBlocker.start('prevent-app-suspension');
+  } else if (!block && sleepBlockerId !== null) {
+    powerSaveBlocker.stop(sleepBlockerId);
+    sleepBlockerId = null;
+  }
+}
 
 function setRecordingActive(active: boolean, why: string): void {
   if (recordingActive === active) return;
   recordingActive = active;
   writeLog(`--- 錄音${active ? '開始' : '結束'}（${why}）---\n`);
-  // 只擋「閒置睡眠讓 app 被暫停」，不擋螢幕關閉；筆電闔上蓋子擋不了，畫面上有講
-  if (active && sleepBlockerId === null) {
-    sleepBlockerId = powerSaveBlocker.start('prevent-app-suspension');
-  } else if (!active && sleepBlockerId !== null) {
-    powerSaveBlocker.stop(sleepBlockerId);
-    sleepBlockerId = null;
+  updateSleepBlocker();
+}
+
+function setActiveMeetings(active: number, why: string): void {
+  if (activeMeetings === active) return;
+  writeLog(`--- 處理中的會議 ${activeMeetings} → ${active} 場（${why}）---\n`);
+  activeMeetings = active;
+  updateSleepBlocker();
+}
+
+/** 完成與失敗各一則系統通知，點了打開主視窗。不支援通知的平台只寫 log */
+function notifyMeetingEvent(event: ActivityEvent): void {
+  const text = notificationFor(event);
+  // log 只留 id 與原因，不留會議標題
+  writeLog(`--- 通知（${event.kind}）會議 ${event.meetingId}：${event.reason ?? '沒有原因'} ---\n`);
+  if (SMOKE) return;
+  if (!Notification.isSupported()) {
+    writeLog('--- 這個平台不支援系統通知，沒有發 ---\n');
+    return;
+  }
+  try {
+    const notification = new Notification({ title: text.title, body: text.body });
+    liveNotifications.add(notification);
+    notification.on('click', () => {
+      liveNotifications.delete(notification);
+      showWindow();
+    });
+    notification.on('close', () => liveNotifications.delete(notification));
+    notification.on('failed', (_event, error) => {
+      liveNotifications.delete(notification);
+      writeLog(`--- 系統通知顯示失敗：${error} ---\n`);
+    });
+    notification.show();
+  } catch (err) {
+    writeLog(`--- 系統通知發不出去：${(err as Error).message} ---\n`);
+  }
+}
+
+/** server 送來的活動訊息。形狀不對寫 log、維持上一次的狀態 */
+function onActivityMessage(raw: unknown): void {
+  const parsed = parseActivityMessage(raw);
+  if (parsed.kind === 'invalid') {
+    writeLog(`--- 忽略 server 送來的訊息（${parsed.reason}）：${JSON.stringify(raw)?.slice(0, 200)} ---\n`);
+    return;
+  }
+  setActiveMeetings(parsed.message.active, 'server 回報');
+  for (const event of parsed.message.events) notifyMeetingEvent(event);
+}
+
+/** 設定過資料夾的打包版登記開機自動啟動；首次設定前、開發模式、冒煙測試都不登記 */
+function syncLoginItem(): void {
+  if (!shouldOpenAtLogin({ vaultDir: vaultDirForUpdate(), isPackaged: app.isPackaged, smoke: SMOKE })) return;
+  try {
+    app.setLoginItemSettings({ openAtLogin: true, args: [HIDDEN_LAUNCH_ARG] });
+    // Windows 要帶同一組 args 才查得到；macOS 13 以上 requires-approval 代表使用者還沒在系統設定核准，等於沒開
+    const now = app.getLoginItemSettings({ args: [HIDDEN_LAUNCH_ARG] });
+    writeLog(`--- 開機自動啟動已登記（openAtLogin ${now.openAtLogin}${process.platform === 'darwin' ? `，status ${now.status}` : ''}）---\n`);
+  } catch (err) {
+    writeLog(`--- 登記開機自動啟動失敗：${(err as Error).message} ---\n`);
   }
 }
 
@@ -236,9 +322,16 @@ async function startServer(): Promise<void> {
   // （Codex review 2026-09-24）
   let ready = false;
   let exitCode: number | null = null;
+  child.on('message', (message) => {
+    // 換設定收掉的舊 server 在結束前送的訊息不算
+    if (server === child) onActivityMessage(message);
+  });
   child.once('exit', (code) => {
     exitCode = code;
-    if (server === child) server = null;
+    if (server === child) {
+      server = null;
+      setActiveMeetings(0, 'server 結束');
+    }
     if (quitting || !ready || retiredServers.has(child)) return;
     void onServerExit(code, logTail.lines());
   });
@@ -377,6 +470,8 @@ async function bootServerIntoWindow(): Promise<void> {
 function showSetup(message: string | null): void {
   setupMessage = message;
   if (message !== null) writeLog(`--- 顯示設定頁：${message} ---\n`);
+  // 開機自動啟動時視窗是藏著的：要使用者處理的設定頁一定要叫出來，不然他只看到托盤
+  showWindow();
   mainWindow?.loadURL(setupPageUrl()).catch((err: Error & { code?: string }) => {
     if (err.code !== 'ERR_ABORTED') writeLog(`--- 設定頁載入失敗：${err.message} ---\n`);
   });
@@ -635,6 +730,7 @@ async function saveSetup(newCode: string, vaultDir: string): Promise<{ ok: true 
   if (sync.freshRoster !== null) store.writeRoster(sync.freshRoster);
   store.writeCredentials({ ...credentials, geminiApiKey: sync.geminiApiKey });
   store.writeSettings({ vaultDir });
+  syncLoginItem();
   runtime = {
     geminiApiKey: sync.geminiApiKey,
     vaultDir,
@@ -827,14 +923,15 @@ async function installUpdate(justChecked?: Extract<UpdateCheck, { state: 'ready'
       return;
     }
     const isMac = process.platform === 'darwin';
+    const processingNote = updateInstallNote(activeMeetings);
     const { response } = await dialog.showMessageBox({
       type: 'question',
       title: 'MeetPilot',
       message: `安裝 MeetPilot ${check.version}？`,
-      detail: isMac
+      detail: (isMac
         ? 'MeetPilot 會打開新版的安裝檔並結束。在打開的視窗裡把 MeetPilot 拖到「應用程式」、選「取代」，再從「應用程式」打開。'
           + 'macOS 說無法確認開發者的話，照第一次安裝時的放行步驟做一次。'
-        : 'MeetPilot 會結束、在背景安裝新版，裝完自動重新開啟。進行中的轉錄重新開啟後會接著跑。',
+        : 'MeetPilot 會結束、在背景安裝新版，裝完自動重新開啟。進行中的轉錄重新開啟後會接著跑。') + processingNote,
       buttons: [isMac ? '打開安裝檔並結束 MeetPilot' : '安裝並重新開啟', '取消'],
       defaultId: 0,
       cancelId: 1,
@@ -866,6 +963,8 @@ async function installUpdate(justChecked?: Extract<UpdateCheck, { state: 'ready'
       // 安裝程式已經起來了，接著一定會關掉這個 app：不能再讓 before-quit 的錄音確認擋住
       quitConfirmed = true;
     }
+    // 使用者在上面的框已同意結束：before-quit 不再問處理中那項（錄音中仍會問，上面也擋過了）
+    updateQuitting = true;
     app.quit();
   } catch (err) {
     writeLog(`--- 更新沒有完成：${(err as Error).stack ?? String(err)} ---\n`);
@@ -989,8 +1088,9 @@ function isServerUrl(url: string): boolean {
   return serverOrigin !== null && (url === serverOrigin || url.startsWith(`${serverOrigin}/`));
 }
 
-function createWindow(): void {
+function createWindow(opts: { show: boolean }): void {
   mainWindow = new BrowserWindow({
+    show: opts.show,
     width: 1280,
     height: 820,
     title: 'MeetPilot',
@@ -1083,25 +1183,34 @@ if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
   app.on('second-instance', showWindow);
-  app.on('activate', showWindow);
+  app.on('activate', () => {
+    if (hiddenLaunchAt !== null && Date.now() - hiddenLaunchAt < HIDDEN_LAUNCH_ACTIVATE_GRACE_MS) return;
+    showWindow();
+  });
   app.on('before-quit', (event) => {
-    // 錄音中結束會切掉錄音。先問一次；確認了才真的結束，已送到的段落留在 server，下次打開可以送出
-    if (recordingActive && !quitConfirmed) {
+    // 錄音中結束會切掉錄音，處理中結束會停下轉錄與分析。先問一次（兩者同時成立也只問一次）；確認了才真的結束，
+    // 已送到的段落與沒做完的 job 留在 server，下次打開接著跑。冒煙測試不問處理中那一項
+    const prompt = quitConfirmed ? null : quitPrompt({ recording: recordingActive, active: SMOKE ? 0 : activeMeetings, ignoreProcessing: updateQuitting });
+    if (prompt !== null) {
       event.preventDefault();
       showWindow();
+      if (quitPromptOpen) return;
+      quitPromptOpen = true;
       void dialog.showMessageBox({
         type: 'warning',
         title: 'MeetPilot',
-        message: '正在錄音，要結束 MeetPilot 嗎？',
-        detail: '結束會中斷錄音。已經送出的部分會留著，下次打開 MeetPilot 可以把它送去轉錄；最後幾秒可能沒送到。',
-        buttons: ['繼續錄音', '結束 MeetPilot'],
+        message: prompt.message,
+        detail: prompt.detail,
+        buttons: prompt.buttons,
         defaultId: 0,
         cancelId: 0,
       }).then(({ response }) => {
         if (response !== 1) return;
         quitConfirmed = true;
-        writeLog('--- 錄音中使用者確認結束 ---\n');
+        writeLog(`--- ${prompt.logNote}使用者確認結束 ---\n`);
         app.quit();
+      }).finally(() => {
+        quitPromptOpen = false;
       });
       return;
     }
@@ -1124,8 +1233,18 @@ if (!app.requestSingleInstanceLock()) {
       });
     });
     registerSetupHandlers();
-    createWindow();
+    // 開機自動啟動：不跳主視窗，只留托盤；點托盤才開。macOS 看系統說是不是開機啟動的，Windows 看登記時帶的參數
+    const hidden = startedHidden({
+      argv: process.argv,
+      wasOpenedAtLogin: process.platform === 'darwin' && app.getLoginItemSettings().wasOpenedAtLogin,
+    });
+    if (hidden) {
+      hiddenLaunchAt = Date.now();
+      writeLog('--- 開機自動啟動，視窗不跳出來，只留在系統匣 ---\n');
+    }
+    createWindow({ show: !hidden });
     createTray();
+    syncLoginItem();
     await startApp();
     void reportPendingUpdate();
     void runUpdateCheck('啟動');
