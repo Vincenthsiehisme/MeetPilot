@@ -21,7 +21,7 @@ import { TranscriptSegment } from '../types';
 import { ActionItemV3, DecisionV3, Evidence, OpenQuestionV3, TopicV3 } from './analysisContract';
 import { SeamReportEntry } from './meetingApi';
 import { MeetingStatus } from './meetingState';
-import { MeetingStore } from './meetingStore';
+import { CurrentTranscript, MeetingStore } from './meetingStore';
 import { NameMention, NameResolver } from './nameResolver';
 import { LINK_ALGO_VERSION } from './topicLink';
 import { TopicTag } from './topicTag';
@@ -60,6 +60,10 @@ const MANUAL_END = '<!-- meetpilot:manual:end -->';
 /** 排除 conflict 副本用。副本的 frontmatter 帶著跟原檔一樣的 meetpilot_id，掃描時不能算進索引 */
 const CONFLICT_INFIX = '.conflict-';
 const MANUAL_SYNTAX_VERSION = 1;
+/** 逐字稿投影的子資料夾，跟 `_診斷/` 同層；`scanVaultIndex` 只讀第一層 `.md`，不會把它底下的檔當會議檔 */
+export const TRANSCRIPT_DIR_NAME = '_逐字稿';
+/** 逐字稿檔 frontmatter 的欄位，值是 meetingId；改名後找舊檔靠它，不靠檔名 */
+const TRANSCRIPT_OF_FIELD = 'meetpilot_transcript_of';
 
 /**
  * 標題最多取前 30 個字元，移除路徑與 wikilink 會壞掉的字元、控制字元與前後空白
@@ -284,6 +288,8 @@ const renderCompletenessSection = (
 
 interface SystemRegionInput {
   title: string;
+  /** 逐字稿檔的 stem（不含 `.md`），跟這份會議記錄現行檔名的 stem 相同 */
+  transcriptStem: string;
   decisions: readonly DecisionV3[];
   actionItems: readonly ActionItemV3[];
   openQuestions: readonly OpenQuestionV3[];
@@ -297,6 +303,8 @@ interface SystemRegionInput {
 /** 系統區的完整內容（純函式，不含 I/O），也是 `auto_checksum` 要雜湊的那段文字 */
 export const renderSystemRegion = (input: SystemRegionInput): string => [
   `# ${input.title}`,
+  '',
+  `逐字稿：[[${TRANSCRIPT_DIR_NAME}/${input.transcriptStem}|逐字稿]]`,
   '',
   '## 完整性',
   renderCompletenessSection(input.seamReport, input.needsReview),
@@ -319,6 +327,35 @@ export const renderSystemRegion = (input: SystemRegionInput): string => [
   '## 相關會議',
   input.relatedSection,
 ].join('\n');
+
+/**
+ * 逐字稿檔全文。時間格式跟會議記錄的出處同一支 `formatEvidenceRange`，兩邊對得上。
+ * `resolved` 為 false 代表輸出的是段落原文，人名還沒校正，檔頭要講。
+ * 一段一行：段落文字裡的換行壓成空白，不然一段會拆成多行、讀不出段落界線。
+ */
+export const renderTranscriptFile = (input: {
+  meetingId: string;
+  title: string;
+  segments: readonly TranscriptSegment[];
+  resolved: boolean;
+}): string => {
+  const lines = input.segments.map((seg) => {
+    const range = formatEvidenceRange({ start: seg.start, end: seg.end });
+    const text = seg.text.replace(/\s*\n\s*/g, ' ').trim();
+    return seg.speaker ? `\`${range}\` ${seg.speaker}：${text}` : `\`${range}\` ${text}`;
+  });
+  return [
+    '---',
+    `${TRANSCRIPT_OF_FIELD}: ${input.meetingId}`,
+    '---',
+    '',
+    `# ${input.title}`,
+    '',
+    ...(input.resolved ? [] : ['人名尚未校正', '']),
+    ...lines,
+    '',
+  ].join('\n');
+};
 
 interface FrontmatterInput {
   meetpilotId: string;
@@ -511,6 +548,28 @@ export const createVaultProjector = (deps: VaultProjectorDeps) => {
   const now = deps.now ?? (() => Date.now());
   mkdirSync(vaultDir, { recursive: true });
 
+  /**
+   * 逐字稿檔該輸出哪一版。**只走唯讀路徑，不呼叫 `nameResolver.resolveTranscript`**：它會刪掉重寫
+   * 這場會的 `name_mentions`，人工確認過的衝突人名會被打回待確認。
+   * 現行逐字稿就是最近一次分析讀的那一版（provenance 的 source_kind／source_edit_version 對得上）
+   * 而且有快照，就輸出快照（已套人名校正，段落索引相同）；否則輸出現行逐字稿的段落原文，檔頭標「人名尚未校正」
+   */
+  const pickTranscriptSegments = (
+    meetingId: string,
+    transcript: CurrentTranscript,
+  ): { segments: readonly TranscriptSegment[]; resolved: boolean } => {
+    const provenance = store.getAnalysisProvenance(meetingId);
+    if (
+      provenance !== null
+      && provenance.resolved_segments_snapshot !== null
+      && provenance.source_kind === transcript.source_kind
+      && provenance.source_edit_version === transcript.source_edit_version
+    ) {
+      return { segments: provenance.resolved_segments_snapshot, resolved: true };
+    }
+    return { segments: transcript.segments, resolved: false };
+  };
+
   const project = (meetingId: string): ProjectionResult => {
     const meeting = store.getMeeting(meetingId);
     if (!meeting) throw new Error(`找不到 Meeting ${meetingId}`);
@@ -584,8 +643,29 @@ export const createVaultProjector = (deps: VaultProjectorDeps) => {
       meetpilotStatus, related, meeting.error, meetingId,
     );
 
+    // 會議記錄的檔案路徑先在這裡定下來：系統區的逐字稿 wikilink 要用它現行的 stem。
+    // 已投影過的沿用索引查到的現行路徑（人可能在 Obsidian 改過名）；第一次投影才現場決定檔名
+    const existingPath = index.get(meetingId);
+    let recordPath: string;
+    if (existingPath) {
+      recordPath = existingPath;
+    } else {
+      // 從沒投影過：檔名現在才決定，之後系統永不更改（SDD 1.3.1〈檔名與身分〉）
+      const stem = buildFileStem(meeting.created_at, title);
+      recordPath = join(vaultDir, `${stem}.md`);
+      if (existsSync(recordPath)) {
+        // 同一分鐘、標題正規化後撞名：這個檔名已經有別的內容佔著（通常是另一場會，也可能是人
+        // 自己放的筆記），不能不驗證就蓋過去——那正是「同一個 id 永遠對到同一個檔」這個不變量
+        // 要擋的事，只是這次是反過來（同一個檔名對到兩個不同的 id）。加短 id 後綴消歧義，
+        // 不猜哪一份對（code review 2026-09-18）
+        recordPath = join(vaultDir, `${stem} (${meetingId.slice(0, 8)}).md`);
+      }
+    }
+    const recordStem = basename(recordPath, '.md');
+
     const systemRegion = renderSystemRegion({
       title,
+      transcriptStem: recordStem,
       decisions: analysis.decisions,
       actionItems: analysis.action_items,
       openQuestions: analysis.open_questions,
@@ -609,21 +689,33 @@ export const createVaultProjector = (deps: VaultProjectorDeps) => {
       writeAtomic(path, assembleFile(frontmatter, systemRegion, manualRegionRaw));
     };
 
-    const existingPath = index.get(meetingId);
-
-    // 從沒投影過：檔名現在才決定，之後系統永不更改（SDD 1.3.1〈檔名與身分〉）
-    if (!existingPath) {
-      const stem = buildFileStem(meeting.created_at, title);
-      let path = join(vaultDir, `${stem}.md`);
-      if (existsSync(path)) {
-        // 同一分鐘、標題正規化後撞名：這個檔名已經有別的內容佔著（通常是另一場會，也可能是人
-        // 自己放的筆記），不能不驗證就蓋過去——那正是「同一個 id 永遠對到同一個檔」這個不變量
-        // 要擋的事，只是這次是反過來（同一個檔名對到兩個不同的 id）。加短 id 後綴消歧義，
-        // 不猜哪一份對（code review 2026-09-18）
-        path = join(vaultDir, `${stem} (${meetingId.slice(0, 8)}).md`);
+    // 會議記錄寫完再投影逐字稿：逐字稿寫失敗會往上拋（runProjection 大聲記 log），
+    // 這時會議記錄已經是最新的，不會因為逐字稿的問題整份停在舊版
+    const projectTranscript = (): void => {
+      if (!transcript) {
+        throw new Error(`Meeting ${meetingId} 有分析結果卻沒有逐字稿，無法投影逐字稿`);
       }
-      writeProjection(path, '', MANUAL_SYNTAX_VERSION);
-      return { status: 'written', path };
+      const { segments, resolved } = pickTranscriptSegments(meetingId, transcript);
+      const transcriptDir = join(vaultDir, TRANSCRIPT_DIR_NAME);
+      mkdirSync(transcriptDir, { recursive: true });
+      const transcriptPath = join(transcriptDir, `${recordStem}.md`);
+      writeAtomic(transcriptPath, renderTranscriptFile({ meetingId, title, segments, resolved }));
+      // 會議記錄被人改名後 stem 跟舊逐字稿不同：同一個 id 不留兩份，用 frontmatter 找舊檔刪掉
+      for (const name of readdirSync(transcriptDir)) {
+        if (!name.endsWith('.md')) continue;
+        const otherPath = join(transcriptDir, name);
+        if (otherPath === transcriptPath) continue;
+        if (extractFrontmatterField(readVaultFile(otherPath), TRANSCRIPT_OF_FIELD) === meetingId) {
+          rmSync(otherPath);
+        }
+      }
+    };
+
+    // 從沒投影過
+    if (!existingPath) {
+      writeProjection(recordPath, '', MANUAL_SYNTAX_VERSION);
+      projectTranscript();
+      return { status: 'written', path: recordPath };
     }
 
     // 已經投影過：驗證系統區沒被人動過，才能安全整份重寫
@@ -640,6 +732,7 @@ export const createVaultProjector = (deps: VaultProjectorDeps) => {
       const conflictPath = `${existingPath.slice(0, -3)}${CONFLICT_INFIX}${conflictSuffix}.md`;
       renameSync(existingPath, conflictPath);
       writeProjection(existingPath, '', MANUAL_SYNTAX_VERSION);
+      projectTranscript();
       return { status: 'conflict', path: existingPath, conflictPath };
     }
 
@@ -654,6 +747,7 @@ export const createVaultProjector = (deps: VaultProjectorDeps) => {
       : MANUAL_SYNTAX_VERSION;
 
     writeProjection(existingPath, manualRegionRaw, manualSyntaxVersion);
+    projectTranscript();
     return { status: 'written', path: existingPath };
   };
 
