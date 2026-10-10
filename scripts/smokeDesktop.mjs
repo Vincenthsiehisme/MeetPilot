@@ -371,7 +371,8 @@ const recording = await waitFor(phase, '會議進入錄音中', async () => {
   return meetings.find((m) => m.status === 'RECORDING') ?? null;
 });
 if (recording.recording_method !== 'in_app') await fail(phase, `錄音方式是 ${recording.recording_method}，不是 in_app`);
-if (!readLog().includes('錄音開始（頁面回報）')) await fail(phase, '頁面沒有告訴外殼錄音開始了（擋睡眠、結束前確認都靠它）');
+// 頁面先等 server 記下開始（會議變 RECORDING），接上 MediaRecorder 之後才經 IPC 告訴外殼，所以要等，不能看到 RECORDING 當下就讀
+await waitFor(phase, '頁面告訴外殼錄音開始了（擋睡眠、結束前確認都靠它）', () => readLog().includes('錄音開始（頁面回報）'), 10_000);
 
 // 關到系統匣：頁面還活著，段落照常送
 // 跟使用者按視窗的關閉鈕同一條路（BrowserWindow.close() → close 事件 → 外殼藏起視窗）
