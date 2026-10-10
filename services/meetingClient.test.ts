@@ -7,6 +7,7 @@ import {
   importLegacyJobs,
   listMeetings,
   listPeopleWithSingleRetry,
+  meetingContextField,
   patchAnalysis,
   patchTitle,
   patchTranscript,
@@ -234,7 +235,7 @@ describe('meetingClient', () => {
     fetchMock.mockResolvedValueOnce(respond(202, JSON.stringify({ meeting: meeting({ status: 'TRANSCRIBING' }) })));
     const onCreated = vi.fn();
 
-    const back = await submitAudio(new File(['x'], 'b.wav'), { meetingId: 'm_existing' }, null, onCreated);
+    const back = await submitAudio(new File(['x'], 'b.wav'), { meetingId: 'm_existing' }, null, null, onCreated);
 
     expect(back.status).toBe('TRANSCRIBING');
     expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -252,7 +253,7 @@ describe('meetingClient', () => {
       .mockResolvedValueOnce(respond(202, JSON.stringify({ meeting: meeting({ status: 'TRANSCRIBING' }) })));
     const onCreated = vi.fn();
 
-    await submitAudio(new File(['x'], 'a.m4a'), null, ['p-1'], onCreated);
+    await submitAudio(new File(['x'], 'a.m4a'), null, ['p-1'], null, onCreated);
 
     expect(fetchMock.mock.calls.map(([url, init]: any[]) => `${init.method} ${url}`)).toEqual([
       'POST /api/meetings',
@@ -261,13 +262,44 @@ describe('meetingClient', () => {
     expect(onCreated).toHaveBeenCalledWith(created);
   });
 
+  it('新建時背景補充帶進 POST 的 meetingContext，頭尾空白去掉', async () => {
+    fetchMock
+      .mockResolvedValueOnce(respond(201, JSON.stringify({ meeting: meeting() })))
+      .mockResolvedValueOnce(respond(202, JSON.stringify({ meeting: meeting({ status: 'TRANSCRIBING' }) })));
+
+    await submitAudio(new File(['x'], 'a.m4a'), null, ['p-1'], '  第三次談採購  ');
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+      fileName: 'a.m4a', fileSize: 1, participantIds: ['p-1'], meetingContext: '第三次談採購',
+    });
+  });
+
+  it('背景補充是空白或 null 時 POST 不帶 meetingContext 這個欄位', async () => {
+    for (const blank of ['', '   \n ', null]) {
+      fetchMock.mockReset();
+      fetchMock
+        .mockResolvedValueOnce(respond(201, JSON.stringify({ meeting: meeting() })))
+        .mockResolvedValueOnce(respond(202, JSON.stringify({ meeting: meeting({ status: 'TRANSCRIBING' }) })));
+
+      await submitAudio(new File(['x'], 'a.m4a'), null, ['p-1'], blank);
+
+      expect(Object.keys(JSON.parse(fetchMock.mock.calls[0][1].body))).not.toContain('meetingContext');
+    }
+  });
+
+  it('meetingContextField：錄音建會議用同一支判斷，空白回空物件', () => {
+    expect(meetingContextField('  ')).toEqual({});
+    expect(meetingContextField(null)).toEqual({});
+    expect(meetingContextField(' 季度檢討 ')).toEqual({ meetingContext: '季度檢討' });
+  });
+
   it('建立成功但上傳失敗時，呼叫端已經拿到那場會的 id（才找得到它去補音檔）', async () => {
     fetchMock
       .mockResolvedValueOnce(respond(201, JSON.stringify({ meeting: meeting() })))
       .mockResolvedValueOnce(respond(500, JSON.stringify({ error: '寫入音檔失敗' })));
     const onCreated = vi.fn();
 
-    await expect(submitAudio(new File(['x'], 'a.m4a'), null, ['p-1'], onCreated)).rejects.toThrow('寫入音檔失敗');
+    await expect(submitAudio(new File(['x'], 'a.m4a'), null, ['p-1'], null, onCreated)).rejects.toThrow('寫入音檔失敗');
     expect(onCreated).toHaveBeenCalledWith(meeting());
   });
 

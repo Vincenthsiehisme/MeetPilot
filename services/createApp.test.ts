@@ -1049,6 +1049,24 @@ describe('POST /api/meetings 帶 title', () => {
   });
 });
 
+describe('POST /api/meetings 帶 meetingContext（背景補充）', () => {
+  it('存進 meeting_context，pipeline 分析時讀的就是這一欄', async () => {
+    await start();
+    const { status, body } = await createMeeting({
+      fileName: 'a.m4a', fileSize: 10, meetingContext: '第三次談採購', participantIds: [TEST_EMPLOYEE_ID],
+    });
+    expect(status).toBe(201);
+    expect(body.meeting.meeting_context).toBe('第三次談採購');
+    expect(store.getMeeting(body.meeting.meeting_id)!.meeting_context).toBe('第三次談採購');
+  });
+
+  it('沒給是 null', async () => {
+    await start();
+    const { body } = await createMeeting({ fileName: 'a.m4a', fileSize: 10, participantIds: [TEST_EMPLOYEE_ID] });
+    expect(body.meeting.meeting_context).toBeNull();
+  });
+});
+
 describe('PATCH /api/meetings/:id/title', () => {
   const readyMeeting = (id = 'm-1') => {
     store.createMeeting({ meeting_id: id, created_at: T0, source_file_name: 'a.m4a', source_file_size: 1 });
