@@ -125,7 +125,7 @@ server 端 ffmpeg）。**2026-09-20 更新：`askDocumentStream` 連同整個問
 
 所以 `callees` 對 generator 沒有意義，空和非空都不能當證據。要確認某個函式有沒有走共用
 路徑，只有讀碼算數。`callers` 從共用函式那頭反查可以縮小範圍，但**它只到檔案層級**：
-當時 `codegraph callers postStream` 回的是 `file geminiService.ts`，不會指名 `askDocumentStream`
+當時 `codegraph callers postStream` 回的是一個檔案節點（該檔已刪），不會指名 `askDocumentStream`
 （兩個符號都已隨問答功能刪除，這裡留的是行為紀錄）。
 
 **三、符號查詢是模糊比對，查一個不存在的名字可能拿到別人的答案。** 2026-09-14 刪掉
@@ -163,12 +163,10 @@ codegraph affected --stdin --quiet --filter "services/*.test.ts"
 | `services/transcriptMerge.ts` | `transcriptMerge.test.ts` | — |
 | `services/httpGuards.ts` | `httpGuards.test.ts` | — |
 | `services/transcribeSegments.ts` | `transcribeSegments.test.ts` | — |
-| `services/retryPolicy.ts` | `retryPolicy.test.ts` | — |
-| `services/httpError.ts` | `retryPolicy.test.ts` | — |
+| `services/httpError.ts` | `httpError.test.ts` | — |
 | `services/printDocument.ts` | `printDocument.test.ts` | — |
 | `services/escapeHtml.ts` | `escapeHtml.test.ts`、`printDocument.test.ts` | — |
 | `services/storageService.ts` | **（空）** | **假的空。有測試**，但 `storageService.test.ts` 用 `vi.resetModules()` ＋ `await import('./storageService')` 動態載入（為了清模組層的連線快取），圖上沒有 import 邊 |
-| `services/geminiService.ts` | （2026-09-14 實測時空） | 當時真的空；之後加了 `geminiService.test.ts`，這一列**未重測**，別當成現況 |
 | `server.ts` | （空） | 真的空 |
 | `App.tsx` | （空） | 真的空 |
 
@@ -251,6 +249,7 @@ function f(p: Pick) {
 - **隨附的 ffmpeg 只開了 server 用得到的元件**（`scripts/ffmpeg/configure-flags.txt`）。server 改用新的 ffmpeg 功能
   （新的濾鏡、編碼器、容器）時，開發機上的完整版 ffmpeg 照樣能跑、三條 gate 照樣綠，打包後才壞。改 `audioSlicer.ts`
   的 ffmpeg 參數時，同一個 PR 要在 flags 加元件並跑 `npm run ffmpeg:verify`；新格式要加一支 fixture。
+  目前切片的輸出是 FLAC（送 Gemini）與 WAV（音量檢查），兩者的 encoder 與 muxer 都在 flags 裡。
 - **icon 與托盤圖示由 `npm run icons:build` 產生**（圖案在 `scripts/icon/iconArtwork.ts`），不要手改 `build/icon.*`
   或 `electron/assets/*.png`，下次重跑就被蓋掉。托盤的 `trayTemplate*.png` 是 macOS template：只能有黑色與透明，
   檔名結尾 `Template` 不能改，系統靠它判斷要依深淺模式上色。

@@ -4,7 +4,7 @@
 #   scripts/ffmpeg/build.sh <mac-arm64|mac-x64|win-x64>
 #
 # 輸出到 vendor/ffmpeg/<目標>/，electron-builder 依平台與架構打進安裝檔。
-# 只開 server 用得到的東西（configure-flags.txt）：音訊解碼、容器、WAV 輸出、重採樣。沒有 --enable-gpl，
+# 只開 server 用得到的東西（configure-flags.txt）：音訊解碼、容器、WAV 與 FLAC 輸出、重採樣。沒有 --enable-gpl，
 # 也沒有任何外部函式庫，授權是 LGPL 2.1 以上；configure 的輸出不是「License: LGPL version 2.1 or later」就失敗。
 # 輸出目錄附 LICENSE-ffmpeg.txt（LGPL 全文）與 NOTICE-ffmpeg.txt（版本、原始碼取得方式、configure 參數、
 # 連進執行檔的 MIT 授權檔案聲明），electron-builder 一起打進安裝檔。
