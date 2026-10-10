@@ -242,7 +242,7 @@ export function createApp(deps: AppDeps): express.Express {
     const result = apiRateLimiter.check(clientIp);
     if (!result.allowed) {
       res.setHeader('Retry-After', String(result.retryAfterSeconds));
-      // 前端 services/retryPolicy.ts 靠 HttpError.status === 429 加 Retry-After 決定退避；訊息帶 "429" 是給人看的，也讓 translateError 分類得到
+      // 前端 services/httpResponse.ts 把 429 與 Retry-After 翻成 HttpError；訊息帶 "429" 是給人看的，也讓 translateError 分類得到
       return res.status(429).json({ error: `請求太頻繁 (HTTP 429)，請 ${result.retryAfterSeconds} 秒後再試` });
     }
     next();
