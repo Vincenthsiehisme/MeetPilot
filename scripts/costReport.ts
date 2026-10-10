@@ -352,7 +352,9 @@ export function loadMeetingTitles(personDir: string): Map<string, string> {
   return titles;
 }
 
-const monthOf = (ts: string): string => ts.slice(0, 7);
+/** 台灣沒有日光節約，固定 UTC+8。月份用台灣時間分組；換價日不走這裡，`priceFor` 另用 UTC 日期 */
+const TAIPEI_OFFSET_MS = 8 * 60 * 60_000;
+export const monthOf = (ts: string): string => new Date(Date.parse(ts) + TAIPEI_OFFSET_MS).toISOString().slice(0, 7);
 
 function buildPerson(shared: string, name: string, prices: readonly PriceRow[], now: Date): PersonReport {
   const personDir = join(shared, name);
@@ -503,7 +505,7 @@ export function renderCostReport(report: CostReport): string {
   out.push('# MeetPilot 成本總覽', '');
   out.push(`產生時間：${report.generatedAt}`);
   out.push(`共享資料夾：${report.sharedRoot}`);
-  out.push('', '金額是依價目表（`scripts/geminiPrices.json`）算的估算，不是帳單。月份與換價日都以呼叫時間的 UTC 日期為準。');
+  out.push('', '金額是依價目表（`scripts/geminiPrices.json`）算的估算，不是帳單。月份用台灣時間（UTC+8）分組。價目表的換價日用呼叫時間的 UTC 日期比。');
   out.push('「其中失敗重試」是 outcome 不是 ok 且有回傳 token 的呼叫金額，已含在估算花費裡。');
   out.push('`_診斷/llm.jsonl` 只在會議走到終點時更新，最近還在跑的會議可能還沒算進來。', '');
 

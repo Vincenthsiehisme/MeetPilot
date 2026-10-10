@@ -239,7 +239,7 @@ describe('檔案輸入輸出', () => {
         // M1：embed 未計
         line({ kind: 'embed', meetingId: M1, model: 'gemini-embedding-001', promptTokens: null, outputTokens: null, thoughtsTokens: null }),
         // M2：沒有對應的會議記錄，標題退回 meetingId 前 8 碼
-        line({ kind: 'analyze', meetingId: M2, promptTokens: 2_000_000, outputTokens: 0, thoughtsTokens: 0, ts: '2026-10-31T23:00:00Z' }),
+        line({ kind: 'analyze', meetingId: M2, promptTokens: 2_000_000, outputTokens: 0, thoughtsTokens: 0, ts: '2026-10-31T10:00:00Z' }),
         // M2：跨月，11 月那一列另算
         line({ kind: 'analyze', meetingId: M2, promptTokens: 1_000_000, outputTokens: 0, thoughtsTokens: 0, ts: '2026-11-01T01:00:00Z' }),
         // 未歸屬
@@ -266,6 +266,22 @@ describe('檔案輸入輸出', () => {
       expect(m1.bucket.cost).toBeCloseTo(2.25, 10);
       expect(m1.bucket.failedCost).toBeCloseTo(0.75, 10);
       expect(m1.bucket.byKind.get('transcribe')!.failedCalls).toBe(2);
+    });
+
+    it('月份用台灣時間分組，換價日用 UTC 日期', () => {
+      const tw = join(root, 'tz');
+      mkdirSync(join(tw, 'x', '_診斷'), { recursive: true });
+      writeFileSync(join(tw, 'x', '_診斷', 'llm.jsonl'), [
+        // 台灣 10/01 01:00，UTC 還在 9 月
+        line({ meetingId: M1, ts: '2026-09-30T17:00:00Z', promptTokens: 1_000_000, outputTokens: 0, thoughtsTokens: 0 }),
+        // UTC 12-31 用舊價 0.75，台灣已是 2027-01-01 04:00
+        line({ meetingId: M2, ts: '2026-12-31T20:00:00Z', promptTokens: 1_000_000, outputTokens: 0, thoughtsTokens: 0 }),
+      ].join('\n'));
+      const x = buildCostReport(tw, prices, now).people[0];
+      expect([...x.months.keys()]).toEqual(['2026-10', '2027-01']);
+      expect(x.months.get('2026-10')!.cost).toBeCloseTo(0.75, 10);
+      expect(x.months.get('2027-01')!.cost).toBeCloseTo(0.75, 10);
+      expect(x.meetings.map((m) => m.month)).toEqual(['2026-10', '2027-01']);
     });
 
     it('embed 與沒有 token 的呼叫不算進金額，只計次數', () => {
