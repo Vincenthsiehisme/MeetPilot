@@ -15,7 +15,7 @@ export interface JobWorker {
   poke(): void;
   /** 目前真的在跑幾個 job */
   readonly active: number;
-  /** 測試用：等所有正在跑的 job 都跑完（成功或失敗）。正式流程不需要等 */
+  /** 測試用：等所有正在跑的 job 都跑完（成功或失敗）。不等冷卻中的重試。正式流程不需要等 */
   whenIdle(): Promise<void>;
 }
 
@@ -37,22 +37,49 @@ export interface JobWorkerDeps {
    * `outcome` 分得出兩者）。轉錄 worker 用它在 `outcome === 'failed'` 時呼叫
    * `transcriptionPipeline.markTranscriptionFailed` 把 meeting 轉成真正的終態。
    *
-   * **退回 queued 的 job 沒有 backoff，可能立刻在同一輪被同一個 worker 重新搶到重跑**
-   * （見 `runOne` 的 `finally`）。這是刻意的簡化：`generateContentWithFallback` 自己會等：
-   * 空輸出與 503 等 1、2 秒，限流照回應的 `retryDelay` 等、最多 60 秒（vault plan「MeetPilot ·
-   * Gemini 限流退避」），會走到 job 級失敗的通常是限流持續好幾分鐘、或更嚴重的問題，
-   * `max_attempts` 設得小，立即重試的代價可接受。限流持續到三次立刻重試都用完時會議會 FAILED，
-   * 這包刻意不處理（要改 `jobs` schema）。
-   * 之後如果真的需要 backoff，加在這裡（`onFailure` 裡 delay 後再 `poke()`）不用動這支本身。
+   * 退回 queued 時這個 worker 會先冷卻（見 `cooldownMs`），冷卻完才再搶。
    */
   onFailure?: (meetingId: string, outcome: 'queued' | 'failed', err: unknown) => void;
   now?: () => number;
+  /**
+   * job 第 n 次失敗、退回 queued 之後，這個 worker 停手多久才再搶（毫秒）。預設 30 秒乘 n
+   * （`JOB_RETRY_COOLDOWN_STEP_MS`）。測試注入別的值；正式流程用預設。
+   */
+  cooldownMs?: (failureCount: number) => number;
 }
+
+/** job 退回 queued 後的冷卻：第 n 次失敗等這個值乘 n */
+export const JOB_RETRY_COOLDOWN_STEP_MS = 30_000;
 
 export function createJobWorker(deps: JobWorkerDeps): JobWorker {
   const now = deps.now ?? (() => Date.now());
+  const cooldownMs = deps.cooldownMs ?? ((failureCount: number) => JOB_RETRY_COOLDOWN_STEP_MS * failureCount);
   let active = 0;
   const running = new Set<Promise<void>>();
+
+  /**
+   * 冷卻（vault plan「MeetPilot · 記錄完整度、成本與背景運作」AC-5）：以前退回 queued 的 job
+   * 會在同一輪 `finally` 的 `tick()` 被立刻搶回來重跑，造成失敗的原因（網路斷線、限流持續）
+   * 多半還沒過去，`max_attempts` 很快用完、會議直接 FAILED。冷卻期間整個 worker 不搶（`poke()` 也不搶），
+   * 等到時才 `tick()`；不改 `jobs` schema，冷卻只活在這個 process 的記憶體裡，
+   * server 重啟後 `reclaimAllActive` 退回的 job 照常立刻搶，那是另一件事。
+   *
+   * 已經在冷卻時又有 job 失敗（`concurrency` > 1），取比較晚到期的那個，不重設成比較短的。
+   */
+  let cooldownTimer: ReturnType<typeof setTimeout> | null = null;
+  let cooldownUntil = 0;
+  const startCooldown = (ms: number): void => {
+    const until = now() + ms;
+    if (cooldownTimer !== null && until <= cooldownUntil) return;
+    if (cooldownTimer !== null) clearTimeout(cooldownTimer);
+    cooldownUntil = until;
+    cooldownTimer = setTimeout(() => {
+      cooldownTimer = null;
+      void tick();
+    }, ms);
+    // 只為了等冷卻不該把 process 吊著不讓它結束
+    cooldownTimer.unref?.();
+  };
 
   const runOne = async (): Promise<void> => {
     const job = deps.jobs.claim(deps.kind, deps.workerId, deps.leaseMs, now());
@@ -70,10 +97,13 @@ export function createJobWorker(deps: JobWorkerDeps): JobWorker {
           err instanceof Error ? err.message : String(err),
           now(),
         );
+        // job.attempt 是這次搶到時的值（從 0 起算），這次失敗是第 attempt + 1 次
+        if (outcome === 'queued') startCooldown(cooldownMs(job.attempt + 1));
         deps.onFailure?.(job.meeting_id, outcome, err);
       } finally {
         active -= 1;
-        // 空出一個名額，可能還有排隊的下一筆，同一個 tick 裡繼續搶，不用等下一次 poke
+        // 空出一個名額，可能還有排隊的下一筆，同一個 tick 裡繼續搶，不用等下一次 poke。
+        // 冷卻中的話 tick 直接回，等冷卻到期再搶
         void tick();
       }
     })();
@@ -85,6 +115,7 @@ export function createJobWorker(deps: JobWorkerDeps): JobWorker {
   };
 
   const tick = async (): Promise<void> => {
+    if (cooldownTimer !== null) return;
     if (active >= deps.concurrency) return;
     await runOne();
   };

@@ -254,6 +254,26 @@ describe('fallback 鏈', () => {
     expect(logged.slice(0, 2).map(l => l.transientReason)).toEqual(['rate_limited', 'rate_limited']);
   });
 
+  it('fetch failed 走 retry：同一個 model 重試再退到下一個，不第一次就往上拋（AC-5）', async () => {
+    vi.useFakeTimers();
+    const fetchFailed = () => Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }),
+    });
+    generateContent
+      .mockRejectedValueOnce(fetchFailed())
+      .mockRejectedValueOnce(fetchFailed())
+      .mockResolvedValueOnce({ text: '{"segments":[]}' });
+
+    const pending = client().transcribeSlice({ base64Data: 'AAAA' });
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    await expect(pending).resolves.toEqual([]);
+    expect(generateContent.mock.calls.map(c => (c[0] as any).model)).toEqual([
+      'gemini-3.8-flash', 'gemini-3.8-flash', 'gemini-3.1-flash-lite',
+    ]);
+    expect(logged.map(l => l.outcome)).toEqual(['transient', 'transient', 'ok']);
+  });
+
   it('不可重試的錯誤第一次就往上拋，不退到 fallback 鏈後面', async () => {
     generateContent.mockRejectedValue(new Error('400 Invalid argument'));
 
@@ -501,6 +521,21 @@ describe('isTransientLlmError', () => {
     expect(isTransientLlmError(new Error('model is overloaded'))).toBe(true);
     expect(isTransientLlmError(new Error('invalid api key'))).toBe(false);
     expect(isTransientLlmError(undefined)).toBe(false);
+  });
+
+  it('網路層錯誤（fetch failed、連線被重設、逾時）算 transient（AC-5）', () => {
+    // Node 內建 fetch（undici）的形狀：訊息只有 fetch failed，原因在 cause
+    expect(isTransientLlmError(new TypeError('fetch failed'))).toBe(true);
+    expect(isTransientLlmError(Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' }),
+    }))).toBe(true);
+    expect(isTransientLlmError(Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }))).toBe(true);
+    expect(isTransientLlmError(Object.assign(new Error('boom'), { cause: { code: 'ETIMEDOUT' } }))).toBe(true);
+    expect(isTransientLlmError(Object.assign(new Error('boom'), { cause: { code: 'UND_ERR_CONNECT_TIMEOUT' } }))).toBe(true);
+    expect(isTransientLlmError(new Error('socket hang up'))).toBe(true);
+    expect(isTransientLlmError(new Error('Request timed out'))).toBe(true);
+    // 不是網路層的錯誤照舊算 fatal
+    expect(isTransientLlmError(Object.assign(new Error('400 Invalid argument'), { cause: { code: 'ERR_INVALID_ARG' } }))).toBe(false);
   });
 });
 

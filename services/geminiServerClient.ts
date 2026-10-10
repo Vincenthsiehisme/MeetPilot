@@ -124,23 +124,57 @@ export function cleanJsonString(str: string | undefined): string {
   return cleaned;
 }
 
+// 網路層的錯誤碼：Node 內建 fetch（undici）連線失敗只丟一句 `fetch failed`，真正的原因在 `cause.code`
+const TRANSIENT_NETWORK_CODES = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ECONNABORTED',
+  'ETIMEDOUT',
+  'EPIPE',
+  'EAI_AGAIN',
+  'ENETUNREACH',
+  'EHOSTUNREACH',
+  'UND_ERR_SOCKET',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT',
+]);
+
 /**
  * 這個錯誤值不值得退到 fallback 鏈的下一個。
  *
  * W4 把它從 `generateContentWithFallback` 的 body 抽出來（判斷字串逐字相同，行為未變），
  * 因為 embedding 沒有 fallback 鏈卻一樣要在紀錄裡分得出 transient 與 fatal。
  * 留兩份的話，之後加一個新的限流訊息只會改到其中一份，而紀錄上看不出哪一份沒改。
+ *
+ * 網路層錯誤（`fetch failed`、連線被重設、逾時）也算 transient（vault plan「MeetPilot · 記錄完整度、
+ * 成本與背景運作」AC-5）：09-16～10-08 的紀錄裡 `fetch failed` 共 13 次，以前一次就判 fatal，
+ * 這一片直接失敗、整個 job 退回重來，其實換一次連線多半就過了。
  */
 export function isTransientLlmError(err: any): boolean {
   const msg = (err?.message || '').toLowerCase();
-  return (
+  if (
     msg.includes('503') ||
     msg.includes('unavailable') ||
     msg.includes('high demand') ||
     msg.includes('429') ||
     msg.includes('resource_exhausted') ||
     msg.includes('overloaded')
-  );
+  ) {
+    return true;
+  }
+  if (
+    msg.includes('fetch failed') ||
+    msg.includes('socket hang up') ||
+    msg.includes('other side closed') ||
+    msg.includes('timed out') ||
+    msg.includes('timeout')
+  ) {
+    return true;
+  }
+  const codes = [err?.code, err?.cause?.code].filter((code): code is string => typeof code === 'string');
+  return codes.some((code) => TRANSIENT_NETWORK_CODES.has(code))
+    || [...TRANSIENT_NETWORK_CODES].some((code) => msg.includes(code.toLowerCase()));
 }
 
 class RetryableLlmResponseError extends Error {
@@ -554,7 +588,7 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
         base64Data,
         offsetSeconds = 0,
         previousContext = '',
-        mimeType = 'audio/wav',
+        mimeType = 'audio/flac',
         sliceDurationSeconds,
         meetingId,
         participantNames,
