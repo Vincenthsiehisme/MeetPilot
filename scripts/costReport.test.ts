@@ -19,6 +19,7 @@ import {
   renderCostReport,
   resolveSharedRoot,
   STATUS_CLASSES,
+  unpricedWarning,
   type CallRecord,
   type StatusMeeting,
 } from './costReport';
@@ -63,8 +64,13 @@ describe('價目表', () => {
     expect(() => priceFor(prices, 'gemini-3.8-flash', '2025-12-31T23:59:59Z')).toThrow(/2026-01-01/);
   });
 
-  it('價目表沒有的模型報錯並指向價目表', () => {
-    expect(() => costOfCall(call({ model: 'gemini-9-ultra' }), prices)).toThrow(/gemini-9-ultra.*geminiPrices\.json/);
+  it('priceFor 對價目表沒有的模型報錯並指向價目表', () => {
+    expect(() => priceFor(prices, 'gemini-9-ultra', '2026-10-01T00:00:00Z')).toThrow(/gemini-9-ultra.*geminiPrices\.json/);
+  });
+
+  it('價目表沒有的模型、有 token：不算進金額，列未計價，不猜價', () => {
+    const r = costOfCall(call({ model: 'gemini-flash-latest', promptTokens: 500, outputTokens: 200, thoughtsTokens: 100 }), prices);
+    expect(r).toEqual({ amount: null, uncounted: 'unpriced' });
   });
 
   it('格式不對的價目表報錯', () => {
@@ -242,12 +248,17 @@ describe('檔案輸入輸出', () => {
         line({ kind: 'analyze', meetingId: M2, promptTokens: 2_000_000, outputTokens: 0, thoughtsTokens: 0, ts: '2026-10-31T10:00:00Z' }),
         // M2：跨月，11 月那一列另算
         line({ kind: 'analyze', meetingId: M2, promptTokens: 1_000_000, outputTokens: 0, thoughtsTokens: 0, ts: '2026-11-01T01:00:00Z' }),
+        // 價目表沒有的模型但有 token：不算金額，列在「價目表沒有的模型」
+        line({ kind: 'analyze', meetingId: M1, model: 'gemini-flash-latest', promptTokens: 500, outputTokens: 200, thoughtsTokens: 100 }),
         // 未歸屬
         line({ kind: 'polish', meetingId: null, promptTokens: 1_000_000, outputTokens: 0, thoughtsTokens: 0 }),
         '',
       ].join('\n'));
       p('雪芳/_診斷/llm.jsonl', `${line({ kind: 'link-judge', meetingId: M3, model: 'gemini-3.1-flash-lite', promptTokens: 4_000_000, outputTokens: 0, thoughtsTokens: 0 })}\n`);
       p('阿明/readme.txt', 'x');
+      // 不是記錄人的資料夾：_ 或 . 開頭
+      p('_更新/_診斷/llm.jsonl', `${line({ model: 'gemini-9-ultra' })}\n`);
+      p('.obsidian/app.json', '{}');
     });
 
     it('分人：每個子資料夾一位，缺 llm.jsonl 的標出來', () => {
@@ -326,12 +337,42 @@ describe('檔案輸入輸出', () => {
       expect(md).toMatch(/\| embedding \| 未計 \|/);
     });
 
-    it('共享資料夾不存在報錯；紀錄裡有價目表沒有的模型時整份報錯', () => {
+    it('共享資料夾不存在報錯', () => {
       expect(() => buildCostReport(join(root, 'nope'), prices, now)).toThrow(/不存在/);
-      const bad = join(root, 'bad');
+    });
+
+    it('第一層以 _ 或 . 開頭的資料夾不是記錄人，不列進總覽', () => {
+      const report = buildCostReport(shared, prices, now);
+      expect(report.people.map((x) => x.name)).toEqual(['妍均', '阿明', '雪芳']);
+      const md = renderCostReport(report);
+      expect(md).not.toContain('_更新');
+      expect(md).not.toContain('.obsidian');
+      expect(md).not.toContain('gemini-9-ultra');
+    });
+
+    it('價目表沒有的模型（有 token）不讓總覽報錯：不算金額、逐模型列次數與 token、總計多一欄、CLI 有警告', () => {
+      const report = buildCostReport(shared, prices, now);
+      const yan = report.people[0];
+      // flash-latest 那筆沒有加進金額
+      expect(yan.total.cost).toBeCloseTo(0.75 + 0.75 + 0.75 + 1.5 + 0.75 + 0.75, 10);
+      expect(yan.total.unpriced).toBe(1);
+      expect(report.total.unpriced).toBe(1);
+      expect(report.unpricedModels).toEqual([{ model: 'gemini-flash-latest', calls: 1, promptTokens: 500, outputTokens: 200, thoughtsTokens: 100 }]);
+      const md = renderCostReport(report);
+      expect(md).toContain('## 價目表沒有的模型');
+      expect(md).toMatch(/\| gemini-flash-latest \| 1 \| 500 \| 200 \| 100 \|/);
+      expect(md).toContain('未計價呼叫');
+      expect(md).toContain('1 次呼叫的模型不在價目表');
+      expect(unpricedWarning(report)).toMatch(/gemini-flash-latest.*geminiPrices\.json/);
+    });
+
+    it('沒有未計價的模型時不印警告、不開那一段', () => {
+      const bad = join(root, 'clean');
       mkdirSync(join(bad, 'x', '_診斷'), { recursive: true });
-      writeFileSync(join(bad, 'x', '_診斷', 'llm.jsonl'), `${line({ model: 'gemini-9-ultra' })}\n`);
-      expect(() => buildCostReport(bad, prices, now)).toThrow(/gemini-9-ultra/);
+      writeFileSync(join(bad, 'x', '_診斷', 'llm.jsonl'), `${line({})}\n`);
+      const report = buildCostReport(bad, prices, now);
+      expect(unpricedWarning(report)).toBeNull();
+      expect(renderCostReport(report)).not.toContain('價目表沒有的模型');
     });
   });
 });

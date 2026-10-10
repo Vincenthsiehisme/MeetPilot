@@ -132,16 +132,19 @@ export function parseLlmLog(text: string, source: string): CallRecord[] {
  * 單筆估算。`amount` 是 null 代表「未計」：
  * - `embed`：紀錄沒有 token 數，不算進金額，也不查價（embedding 模型不在價目表）。
  * - `no-tokens`：三個 token 欄都是 null（失敗在拿到回應之前，或 SDK 沒回用量），沒有數字可乘，不查價也不當 0 金額。
- * 其餘一律查價目表，模型不在表裡或呼叫日早於生效日就拋。`thoughtsTokens` 為 null 當 0。
+ * - `unpriced`：有 token 但價目表完全沒有這個模型（例如 fallback 鏈最後的 `gemini-flash-latest`）。不猜價、不當 0，
+ *   不算進金額，由呼叫端另列「價目表沒有的模型」並在 CLI 警告。
+ * 價目表有這個模型、但呼叫日早於最早生效日，仍然拋（那是價目表寫錯，不是新模型）。`thoughtsTokens` 為 null 當 0。
  */
 export function costOfCall(
   rec: CallRecord,
   prices: readonly PriceRow[],
-): { amount: number | null; uncounted: 'embed' | 'no-tokens' | null } {
+): { amount: number | null; uncounted: 'embed' | 'no-tokens' | 'unpriced' | null } {
   if (rec.kind === 'embed') return { amount: null, uncounted: 'embed' };
   if (rec.promptTokens === null && rec.outputTokens === null && rec.thoughtsTokens === null) {
     return { amount: null, uncounted: 'no-tokens' };
   }
+  if (!prices.some((p) => p.model === rec.model)) return { amount: null, uncounted: 'unpriced' };
   const price = priceFor(prices, rec.model, rec.ts);
   const inputRate = rec.kind === 'transcribe' && price.audioInputPerM !== undefined ? price.audioInputPerM : price.inputPerM;
   const amount = ((rec.promptTokens ?? 0) * inputRate + ((rec.outputTokens ?? 0) + (rec.thoughtsTokens ?? 0)) * price.outputPerM) / 1_000_000;
@@ -269,19 +272,22 @@ export interface Totals {
   failedCost: number;
   calls: number;
   failedCalls: number;
-  /** 沒有金額的呼叫數（embed 與沒有 token 數的） */
+  /** 沒有金額的呼叫數（embed、沒有 token 數的、價目表沒有模型的） */
   uncounted: number;
+  /** uncounted 裡「價目表沒有這個模型」的那幾次 */
+  unpriced: number;
 }
 
 export interface Bucket extends Totals {
   byKind: Map<string, Totals>;
 }
 
-const emptyTotals = (): Totals => ({ cost: 0, failedCost: 0, calls: 0, failedCalls: 0, uncounted: 0 });
+const emptyTotals = (): Totals => ({ cost: 0, failedCost: 0, calls: 0, failedCalls: 0, uncounted: 0, unpriced: 0 });
 const emptyBucket = (): Bucket => ({ ...emptyTotals(), byKind: new Map() });
 
-function addTo(t: Totals, amount: number | null, failed: boolean): void {
+function addTo(t: Totals, amount: number | null, failed: boolean, unpriced: boolean): void {
   t.calls += 1;
+  if (unpriced) t.unpriced += 1;
   if (failed) t.failedCalls += 1;
   if (amount === null) {
     t.uncounted += 1;
@@ -291,11 +297,11 @@ function addTo(t: Totals, amount: number | null, failed: boolean): void {
   if (failed) t.failedCost += amount;
 }
 
-function addCall(bucket: Bucket, kind: string, amount: number | null, failed: boolean): void {
-  addTo(bucket, amount, failed);
+function addCall(bucket: Bucket, kind: string, amount: number | null, failed: boolean, unpriced: boolean): void {
+  addTo(bucket, amount, failed, unpriced);
   let k = bucket.byKind.get(kind);
   if (!k) bucket.byKind.set(kind, (k = emptyTotals()));
-  addTo(k, amount, failed);
+  addTo(k, amount, failed, unpriced);
 }
 
 export interface MeetingRow {
@@ -305,6 +311,15 @@ export interface MeetingRow {
   title: string;
   firstTs: string;
   bucket: Bucket;
+}
+
+/** 價目表沒有、但有 token 的模型：沒算進金額，逐模型列次數與 token 數，提醒使用者補價目表 */
+export interface UnpricedModel {
+  model: string;
+  calls: number;
+  promptTokens: number;
+  outputTokens: number;
+  thoughtsTokens: number;
 }
 
 export interface PersonReport {
@@ -319,6 +334,8 @@ export interface PersonReport {
   /** 兩個 kind 以外的計數，給頁尾說明 */
   embedCalls: number;
   noTokenCalls: number;
+  unpricedCalls: number;
+  unpricedModels: Map<string, UnpricedModel>;
 }
 
 export interface CostReport {
@@ -330,6 +347,8 @@ export interface CostReport {
   personMonths: Array<{ person: string; month: string; bucket: Bucket }>;
   /** 月彙總（所有人） */
   months: Map<string, Bucket>;
+  /** 價目表沒有的模型（所有人合併），依模型名排序 */
+  unpricedModels: UnpricedModel[];
 }
 
 /** 掃一位記錄人資料夾第一層的 .md，建 meetpilot_id → 檔名（不含 .md）。規則跟 `vaultProjector` 的 `scanVaultIndex` 一致：跳過 conflict 副本，同 id 兩檔就拋 */
@@ -368,6 +387,8 @@ function buildPerson(shared: string, name: string, prices: readonly PriceRow[], 
     status: null,
     embedCalls: 0,
     noTokenCalls: 0,
+    unpricedCalls: 0,
+    unpricedModels: new Map(),
   };
   const titles = loadMeetingTitles(personDir);
 
@@ -387,13 +408,23 @@ function buildPerson(shared: string, name: string, prices: readonly PriceRow[], 
     const { amount, uncounted } = costOfCall(rec, prices);
     if (uncounted === 'embed') person.embedCalls += 1;
     if (uncounted === 'no-tokens') person.noTokenCalls += 1;
+    const isUnpriced = uncounted === 'unpriced';
+    if (isUnpriced) {
+      person.unpricedCalls += 1;
+      let u = person.unpricedModels.get(rec.model);
+      if (!u) person.unpricedModels.set(rec.model, (u = { model: rec.model, calls: 0, promptTokens: 0, outputTokens: 0, thoughtsTokens: 0 }));
+      u.calls += 1;
+      u.promptTokens += rec.promptTokens ?? 0;
+      u.outputTokens += rec.outputTokens ?? 0;
+      u.thoughtsTokens += rec.thoughtsTokens ?? 0;
+    }
     const failed = rec.outcome !== 'ok';
     const month = monthOf(rec.ts);
 
-    addCall(person.total, rec.kind, amount, failed);
+    addCall(person.total, rec.kind, amount, failed, isUnpriced);
     let m = person.months.get(month);
     if (!m) person.months.set(month, (m = emptyBucket()));
-    addCall(m, rec.kind, amount, failed);
+    addCall(m, rec.kind, amount, failed, isUnpriced);
 
     // 一場跨月就分成兩列，這樣逐場的列加起來等於分月的數字
     const key = `${month}\u0000${rec.meetingId ?? ''}`;
@@ -403,7 +434,7 @@ function buildPerson(shared: string, name: string, prices: readonly PriceRow[], 
       rows.set(key, (row = { month, meetingId: rec.meetingId, title, firstTs: rec.ts, bucket: emptyBucket() }));
     }
     if (rec.ts < row.firstTs) row.firstTs = rec.ts;
-    addCall(row.bucket, rec.kind, amount, failed);
+    addCall(row.bucket, rec.kind, amount, failed, isUnpriced);
   }
 
   person.meetings = [...rows.values()].sort((a, b) => a.firstTs.localeCompare(b.firstTs));
@@ -411,24 +442,34 @@ function buildPerson(shared: string, name: string, prices: readonly PriceRow[], 
 }
 
 function mergeInto(target: Bucket, source: Bucket): void {
-  for (const k of ['cost', 'failedCost', 'calls', 'failedCalls', 'uncounted'] as const) target[k] += source[k];
+  for (const k of ['cost', 'failedCost', 'calls', 'failedCalls', 'uncounted', 'unpriced'] as const) target[k] += source[k];
   for (const [kind, t] of source.byKind) {
     let dst = target.byKind.get(kind);
     if (!dst) target.byKind.set(kind, (dst = emptyTotals()));
-    for (const k of ['cost', 'failedCost', 'calls', 'failedCalls', 'uncounted'] as const) dst[k] += t[k];
+    for (const k of ['cost', 'failedCost', 'calls', 'failedCalls', 'uncounted', 'unpriced'] as const) dst[k] += t[k];
   }
 }
 
 export function buildCostReport(sharedRoot: string, prices: readonly PriceRow[], now: Date): CostReport {
   if (!existsSync(sharedRoot) || !statSync(sharedRoot).isDirectory()) throw new Error(`共享資料夾 ${sharedRoot} 不存在或不是資料夾`);
   const names = readdirSync(sharedRoot)
-    .filter((n) => statSync(join(sharedRoot, n)).isDirectory())
+    // `_` 或 `.` 開頭的資料夾（`_更新/`、`.obsidian`）不是記錄人
+    .filter((n) => !n.startsWith('_') && !n.startsWith('.') && statSync(join(sharedRoot, n)).isDirectory())
     .sort((a, b) => a.localeCompare(b));
   const people = names.map((n) => buildPerson(sharedRoot, n, prices, now));
 
-  const report: CostReport = { generatedAt: now.toISOString(), sharedRoot, people, total: emptyBucket(), personMonths: [], months: new Map() };
+  const report: CostReport = { generatedAt: now.toISOString(), sharedRoot, people, total: emptyBucket(), personMonths: [], months: new Map(), unpricedModels: [] };
+  const unpriced = new Map<string, UnpricedModel>();
   for (const p of people) {
     mergeInto(report.total, p.total);
+    for (const u of p.unpricedModels.values()) {
+      const dst = unpriced.get(u.model) ?? { model: u.model, calls: 0, promptTokens: 0, outputTokens: 0, thoughtsTokens: 0 };
+      dst.calls += u.calls;
+      dst.promptTokens += u.promptTokens;
+      dst.outputTokens += u.outputTokens;
+      dst.thoughtsTokens += u.thoughtsTokens;
+      unpriced.set(u.model, dst);
+    }
     for (const [month, b] of [...p.months].sort(([a], [b2]) => a.localeCompare(b2))) {
       report.personMonths.push({ person: p.name, month, bucket: b });
       let all = report.months.get(month);
@@ -436,6 +477,7 @@ export function buildCostReport(sharedRoot: string, prices: readonly PriceRow[],
       mergeInto(all, b);
     }
   }
+  report.unpricedModels = [...unpriced.values()].sort((a, b) => a.model.localeCompare(b.model));
   report.months = new Map([...report.months].sort(([a], [b]) => a.localeCompare(b)));
   return report;
 }
@@ -464,6 +506,13 @@ function amountCell(t: Totals | undefined): string {
   if (t.uncounted === 0) return money(t.cost);
   if (t.uncounted === t.calls) return `未計 ${t.uncounted} 次`;
   return `${money(t.cost)}（另 ${t.uncounted} 次未計）`;
+}
+
+/** 有價目表沒有的模型時回一行警告給 CLI 印在 stderr，沒有就 null */
+export function unpricedWarning(report: CostReport): string | null {
+  if (report.unpricedModels.length === 0) return null;
+  const list = report.unpricedModels.map((u) => `${u.model}（${u.calls} 次）`).join('、');
+  return `警告：價目表沒有這些模型，它們的呼叫沒有算進金額：${list}。請到 scripts/geminiPrices.json 補上價格後重跑`;
 }
 
 function renderStatusSection(report: CostReport): string[] {
@@ -509,10 +558,16 @@ export function renderCostReport(report: CostReport): string {
   out.push('「其中失敗重試」是 outcome 不是 ok 且有回傳 token 的呼叫金額，已含在估算花費裡。');
   out.push('`_診斷/llm.jsonl` 只在會議走到終點時更新，最近還在跑的會議可能還沒算進來。', '');
 
-  const summaryHead = ['估算花費', '其中失敗重試', '呼叫次數', '失敗次數', '未計次數'];
-  const summaryCells = (t: Totals): string[] => [money(t.cost), money(t.failedCost), String(t.calls), String(t.failedCalls), String(t.uncounted)];
+  const summaryHead = ['估算花費', '其中失敗重試', '呼叫次數', '失敗次數', '未計次數', '未計價呼叫'];
+  const summaryCells = (t: Totals): string[] => [money(t.cost), money(t.failedCost), String(t.calls), String(t.failedCalls), String(t.uncounted), String(t.unpriced)];
 
   out.push('## 總計', '', ...table(summaryHead, [summaryCells(report.total)]), '');
+
+  if (report.unpricedModels.length > 0) {
+    out.push('## 價目表沒有的模型', '');
+    out.push('這些模型的呼叫有 token，但價目表沒有價格，沒有算進任何金額（也不猜價）。到 `scripts/geminiPrices.json` 補上價格後重跑。', '');
+    out.push(...table(['模型', '呼叫次數', 'promptTokens', 'outputTokens', 'thoughtsTokens'], report.unpricedModels.map((u) => [u.model, String(u.calls), String(u.promptTokens), String(u.outputTokens), String(u.thoughtsTokens)])), '');
+  }
 
   out.push(...renderStatusSection(report));
 
@@ -554,6 +609,7 @@ export function renderCostReport(report: CostReport): string {
     ), '');
     const notes: string[] = [];
     if (p.embedCalls > 0) notes.push(`embedding ${p.embedCalls} 次未計（紀錄沒有 token 數）`);
+    if (p.unpricedCalls > 0) notes.push(`${p.unpricedCalls} 次呼叫的模型不在價目表，沒有算進金額`);
     if (p.noTokenCalls > 0) notes.push(`${p.noTokenCalls} 次呼叫沒有回傳 token 數，沒有算進金額`);
     if (notes.length > 0) out.push(`${notes.join('；')}。`, '');
   }
@@ -652,6 +708,8 @@ function main(): void {
   mkdirSync(outDir, { recursive: true });
   const outPath = join(outDir, '總覽.md');
   writeFileSync(outPath, renderCostReport(report));
+  const warning = unpricedWarning(report);
+  if (warning) console.error(warning);
   console.log(`已寫入 ${outPath}（估算總計 ${money(report.total.cost)}，其中失敗重試 ${money(report.total.failedCost)}）`);
 }
 
