@@ -22,6 +22,7 @@ import { createApp } from './services/createApp';
 import { createVaultProjector, resolveVaultDir } from './services/vaultProjector';
 import { createDiagnosticsExporter, resolveDiagnosticsConfig } from './services/diagnosticsExport';
 import { createVoiceMemoRecorder } from './services/voiceMemoRecorder';
+import { createActivityMonitor, resolveActivitySender } from './services/meetingActivity';
 
 // 這個檔只做三件事：把真的依賴組出來、交給 createApp、listen。
 // 路由與 middleware 全部在 services/createApp.ts，理由見那個檔的檔頭（測得動）。
@@ -334,6 +335,22 @@ async function startServer() {
   // 不會自動觸發 worker 去搶——啟動流程的最後手動 poke 兩個 worker 一次
   transcriptionWorker.poke();
   analysisWorker.poke();
+
+  // 活動快照（vault plan「MeetPilot · 記錄完整度、成本與背景運作」AC-3）。放在回收、補齊之後才啟動：
+  // 啟動基準要看到的是補齊後的狀態，不然上面標成 FAILED 的舊會議會被當成剛發生的失敗。
+  // 在 Electron utilityProcess 裡才送訊息給桌面主程序；`npm run dev` 與正式 server 沒有 parentPort，只寫 `_狀態.json`
+  const activitySender = resolveActivitySender(process);
+  createActivityMonitor({
+    listMeetings: () => meetingStore.listMeetings(),
+    jobs: jobStore,
+    vaultDir,
+    send: activitySender,
+  }).start();
+  console.log(
+    activitySender
+      ? '[MeetPilot] 活動快照：每 5 秒經 parentPort 回報桌面主程序，狀態寫到 _狀態.json'
+      : '[MeetPilot] 活動快照：不在 utilityProcess 裡，只寫 _狀態.json、不送訊息',
+  );
 
   const { host, port, basicAuth } = listenConfig;
   // Express 5 把 listen 失敗（EADDRINUSE、EACCES）交給這個 callback。不看 err 的話會印出「Server running」
