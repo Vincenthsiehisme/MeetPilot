@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  HIDDEN_LAUNCH_ARG, notificationFor, parseActivityMessage, quitPrompt, shouldBlockSleep, shouldOpenAtLogin, startedHidden,
+  HIDDEN_LAUNCH_ARG, notificationFor, parseActivityMessage, quitPrompt, shouldBlockSleep, shouldOpenAtLogin, startedHidden, updateInstallNote,
 } from './desktopActivity';
 
 const valid = {
@@ -94,6 +94,27 @@ describe('quitPrompt', () => {
     expect(prompt?.detail).toContain('中斷錄音');
     expect(prompt?.detail).toContain('接著跑');
     expect(prompt?.buttons).toHaveLength(2);
+  });
+});
+
+describe('裝更新時的結束', () => {
+  it('更新是使用者已經確認要結束的動作：處理中那項不再問', () => {
+    expect(quitPrompt({ recording: false, active: 3, ignoreProcessing: true })).toBeNull();
+  });
+
+  it('錄音中照舊問，而且只講錄音，不提處理中', () => {
+    const prompt = quitPrompt({ recording: true, active: 3, ignoreProcessing: true });
+    expect(prompt).toMatchObject({ message: '正在錄音，要結束 MeetPilot 嗎？', logNote: '錄音中' });
+  });
+
+  it('沒給 ignoreProcessing 時行為不變', () => {
+    expect(quitPrompt({ recording: false, active: 3 })?.message).toContain('3 場會議在處理');
+  });
+
+  it('確認對話框補一句：有處理中的會議才說，下次打開會接著跑', () => {
+    expect(updateInstallNote(0)).toBe('');
+    expect(updateInstallNote(2)).toContain('2 場會議還在處理');
+    expect(updateInstallNote(2)).toContain('下次打開');
   });
 });
 
