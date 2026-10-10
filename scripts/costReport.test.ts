@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   assertOutOutsideShared,
@@ -131,7 +131,7 @@ describe('命令列', () => {
   });
 
   it('設定檔路徑照平台', () => {
-    expect(defaultSettingsPath('darwin', '/Users/v', undefined)).toBe('/Users/v/Library/Application Support/MeetPilot/desktop-settings.json');
+    expect(defaultSettingsPath('darwin', '/Users/v', undefined)).toBe(join('/Users/v', 'Library', 'Application Support', 'MeetPilot', 'desktop-settings.json'));
     expect(() => defaultSettingsPath('win32', 'C:\\Users\\v', undefined)).toThrow(/APPDATA/);
   });
 });
@@ -154,12 +154,12 @@ describe('檔案輸入輸出', () => {
 
   describe('resolveSharedRoot', () => {
     it('--shared 優先', () => {
-      expect(resolveSharedRoot('/x/shared', '/nope/desktop-settings.json')).toBe('/x/shared');
+      expect(resolveSharedRoot('/x/shared', '/nope/desktop-settings.json')).toBe(resolve('/x/shared'));
     });
 
     it('沒給 --shared 時取設定檔 vaultDir 的上一層', () => {
       const settings = write('s1/desktop-settings.json', JSON.stringify({ version: 1, vaultDir: '/data/MeetPilot 記錄/妍均' }));
-      expect(resolveSharedRoot(undefined, settings)).toBe('/data/MeetPilot 記錄');
+      expect(resolveSharedRoot(undefined, settings)).toBe(dirname(resolve('/data/MeetPilot 記錄/妍均')));
     });
 
     it('讀不到設定檔報錯並提示 --shared', () => {
@@ -184,7 +184,7 @@ describe('檔案輸入輸出', () => {
       expect(() => assertOutOutsideShared(join(shared(), 'a', 'b', 'c'), shared())).toThrow(/共享資料夾/);
     });
 
-    it('透過 symlink 指進共享資料夾也拒絕', () => {
+    it.skipIf(process.platform === 'win32')('透過 symlink 指進共享資料夾也拒絕', () => {
       const link = join(root, 'out-check', 'link');
       symlinkSync(shared(), link);
       expect(() => assertOutOutsideShared(join(link, 'x'), shared())).toThrow(/共享資料夾/);
