@@ -555,6 +555,7 @@ export function renderCostReport(report: CostReport): string {
   out.push(`產生時間：${report.generatedAt}`);
   out.push(`共享資料夾：${report.sharedRoot}`);
   out.push('', '金額是依價目表（`scripts/geminiPrices.json`）算的估算，不是帳單。月份用台灣時間（UTC+8）分組。價目表的換價日用呼叫時間的 UTC 日期比。');
+  out.push('轉錄呼叫的輸入 token 含少量文字指令，有音訊價的模型一律以音訊價估，略為高估（`llm.jsonl` 沒有分模態的 token 數）。');
   out.push('「其中失敗重試」是 outcome 不是 ok 且有回傳 token 的呼叫金額，已含在估算花費裡。');
   out.push('`_診斷/llm.jsonl` 只在會議走到終點時更新，最近還在跑的會議可能還沒算進來。', '');
 
@@ -574,7 +575,7 @@ export function renderCostReport(report: CostReport): string {
   out.push('## 各步驟分項（全部記錄人）', '');
   out.push(...table(['步驟', ...summaryHead], kindCols.map((k) => {
     const t = report.total.byKind.get(k) as Totals;
-    return [kindLabel(k), k === 'embed' ? '未計' : money(t.cost), money(t.failedCost), String(t.calls), String(t.failedCalls), String(t.uncounted)];
+    return [kindLabel(k), k === 'embed' ? '未計' : money(t.cost), money(t.failedCost), String(t.calls), String(t.failedCalls), String(t.uncounted), String(t.unpriced)];
   })), '');
 
   out.push('## 分人', '');

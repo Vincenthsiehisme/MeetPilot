@@ -220,7 +220,7 @@ npm run cost:report -- --shared <共享資料夾> --out <輸出資料夾>
   - 現行價取自 2026-10-10 讀的 Gemini API 價目頁，`effectiveFrom` 寫 `2026-01-01` 表示「往前沿用」（頁面沒寫起算日，紀錄最早 2026-09-16）。`gemini-3.8-flash` 在 2027-01-01 起換成較高的價，換價前後的呼叫分開算。價格改了就加新的一列，不改舊列。
   - 總覽的月份用台灣時間（UTC+8）分組，台灣 1 號早上 8 點前的呼叫算進當月，不算上個月。
   - 換價日用呼叫時間（`ts`）的 UTC 日期比（Google 換價的時區沒公布），所以 2026-12-31T20:00Z 的呼叫用舊價，月份落在台灣時間的 2027-01。
-  - `gemini-3.8-flash` 價目頁只列一個 input 價，轉錄也用它；有 `audioInputPerM` 的模型，`kind` 是 `transcribe` 的呼叫才用音訊價。
+  - `gemini-3.8-flash` 價目頁只列一個 input 價，轉錄也用它；有 `audioInputPerM` 的模型，`kind` 是 `transcribe` 的呼叫才用音訊價。轉錄呼叫的輸入 token 含少量文字指令，`llm.jsonl` 沒有分模態的 token 數，有音訊價的模型一律以音訊價估，所以略為高估。
   - 估算 = `promptTokens` 乘 input 價，加（`outputTokens` + `thoughtsTokens`）乘 output 價。`thoughtsTokens` 沒有當 0。
   - 價目表完全沒有的模型（例如 fallback 鏈最後的 `gemini-flash-latest`）只要呼叫有 token，就不算進金額、也不猜價：總覽另開「價目表沒有的模型」一段逐模型列次數與 token 數，各張表多一欄「未計價呼叫」，CLI 結束時在 stderr 印一行警告。補上價格後重跑。價目表有這個模型、但呼叫日早於最早生效日，是價目表寫錯，整份報錯。
 - `embed` 的紀錄沒有 token 數，列「未計」，不算進金額。三個 token 欄都是 null 的呼叫（失敗在拿到回應前）也列未計，不查價。
