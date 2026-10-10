@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -322,5 +322,42 @@ describe('createActivityMonitor', () => {
       status: 'CREATED', inProgress: false,
     });
     db.close();
+  });
+
+  it('start()：第一次寫狀態檔失敗不拋、大聲記錯（帶路徑），基準訊息照送，下一輪 tick 會再寫', () => {
+    vi.useFakeTimers();
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const { db, store, sent, dir: vault } = setup();
+      store.createMeeting({ meeting_id: 'm1', created_at: NOW, source_file_name: 'a.m4a', source_file_size: 1 });
+      const writes: string[] = [];
+      let failNext = true;
+      const monitor = createActivityMonitor({
+        listMeetings: () => store.listMeetings(),
+        jobs: createJobStore(db),
+        vaultDir: vault,
+        send: m => sent.push(m),
+        now: () => NOW,
+        writeFile: path => {
+          writes.push(path);
+          if (failNext) {
+            failNext = false;
+            throw new Error('EPERM: rename 被 OneDrive 鎖住');
+          }
+        },
+      });
+      expect(() => monitor.start()).not.toThrow();
+      expect(sent).toEqual([{ type: 'meetpilot-activity', schema: 1, active: 0, events: [] }]);
+      expect(errorLog).toHaveBeenCalledTimes(1);
+      expect(String(errorLog.mock.calls[0]?.[0])).toContain(join(vault, '_狀態.json'));
+      vi.advanceTimersByTime(5_000);
+      expect(writes).toEqual([join(vault, '_狀態.json'), join(vault, '_狀態.json')]);
+      expect(errorLog).toHaveBeenCalledTimes(1);
+      monitor.stop();
+      db.close();
+    } finally {
+      errorLog.mockRestore();
+      vi.useRealTimers();
+    }
   });
 });

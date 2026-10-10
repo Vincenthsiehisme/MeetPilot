@@ -265,17 +265,21 @@ export const createActivityMonitor = (deps: ActivityMonitorDeps) => {
 
   return {
     tick,
-    /** 立刻算一次當基準，之後每 5 秒一次。timer 裡的例外只記 log，不讓 server 因此掛掉 */
+    /**
+     * 立刻算一次當基準，之後每 5 秒一次。任何一次失敗（含第一次）只大聲記 log、下一輪再試，
+     * 不讓 server 因此掛掉或在 listen 前結束：寫檔失敗（例如 OneDrive 鎖住 rename）時基準訊息已經送出
+     */
     start: (): void => {
       if (timer) throw new Error('活動快照已經在跑');
-      tick();
-      timer = setInterval(() => {
+      const safeTick = (): void => {
         try {
           tick();
         } catch (err) {
-          console.error('[MeetPilot] 活動快照失敗：', err);
+          console.error(`[MeetPilot] 活動快照失敗（狀態檔 ${statusPath}），下一輪再試：`, err);
         }
-      }, SNAPSHOT_INTERVAL_MS);
+      };
+      safeTick();
+      timer = setInterval(safeTick, SNAPSHOT_INTERVAL_MS);
       timer.unref();
     },
     stop: (): void => {
