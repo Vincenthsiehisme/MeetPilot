@@ -845,6 +845,45 @@ describe('project：逐字稿投影到 _逐字稿/', () => {
     expect(readOnlyFileByName('我改的名字.md')).toContain(`[[${TRANSCRIPT_DIR}/我改的名字|逐字稿]]`);
   });
 
+  it('互換改名：目標逐字稿檔屬於另一場時不覆蓋、拋錯講出兩個 id 與路徑，會議記錄本身照樣寫出', () => {
+    const id1 = makeReadyMeeting({ overview: '週會', title: '週會', segments: [{ start: 0, end: 5, text: '會議一的內容', speaker: 'S' }] });
+    const id2 = makeReadyMeeting({ id: 'm-2', overview: '另一場', title: '另一場', segments: [{ start: 0, end: 5, text: '會議二的內容', speaker: 'S' }] });
+    projector.project(id1);
+    projector.project(id2);
+    const stem1 = '2023-11-14 2213 週會';
+    const stem2 = '2023-11-14 2213 另一場';
+
+    // 會議 1 的記錄改名成 C，會議 2 的記錄改名成會議 1 原本的名字；會議 1 還沒重投影
+    renameSync(join(vaultDir, `${stem1}.md`), join(vaultDir, 'C.md'));
+    renameSync(join(vaultDir, `${stem2}.md`), join(vaultDir, `${stem1}.md`));
+    const before = readTranscriptFile(`${stem1}.md`);
+    expect(before).toContain('meetpilot_transcript_of: m-1');
+
+    expect(() => projector.project(id2)).toThrow(
+      new RegExp(`m-2.*m-1|m-1.*m-2`),
+    );
+    expect(() => projector.project(id2)).toThrow(/_逐字稿/);
+
+    expect(readTranscriptFile(`${stem1}.md`)).toBe(before); // 會議 1 的逐字稿沒被蓋
+    expect(readTranscriptFile(`${stem1}.md`)).toContain('會議一的內容');
+    expect(readOnlyFileByName(`${stem1}.md`)).toContain('meetpilot_id: m-2'); // 會議 2 的記錄照寫
+    expect(readOnlyFileByName(`${stem1}.md`)).toContain(`[[${TRANSCRIPT_DIR}/${stem1}|逐字稿]]`);
+    // 會議 2 原本的逐字稿檔也沒被刪（新檔沒寫成，不能先把舊檔清掉）
+    expect(transcriptFiles()).toEqual([`${stem1}.md`, `${stem2}.md`].sort());
+  });
+
+  it('目標逐字稿檔存在但沒有 frontmatter（人手放的檔）：不覆蓋、拋錯', () => {
+    const id = makeReadyMeeting({ overview: '週會', title: '週會' });
+    mkdirSync(join(vaultDir, TRANSCRIPT_DIR), { recursive: true });
+    const target = join(vaultDir, TRANSCRIPT_DIR, '2023-11-14 2213 週會.md');
+    writeFileSync(target, '我自己寫的筆記', 'utf8');
+
+    expect(() => projector.project(id)).toThrow(/_逐字稿/);
+
+    expect(readFileSync(target, 'utf8')).toBe('我自己寫的筆記');
+    expect(listMdFiles(vaultDir)).toHaveLength(1); // 會議記錄照寫
+  });
+
   it('_逐字稿/ 裡的檔不進 scanVaultIndex：裡面就算帶 meetpilot_id、auto 標記也不會報重複或孤兒錯誤', () => {
     const id = makeReadyMeeting({ overview: '週會', title: '週會' });
     projector.project(id);

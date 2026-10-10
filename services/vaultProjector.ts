@@ -699,6 +699,20 @@ export const createVaultProjector = (deps: VaultProjectorDeps) => {
       const transcriptDir = join(vaultDir, TRANSCRIPT_DIR_NAME);
       mkdirSync(transcriptDir, { recursive: true });
       const transcriptPath = join(transcriptDir, `${recordStem}.md`);
+      // 目標檔已存在就先驗是誰的：兩份會議記錄被人互換改名、其中一場還沒重投影時，
+      // 這個 stem 的逐字稿可能屬於另一場；沒有 frontmatter 的檔是人手放的。兩種都不蓋，大聲拋錯
+      if (existsSync(transcriptPath)) {
+        const owner = extractFrontmatterField(readVaultFile(transcriptPath), TRANSCRIPT_OF_FIELD);
+        if (owner !== meetingId) {
+          throw new Error(
+            `Meeting ${meetingId} 的逐字稿要寫到 ${transcriptPath}，但那個檔`
+            + (owner === null
+              ? '沒有 meetpilot_transcript_of（不是系統寫的檔）'
+              : `屬於另一場會 ${owner}`)
+            + '，不覆蓋。請先處理那個檔，或讓另一場會重新投影後再試',
+          );
+        }
+      }
       writeAtomic(transcriptPath, renderTranscriptFile({ meetingId, title, segments, resolved }));
       // 會議記錄被人改名後 stem 跟舊逐字稿不同：同一個 id 不留兩份，用 frontmatter 找舊檔刪掉
       for (const name of readdirSync(transcriptDir)) {
