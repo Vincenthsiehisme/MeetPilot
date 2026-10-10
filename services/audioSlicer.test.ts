@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -23,6 +23,21 @@ const fakeRunner = (
 };
 
 const throwingRunner = (err: unknown): CommandRunner => async () => { throw err; };
+
+// node:fs 的 ESM 匯出不能 vi.spyOn，只能整個模組換掉，其餘原樣代理給真實實作（同 geminiServerClient.test.ts）。
+// 預設 rmSync 照真的刪；只有測「暫存檔刪不掉」那一條才覆寫
+const { rmSyncMock } = vi.hoisted(() => ({ rmSyncMock: vi.fn() }));
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return { ...actual, rmSync: (...args: Parameters<typeof actual.rmSync>) => rmSyncMock(...args) };
+});
+const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+beforeEach(() => {
+  rmSyncMock.mockImplementation((...args: Parameters<typeof realFs.rmSync>) => realFs.rmSync(...args));
+});
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe('planSlices', () => {
   it('總長剛好等於一片長度時只有一片，不多排一片空的', () => {
@@ -157,6 +172,36 @@ describe('probeDurationRemuxingIfMissing（AC-7：瀏覽器錄的 webm 沒寫長
     expect(readdirSync(dir)).toEqual(['a.audio']);
   });
 
+  it('remux 失敗又刪不掉暫存檔（EBUSY）：拋的是 remux 的錯誤，不被刪檔錯誤蓋掉，只 warn 路徑與錯誤碼', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    rmSyncMock.mockImplementation((path: string, ...rest: unknown[]) => {
+      if (String(path).endsWith('.part')) {
+        throw Object.assign(new Error(`EBUSY: resource busy or locked, unlink '${path}'`), { code: 'EBUSY' });
+      }
+      return (realFs.rmSync as (...args: unknown[]) => void)(path, ...rest);
+    });
+    const file = join(dir, 'a.audio');
+    writeFileSync(file, 'original');
+    let partPath = '';
+    const slicer = createAudioSlicer({
+      ffmpegPath: 'ffmpeg',
+      ffprobePath: 'ffprobe',
+      runner: async (executable, args) => {
+        if (executable === 'ffprobe') return { code: 0, stdout: Buffer.from('N/A'), stderr: '' };
+        // 真的 ffmpeg 失敗時可能已經寫了半個檔
+        partPath = args[args.length - 1] as string;
+        writeFileSync(partPath, 'half');
+        return { code: 1, stdout: Buffer.alloc(0), stderr: 'Invalid data found' };
+      },
+    });
+
+    await expect(slicer.probeDurationRemuxingIfMissing(file)).rejects.toThrow(/remux.*Invalid data found/);
+    expect(readFileSync(file, 'utf8')).toBe('original');
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0].join(' '))).toContain(partPath);
+    expect(String(warn.mock.calls[0].join(' '))).toContain('EBUSY');
+  });
+
   it('remux 之後還是讀不到長度就照原本的錯誤爆，不塞一個假長度', async () => {
     const calls: { executable: string; args: readonly string[] }[] = [];
     const file = join(dir, 'a.audio');
@@ -207,6 +252,41 @@ describe('readSlice', () => {
     expect(outPath.endsWith('.part')).toBe(true);
     expect(calls[0].args.indexOf('-ss')).toBeLessThan(calls[0].args.indexOf('-i'));
     expect(readdirSync(dir)).toEqual([]);
+  });
+
+  it('暫存檔刪不掉（Windows 防毒或 OneDrive 鎖住，EBUSY）時照樣回傳切片，只 warn 路徑與錯誤碼', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    rmSyncMock.mockImplementation((path: string, ...rest: unknown[]) => {
+      if (String(path).endsWith('.part')) {
+        throw Object.assign(new Error(`EBUSY: resource busy or locked, unlink '${path}'`), { code: 'EBUSY' });
+      }
+      return (realFs.rmSync as (...args: unknown[]) => void)(path, ...rest);
+    });
+    const calls: { executable: string; args: readonly string[] }[] = [];
+    const slicer = createAudioSlicer({ ffmpegPath: 'ffmpeg', ffprobePath: 'ffprobe', runner: writingRunner('fLaC....', calls) });
+
+    const flac = await slicer.readSlice(audio, 0, 10, 'flac');
+
+    expect(flac.toString('utf8')).toBe('fLaC....');
+    const outPath = calls[0].args[calls[0].args.length - 1] as string;
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0].join(' '))).toContain(outPath);
+    expect(String(warn.mock.calls[0].join(' '))).toContain('EBUSY');
+  });
+
+  it('ffmpeg 失敗又刪不掉暫存檔時，拋的是 ffmpeg 的錯誤，不被刪檔錯誤蓋掉', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    rmSyncMock.mockImplementation((path: string, ...rest: unknown[]) => {
+      if (String(path).endsWith('.part')) {
+        throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' });
+      }
+      return (realFs.rmSync as (...args: unknown[]) => void)(path, ...rest);
+    });
+    const slicer = createAudioSlicer({
+      ffmpegPath: 'ffmpeg', ffprobePath: 'ffprobe', runner: fakeRunner({ code: 1, stderr: 'Invalid data found' }),
+    });
+
+    await expect(slicer.readSlice(audio, 0, 10, 'flac')).rejects.toThrow(/結束碼 1.*Invalid data found/);
   });
 
   it('wav：給音量檢查用，維持 16kHz 單聲道 WAV 寫到 stdout', async () => {

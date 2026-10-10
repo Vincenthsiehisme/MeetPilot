@@ -134,6 +134,24 @@ const readOutputFile = (path: string): Buffer => {
   }
 };
 
+/**
+ * 刪暫存檔（切片的 `.slice-*.part`、remux 失敗留下的 `.remux-*.part`），這個檔裡刪暫存檔一律走這支。
+ * 刪不掉（Windows 防毒或 OneDrive 剛好鎖住，EBUSY／EPERM）只 warn，不拋：
+ * 這時切片已經讀到手或 ffmpeg 自己的錯誤正要往上拋，刪檔失敗不能把成功的切片變失敗、
+ * 也不能蓋掉真正的錯誤。留下的 `.part` 由啟動時的 `removePartialUploads` 清
+ */
+const removeTempFile = (path: string): void => {
+  try {
+    rmSync(path, { force: true });
+  } catch (err) {
+    const code = (err as { code?: unknown } | null | undefined)?.code;
+    console.warn(
+      `[audioSlicer] 切片暫存檔刪不掉（${typeof code === 'string' ? code : '沒有錯誤碼'}），留給啟動時清理：${path}`,
+      err,
+    );
+  }
+};
+
 export interface AudioSlicerOptions {
   ffmpegPath: string;
   ffprobePath: string;
@@ -219,7 +237,7 @@ export function createAudioSlicer(options: AudioSlicerOptions) {
         );
         renameSync(partPath, filePath);
       } catch (err) {
-        rmSync(partPath, { force: true });
+        removeTempFile(partPath);
         throw err;
       }
       return parseDuration(await readRawDuration(filePath), filePath);
@@ -268,7 +286,7 @@ export function createAudioSlicer(options: AudioSlicerOptions) {
           );
           output = readOutputFile(partPath);
         } finally {
-          rmSync(partPath, { force: true });
+          removeTempFile(partPath);
         }
       }
 

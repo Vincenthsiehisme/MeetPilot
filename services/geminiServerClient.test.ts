@@ -154,16 +154,14 @@ describe('transcribeSlice', () => {
     expect(request.config.thinkingConfig).toEqual({ thinkingLevel: 'LOW' });
   });
 
-  it('設 maxOutputTokens 32768；撞到 MAX_TOKENS 當這次失敗走重試與 fallback，不收截斷的內容（AC-9）', async () => {
+  it('設 maxOutputTokens 32768；撞到 MAX_TOKENS 不在同一個模型重試，直接換下一個模型，不收截斷的內容（AC-9）', async () => {
     vi.useFakeTimers();
     // 截斷的內容刻意給一份解得開的：要證明擋下它的是 finishReason，不是剛好 JSON 解不開
-    const truncated = {
-      text: '{"segments":[{"start":0,"end":5,"text":"截斷的前半","speaker":"Speaker 1"}]}',
-      candidates: [{ finishReason: 'MAX_TOKENS' }],
-    };
     generateContent
-      .mockResolvedValueOnce(truncated)
-      .mockResolvedValueOnce(truncated)
+      .mockResolvedValueOnce({
+        text: '{"segments":[{"start":0,"end":5,"text":"截斷的前半","speaker":"Speaker 1"}]}',
+        candidates: [{ finishReason: 'MAX_TOKENS' }],
+      })
       .mockResolvedValueOnce({
         text: '{"segments":[{"start":0,"end":5,"text":"完整的","speaker":"Speaker 1"}]}',
         candidates: [{ finishReason: 'STOP' }],
@@ -173,18 +171,20 @@ describe('transcribeSlice', () => {
     await vi.advanceTimersByTimeAsync(10_000);
 
     await expect(pending).resolves.toEqual([{ start: 0, end: 5, text: '完整的', speaker: 'Speaker 1' }]);
-    // 拿掉上限這裡就紅：每一次呼叫（含重試與 fallback）都帶同一個上限
-    expect(generateContent.mock.calls.map(c => (c[0] as any).config.maxOutputTokens)).toEqual([32768, 32768, 32768]);
+    // 拿掉上限這裡就紅：每一次呼叫（含 fallback）都帶同一個上限
+    expect(generateContent.mock.calls.map(c => (c[0] as any).config.maxOutputTokens)).toEqual([32768, 32768]);
+    // 同一個模型只打一次：再試一次多半一樣停不下來，又燒滿一次上限
     expect(generateContent.mock.calls.map(c => (c[0] as any).model)).toEqual([
-      'gemini-3.8-flash', 'gemini-3.8-flash', 'gemini-3.1-flash-lite',
+      'gemini-3.8-flash', 'gemini-3.1-flash-lite',
     ]);
-    expect(logged.map(l => l.outcome)).toEqual(['transient', 'transient', 'ok']);
-    expect(logged.map(l => extractFinishReason(l.response))).toEqual(['MAX_TOKENS', 'MAX_TOKENS', 'STOP']);
-    expect(logged.map(l => l.configuredMaxOutputTokens)).toEqual([32768, 32768, 32768]);
+    expect(logged.map(l => l.outcome)).toEqual(['transient', 'ok']);
+    expect(logged.map(l => extractFinishReason(l.response))).toEqual(['MAX_TOKENS', 'STOP']);
+    expect(logged.map(l => l.configuredMaxOutputTokens)).toEqual([32768, 32768]);
+    expect(logged.map(l => l.modelIndex)).toEqual([0, 1]);
     expect((logged[0].error as Error).message).toContain('MAX_TOKENS');
   });
 
-  it('每個模型都撞到 MAX_TOKENS 時整片失敗，不退回截斷的內容（AC-9）', async () => {
+  it('每個模型都撞到 MAX_TOKENS 時每個模型各打一次就整片失敗，不退回截斷的內容（AC-9）', async () => {
     vi.useFakeTimers();
     generateContent.mockResolvedValue({
       text: '{"segments":[{"start":0,"end":5,"text":"截斷的前半","speaker":"Speaker 1"}]}',
@@ -195,7 +195,24 @@ describe('transcribeSlice', () => {
     const assertion = expect(pending).rejects.toThrow(/MAX_TOKENS/);
     await vi.advanceTimersByTimeAsync(60_000);
     await assertion;
+    expect(generateContent.mock.calls.map(c => (c[0] as any).model)).toEqual([
+      'gemini-3.8-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest',
+    ]);
     expect(logged.every(l => l.outcome === 'transient')).toBe(true);
+  });
+
+  it('其他 transient（空輸出）照舊在同一個模型重試，MAX_TOKENS 的換模型規則不影響它', async () => {
+    vi.useFakeTimers();
+    generateContent
+      .mockResolvedValueOnce({ text: '', candidates: [{ finishReason: 'STOP' }] })
+      .mockResolvedValueOnce({ text: '{"segments":[]}', candidates: [{ finishReason: 'STOP' }] });
+
+    const pending = client().transcribeSlice({ base64Data: 'AAAA' });
+    await vi.advanceTimersByTimeAsync(10_000);
+    await expect(pending).resolves.toEqual([]);
+    expect(generateContent.mock.calls.map(c => (c[0] as any).model)).toEqual([
+      'gemini-3.8-flash', 'gemini-3.8-flash',
+    ]);
   });
 
   it('圍欄包住的合法 segments 要正確解析，不能變成一段 JSON 原始碼的假逐字稿', async () => {

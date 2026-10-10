@@ -192,6 +192,18 @@ class RetryableLlmResponseError extends Error {
   }
 }
 
+/**
+ * 輸出撞到 maxOutputTokens（finishReason MAX_TOKENS）。仍算可重試的空輸出一類，
+ * 但 `generateContentWithFallback` 不在同一個模型再試，直接換下一個：同一段音訊同一個模型
+ * 再試多半一樣停不下來，又燒滿一次上限（AC-9 要擋的正是這筆花費）
+ */
+class MaxTokensLlmResponseError extends RetryableLlmResponseError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'MaxTokensLlmResponseError';
+  }
+}
+
 export function formatTranscriptForAI(transcript: TranscriptSegment[]): string {
   return transcript.reduce((acc, curr, idx, arr) => {
     const prev = arr[idx - 1];
@@ -563,6 +575,11 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
             throw err;
           }
 
+          if (err instanceof MaxTokensLlmResponseError) {
+            console.warn(`[Gemini Request] Model ${model} 撞到輸出上限，不在同一個模型重試，改用 fallback 鏈的下一個模型`);
+            break;
+          }
+
           if (rateLimit) {
             if (rateLimit.dailyQuotaExhausted) {
               console.warn(`[Gemini Request] Model ${model} 今天的額度用完，改用 fallback 鏈的下一個模型`);
@@ -658,11 +675,12 @@ Output JSON format:
         config: promptConfig,
         validateResponse: (candidate) => {
           // 撞到輸出上限的內容是截斷的。以前留到 fallback 外面解 JSON 才拋，這一片直接失敗、
-          // 不重試也不換模型；在這裡拋就走既有的重試與 fallback，截斷的內容一個字都不收。
+          // 不換模型；在這裡拋就換 fallback 鏈的下一個模型（同一個模型不重試，見
+          // MaxTokensLlmResponseError），截斷的內容一個字都不收。
           // llm.jsonl 那一筆的 finishReason 是 MAX_TOKENS、errorMessage 是下面這句
           // （transientReason 會記成 empty_output：llmTelemetry 的列舉只有兩種，這包不改契約檔）
           if (candidate?.candidates?.[0]?.finishReason === 'MAX_TOKENS') {
-            throw new RetryableLlmResponseError(
+            throw new MaxTokensLlmResponseError(
               `Gemini 轉錄輸出撞到 maxOutputTokens 上限（${TRANSCRIBE_MAX_OUTPUT_TOKENS}，finishReason MAX_TOKENS），不收截斷的內容`,
             );
           }
