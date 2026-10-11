@@ -34,7 +34,7 @@ async function checkFlac(ffprobePath: string, file: string): Promise<string> {
   ]);
   if (result.code !== 0) throw new Error(`ffprobe 讀不了切出來的 FLAC：${result.stderr.trim().slice(-300)}`);
   const fields = Object.fromEntries(
-    result.stdout.toString('utf8').trim().split('\n').map((line) => line.split('=') as [string, string]),
+    result.stdout.toString('utf8').trim().split(/\r?\n/).map((line) => line.split('=') as [string, string]),
   );
   const expected = { codec_name: 'flac', sample_rate: '16000', channels: '1', sample_fmt: 's16' };
   for (const [key, value] of Object.entries(expected)) {
