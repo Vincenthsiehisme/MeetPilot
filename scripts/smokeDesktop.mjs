@@ -36,9 +36,12 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 const TIMEOUT_MS = 60_000;
+// 等一場會轉錄失敗到 FAILED：job 失敗要用完 max_attempts（3 次）才 FAILED，中間退回 queued 會冷卻
+// 30 秒、60 秒（services/jobWorker.ts 的 JOB_RETRY_COOLDOWN_STEP_MS），最快也要 90 秒以上
+const JOB_FAILED_TIMEOUT_MS = 150_000;
 // 整支腳本的硬上限：收尾時 app 卡住不結束（例如 macOS 的錯誤對話框卡住主程序）也不能讓 CI 無限等下去。
-// 2026-09-24 CI 的 macOS 那格就這樣卡了 40 分鐘以上
-const WATCHDOG_MS = 6 * 60_000;
+// 2026-09-24 CI 的 macOS 那格就這樣卡了 40 分鐘以上。兩段各等一次 JOB_FAILED_TIMEOUT_MS，所以留到 10 分鐘
+const WATCHDOG_MS = 10 * 60_000;
 setTimeout(() => {
   console.error(`[desktop-smoke] 失敗：超過 ${WATCHDOG_MS / 1000} 秒還沒結束，強制退出`);
   process.exit(1);
@@ -129,7 +132,9 @@ const launch = async (extraArgs = []) => {
   ], {
     stdio: 'ignore',
     detached: process.platform !== 'win32',
-    env: { ...process.env, MEETPILOT_DESKTOP_USER_DATA: userData, MEETPILOT_DESKTOP_GATEWAY_URL: gatewayUrl },
+    // MEETPILOT_DESKTOP_SMOKE：外殼不登記開機自動啟動（會改到這台電腦真實的登入項目）、不發系統通知、
+    // 結束時不問「還有會議在處理」（對話框會卡住收尾）
+    env: { ...process.env, MEETPILOT_DESKTOP_USER_DATA: userData, MEETPILOT_DESKTOP_GATEWAY_URL: gatewayUrl, MEETPILOT_DESKTOP_SMOKE: '1' },
   });
   app = { child, exited: null, cdpPort, inspectPort };
   const current = app;
@@ -394,7 +399,7 @@ if (stopped.status === 'CREATED') await fail(phase, '停止之後退回 CREATED�
 const settled = await waitFor(phase, '轉錄跑到打 Gemini', async () => {
   const m = (await api('/api/meetings')).meetings.find((x) => x.meeting_id === recording.meeting_id);
   return m.status === 'FAILED' || (m.processed_slices ?? 0) > 0 ? m : null;
-});
+}, JOB_FAILED_TIMEOUT_MS);
 // 「沒有聲音」也算：有聲音的錄音被當成靜音擋下來，是這支要抓的誤擋
 if (settled.status === 'FAILED' && /ffmpeg|ffprobe|長度|切片|remux|音訊|沒有聲音/i.test(settled.error ?? '')) {
   await fail(phase, `轉錄在處理音檔時就失敗了，不是在打 Gemini：${settled.error}`);
@@ -465,7 +470,7 @@ await waitFor(phase, '按下「停止錄音」', () => evaluate(silPage, clickBu
 const silentSettled = await waitFor(phase, '這場會轉錄失敗', async () => {
   const m = (await silApi('/api/meetings')).meetings.find((x) => x.meeting_id === silentRec.meeting_id);
   return m.status === 'FAILED' || m.status === 'READY' || m.status === 'LINKED' || (m.processed_slices ?? 0) > 0 ? m : null;
-});
+}, JOB_FAILED_TIMEOUT_MS);
 if (silentSettled.status !== 'FAILED' || !/幾乎沒有聲音/.test(silentSettled.error ?? '')) {
   await fail(phase, `全是空白的錄音應該在轉錄前就 FAILED、講「幾乎沒有聲音」，實際是 ${silentSettled.status}：${silentSettled.error ?? '（沒有錯誤訊息）'}`);
 }

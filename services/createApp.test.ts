@@ -41,7 +41,6 @@ let analysisEnqueued: string[];
 
 const fakeGemini = (): GeminiServerClient => ({
   transcribeSlice: async () => [],
-  polishTranscript: async () => '潤過的',
   analyzeTranscript: async () => ({ title: 't', overview: 'x', topics: [], decisions: [], action_items: [], open_questions: [] }),
   // 路由這一層不跑轉錄鏈，抽標籤也不會被呼叫到；形狀要在，缺了型別就對不上
   extractTopicTags: async () => [],
@@ -433,6 +432,18 @@ describe('PUT /api/meetings/:id/audio', () => {
   it('找不到 Meeting 時回 404，不建檔', async () => {
     await start();
     const res = await putAudio('沒有這場會', Buffer.alloc(16));
+    expect(res.status).toBe(404);
+  });
+});
+
+describe('全文修潤已拿掉', () => {
+  it('POST /api/gemini/polish 回 404，不會再叫模型', async () => {
+    await start();
+    const res = await fetch(`${url}/api/gemini/polish`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ transcript: [{ start: 0, end: 1, text: 'x' }] }),
+    });
     expect(res.status).toBe(404);
   });
 });
@@ -1046,6 +1057,24 @@ describe('POST /api/meetings 帶 title', () => {
     await start();
     const { body } = await createMeeting({ fileName: 'a.m4a', fileSize: 10, participantIds: [TEST_EMPLOYEE_ID] });
     expect(body.meeting.title).toBeNull();
+  });
+});
+
+describe('POST /api/meetings 帶 meetingContext（背景補充）', () => {
+  it('存進 meeting_context，pipeline 分析時讀的就是這一欄', async () => {
+    await start();
+    const { status, body } = await createMeeting({
+      fileName: 'a.m4a', fileSize: 10, meetingContext: '第三次談採購', participantIds: [TEST_EMPLOYEE_ID],
+    });
+    expect(status).toBe(201);
+    expect(body.meeting.meeting_context).toBe('第三次談採購');
+    expect(store.getMeeting(body.meeting.meeting_id)!.meeting_context).toBe('第三次談採購');
+  });
+
+  it('沒給是 null', async () => {
+    await start();
+    const { body } = await createMeeting({ fileName: 'a.m4a', fileSize: 10, participantIds: [TEST_EMPLOYEE_ID] });
+    expect(body.meeting.meeting_context).toBeNull();
   });
 });
 

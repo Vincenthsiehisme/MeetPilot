@@ -124,24 +124,66 @@ export function cleanJsonString(str: string | undefined): string {
   return cleaned;
 }
 
+// 網路層的錯誤碼：Node 內建 fetch（undici）連線失敗只丟一句 `fetch failed`，真正的原因在 `cause.code`
+const TRANSIENT_NETWORK_CODES = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ECONNABORTED',
+  'ETIMEDOUT',
+  'EPIPE',
+  'EAI_AGAIN',
+  'ENETUNREACH',
+  'EHOSTUNREACH',
+  'UND_ERR_SOCKET',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT',
+]);
+
 /**
  * 這個錯誤值不值得退到 fallback 鏈的下一個。
  *
  * W4 把它從 `generateContentWithFallback` 的 body 抽出來（判斷字串逐字相同，行為未變），
  * 因為 embedding 沒有 fallback 鏈卻一樣要在紀錄裡分得出 transient 與 fatal。
  * 留兩份的話，之後加一個新的限流訊息只會改到其中一份，而紀錄上看不出哪一份沒改。
+ *
+ * 網路層錯誤（`fetch failed`、連線被重設、逾時）也算 transient（vault plan「MeetPilot · 記錄完整度、
+ * 成本與背景運作」AC-5）：09-16～10-08 的紀錄裡 `fetch failed` 共 13 次，以前一次就判 fatal，
+ * 這一片直接失敗、整個 job 退回重來，其實換一次連線多半就過了。
  */
 export function isTransientLlmError(err: any): boolean {
   const msg = (err?.message || '').toLowerCase();
-  return (
+  if (
     msg.includes('503') ||
     msg.includes('unavailable') ||
     msg.includes('high demand') ||
     msg.includes('429') ||
     msg.includes('resource_exhausted') ||
     msg.includes('overloaded')
-  );
+  ) {
+    return true;
+  }
+  if (
+    msg.includes('fetch failed') ||
+    msg.includes('socket hang up') ||
+    msg.includes('other side closed') ||
+    msg.includes('timed out') ||
+    msg.includes('timeout')
+  ) {
+    return true;
+  }
+  const codes = [err?.code, err?.cause?.code].filter((code): code is string => typeof code === 'string');
+  return codes.some((code) => TRANSIENT_NETWORK_CODES.has(code))
+    || [...TRANSIENT_NETWORK_CODES].some((code) => msg.includes(code.toLowerCase()));
 }
+
+/**
+ * 轉錄呼叫的輸出上限（vault plan「MeetPilot · 記錄完整度、成本與背景運作」AC-9）。
+ * Gemini 3 系列的 thinking token 也算進這個上限。09-16～10-08 的紀錄裡正常切片 output 最多約 1.2 萬、
+ * thinking 最多約 1.4 萬，合起來留了餘裕；沒設上限時有一次輸出 65,522 token 撞到模型自己的上限，
+ * 白燒一整片的錢、內容還是截斷的。撞到上限當這次呼叫失敗（見 transcribeSlice 的 validateResponse）
+ */
+export const TRANSCRIBE_MAX_OUTPUT_TOKENS = 32768;
 
 class RetryableLlmResponseError extends Error {
   constructor(message: string) {
@@ -150,15 +192,16 @@ class RetryableLlmResponseError extends Error {
   }
 }
 
-export function formatTranscriptForAI(transcript: TranscriptSegment[]): string {
-  return transcript.reduce((acc, curr, idx, arr) => {
-    const prev = arr[idx - 1];
-    const speaker = curr.speaker || 'Unknown';
-    if (prev && (prev.speaker || 'Unknown') === speaker) {
-      return acc + ` ${curr.text}`;
-    }
-    return acc + (acc ? '\n\n' : '') + `${speaker}: ${curr.text}`;
-  }, '');
+/**
+ * 輸出撞到 maxOutputTokens（finishReason MAX_TOKENS）。仍算可重試的空輸出一類，
+ * 但 `generateContentWithFallback` 不在同一個模型再試，直接換下一個：同一段音訊同一個模型
+ * 再試多半一樣停不下來，又燒滿一次上限（AC-9 要擋的正是這筆花費）
+ */
+class MaxTokensLlmResponseError extends RetryableLlmResponseError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'MaxTokensLlmResponseError';
+  }
 }
 
 export function formatTranscriptWithTimeForAI(transcript: TranscriptSegment[]): string {
@@ -175,8 +218,8 @@ export function formatTranscriptWithTimeForAI(transcript: TranscriptSegment[]): 
 
 /**
  * 給 `analyzeTranscript` 用：逐字稿標成 `[#n MM:SS-MM:SS] 講者: 內容`，一段一行、
- * n 是 1-based 陣列索引。**不能沿用 `formatTranscriptForAI`**（同講者連續發言會合併成一段），
- * 那會讓編號對不上 `transcript` 陣列的實際索引，`buildAnalysisV3FromModelOutput` 換算出處
+ * n 是 1-based 陣列索引。**一段一行、不能合併**（例如把同講者連續發言併成一段），
+ * 合併會讓編號對不上 `transcript` 陣列的實際索引，`buildAnalysisV3FromModelOutput` 換算出處
  * 時會拿到錯的段落。模型回段落編號，不回秒數：秒數模型會算錯，編號只要查表。
  */
 export function formatTranscriptForAnalysis(transcript: readonly TranscriptSegment[]): string {
@@ -411,7 +454,6 @@ export interface GeminiServerClient {
    */
   readonly embeddingModel: string;
   transcribeSlice(input: TranscribeSliceInput): Promise<TranscriptSegment[]>;
-  polishTranscript(transcript: TranscriptSegment[]): Promise<string>;
   /** 會議記錄分析（`C-ANALYSIS` v3）。規範正本 `prompts/meeting-record-spec.md`，出處回段落編號
    * 不是秒數，見 `AnalysisModelOutput` 檔頭與 `analysisContract.ts` 的 `buildAnalysisV3FromModelOutput` */
   analyzeTranscript(input: AnalyzeTranscriptInput): Promise<AnalysisModelOutput>;
@@ -522,6 +564,11 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
             throw err;
           }
 
+          if (err instanceof MaxTokensLlmResponseError) {
+            console.warn(`[Gemini Request] Model ${model} 撞到輸出上限，不在同一個模型重試，改用 fallback 鏈的下一個模型`);
+            break;
+          }
+
           if (rateLimit) {
             if (rateLimit.dailyQuotaExhausted) {
               console.warn(`[Gemini Request] Model ${model} 今天的額度用完，改用 fallback 鏈的下一個模型`);
@@ -554,7 +601,7 @@ export function createGeminiServerClient(llmLogger: LlmLogger): GeminiServerClie
         base64Data,
         offsetSeconds = 0,
         previousContext = '',
-        mimeType = 'audio/wav',
+        mimeType = 'audio/flac',
         sliceDurationSeconds,
         meetingId,
         participantNames,
@@ -584,9 +631,10 @@ Output JSON format:
 { "segments": [{ "start": 0.0, "end": 5.5, "text": "完整的句子內容...", "speaker": "Speaker 1" }] }`,
         // 逐字稿是機械式的照抄任務，不需要推理，調低 thinking level 降低「thinking 吃光
         // maxOutputTokens、response.text 變空」的機率（2026-09-16 查證：Gemini 3 系列的
-        // thinking token 算進 maxOutputTokens，這支呼叫又沒設上限）。不是保證消除，是降低機率：
+        // thinking token 算進 maxOutputTokens）。不是保證消除，是降低機率：
         // llm.jsonl 的 finishReason 欄位之後能直接看出還有沒有撞到 MAX_TOKENS
         thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        maxOutputTokens: TRANSCRIBE_MAX_OUTPUT_TOKENS,
         responseMimeType: 'application/json',
         responseSchema: {
           type: Type.OBJECT,
@@ -615,6 +663,16 @@ Output JSON format:
         contents: { parts },
         config: promptConfig,
         validateResponse: (candidate) => {
+          // 撞到輸出上限的內容是截斷的。以前留到 fallback 外面解 JSON 才拋，這一片直接失敗、
+          // 不換模型；在這裡拋就換 fallback 鏈的下一個模型（同一個模型不重試，見
+          // MaxTokensLlmResponseError），截斷的內容一個字都不收。
+          // llm.jsonl 那一筆的 finishReason 是 MAX_TOKENS、errorMessage 是下面這句
+          // （transientReason 會記成 empty_output：llmTelemetry 的列舉只有兩種，這包不改契約檔）
+          if (candidate?.candidates?.[0]?.finishReason === 'MAX_TOKENS') {
+            throw new MaxTokensLlmResponseError(
+              `Gemini 轉錄輸出撞到 maxOutputTokens 上限（${TRANSCRIBE_MAX_OUTPUT_TOKENS}，finishReason MAX_TOKENS），不收截斷的內容`,
+            );
+          }
           if (
             typeof candidate?.text !== 'string'
             || candidate.text.trim() === ''
@@ -678,34 +736,6 @@ Output JSON format:
       }
 
       return normalizeTranscribedSegments(rawSegments, offsetSeconds, sliceDurationSeconds);
-    },
-
-    async polishTranscript(transcript: TranscriptSegment[]): Promise<string> {
-      const ai = getAI();
-      const fullText = formatTranscriptForAI(transcript);
-
-      const { response } = await generateContentWithFallback(ai, {
-        kind: 'polish',
-        preferredModel: 'gemini-3.8-flash',
-        contents: `請將以下會議逐字稿進行「全文修潤」。
-      
-原始逐字稿可能包含破碎的句子、文法錯誤或贅字。
-請將其重寫為一篇流暢、通順的「對話劇本」或「文章」。
-
-要求：
-1. **修正語病**：將口語轉化為通順的書面語，但保留原意。
-2. **標示講者**：保留對話形式 (Speaker: Content)。
-3. **分段清晰**：適當分段，增加可讀性。
-4. **Markdown 格式**：使用 Markdown 格式輸出。
-
-原始內容：
-${fullText}`,
-        config: {
-          systemInstruction: '你是一位專業的文字編輯，擅長將口語逐字稿潤飾為高品質的訪談文章或劇本。',
-        },
-      });
-
-      return response.text || '無法生成修潤內容';
     },
 
     /**

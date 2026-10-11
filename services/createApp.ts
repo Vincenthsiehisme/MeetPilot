@@ -242,7 +242,7 @@ export function createApp(deps: AppDeps): express.Express {
     const result = apiRateLimiter.check(clientIp);
     if (!result.allowed) {
       res.setHeader('Retry-After', String(result.retryAfterSeconds));
-      // 前端 services/retryPolicy.ts 靠 HttpError.status === 429 加 Retry-After 決定退避；訊息帶 "429" 是給人看的，也讓 translateError 分類得到
+      // 前端 services/httpResponse.ts 把 429 與 Retry-After 翻成 HttpError；訊息帶 "429" 是給人看的，也讓 translateError 分類得到
       return res.status(429).json({ error: `請求太頻繁 (HTTP 429)，請 ${result.retryAfterSeconds} 秒後再試` });
     }
     next();
@@ -413,38 +413,6 @@ export function createApp(deps: AppDeps): express.Express {
     res.status(described.status).json({ error: described.error });
   });
 
-  function handleApiError(err: any, res: express.Response) {
-    console.error('[Gemini API Server Error]:', err?.message || err);
-    let statusCode = 500;
-    let message = err?.message || 'Gemini API 處理發生錯誤';
-
-    try {
-      if (typeof err?.message === 'string' && err.message.trim().startsWith('{')) {
-        const parsed = JSON.parse(err.message);
-        if (parsed?.error) {
-          statusCode = parsed.error.code || 500;
-          message = parsed.error.message || message;
-        }
-      }
-    } catch {}
-
-    if (err?.status && typeof err.status === 'number') {
-      statusCode = err.status;
-    }
-
-    // Prevent reverse proxies (e.g. nginx in container) from intercepting 502/503/504
-    // and returning an HTML page (<!doctype html>) instead of our JSON response.
-    if (statusCode === 502 || statusCode === 503 || statusCode === 504) {
-      statusCode = 500;
-    }
-
-    res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    res.status(statusCode >= 400 && statusCode < 600 ? statusCode : 500).json({
-      error: message,
-      rawError: err?.message,
-    });
-  }
-
   // API Health Check
   app.get('/api/health', (req, res) => {
     res.json({
@@ -453,8 +421,7 @@ export function createApp(deps: AppDeps): express.Express {
     });
   });
 
-  // Meeting 相關的錯誤自己接：handleApiError 是為 Gemini 的錯誤形狀寫的（會去解析 err.message 裡的 JSON），
-  // 用在這裡會把 store 的錯誤印成 Gemini 錯誤，出事時找錯地方
+  // Meeting 相關的錯誤自己接，訊息照原樣回給前端
   function handleStoreError(err: unknown, res: express.Response) {
     const message = err instanceof Error ? err.message : String(err);
     console.error('[MeetPilot Store Error]:', message);
@@ -1186,24 +1153,10 @@ export function createApp(deps: AppDeps): express.Express {
     }
   });
 
-  // 前端仍在用的唯一一條 Gemini 路由。轉錄與分析的路由在 W2 T2 之後零呼叫端（那兩件事的發起點
-  // 改成 server 端的 transcriptionPipeline），已經移除；問答串流路由在 2026-09-20 連同前端一起拿掉。
+  // 沒有對外的 Gemini 路由。轉錄與分析的路由在 W2 T2 之後零呼叫端（那兩件事的發起點
+  // 改成 server 端的 transcriptionPipeline），已經移除；問答串流路由在 2026-09-20 連同前端一起拿掉；
+  // 全文修潤（POST /api/gemini/polish）在 2026-10-10 連同前端按鈕一起拿掉。
   // geminiServerClient 的 transcribeSlice 與 analyzeTranscript 都是 pipeline 內部呼叫，沒有對外路由。
-
-  // Polish Transcript（components/TranscriptView.tsx）
-  app.post('/api/gemini/polish', async (req, res) => {
-    try {
-      const { transcript } = req.body;
-      if (!transcript || !Array.isArray(transcript) || transcript.length === 0) {
-        return res.json({ content: '' });
-      }
-
-      const content = await geminiClient.polishTranscript(transcript);
-      res.json({ content });
-    } catch (err: any) {
-      handleApiError(err, res);
-    }
-  });
 
   return app;
 }

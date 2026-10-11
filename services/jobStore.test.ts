@@ -218,3 +218,49 @@ describe('reclaimAllActive（server 啟動時呼叫一次）', () => {
     expect(jobs.get(jobId)?.status).toBe('failed');
   });
 });
+
+describe('activeMeetingIds', () => {
+  it('queued、claimed、running 都算，每場只列一次；succeeded、failed 不算', () => {
+    meetingStore.createMeeting({ meeting_id: 'm-2', created_at: T0, source_file_name: 'b.m4a', source_file_size: 1 });
+    meetingStore.createMeeting({ meeting_id: 'm-3', created_at: T0, source_file_name: 'c.m4a', source_file_size: 1 });
+    jobs.enqueue('m-1', 'transcription', null, T0);
+    jobs.claim('transcription', 'w', 60_000, T0 + 1);
+    jobs.enqueue('m-1', 'analysis', { source_kind: 'raw', source_edit_version: null }, T0 + 2);
+    const m2 = jobs.enqueue('m-2', 'transcription', null, T0 + 3)!;
+    jobs.markSucceeded(m2, T0 + 4);
+    expect(jobs.activeMeetingIds()).toEqual(['m-1']);
+    const m3 = jobs.enqueue('m-3', 'transcription', null, T0 + 5)!;
+    expect(jobs.activeMeetingIds().sort()).toEqual(['m-1', 'm-3']);
+    jobs.markFailed(m3, 'x', T0 + 6);
+    jobs.markFailed(m3, 'x', T0 + 7);
+    jobs.markFailed(m3, 'x', T0 + 8);
+    expect(jobs.activeMeetingIds()).toEqual(['m-1']);
+  });
+});
+
+describe('listLatestJobs', () => {
+  it('每場會每種 kind 只回最新一筆，失敗用盡的那筆帶 error', () => {
+    const first = jobs.enqueue('m-1', 'transcription', null, T0)!;
+    jobs.markFailed(first, '壞了', T0 + 1);
+    jobs.markFailed(first, '壞了', T0 + 2);
+    jobs.markFailed(first, '壞了', T0 + 3);
+    expect(jobs.listLatestJobs()).toEqual([
+      { job_id: first, meeting_id: 'm-1', kind: 'transcription', status: 'failed', error: '壞了' },
+    ]);
+
+    const second = jobs.enqueue('m-1', 'transcription', null, T0 + 10)!;
+    const analysis = jobs.enqueue('m-1', 'analysis', { source_kind: 'raw', source_edit_version: null }, T0 + 11)!;
+    const latest = jobs.listLatestJobs();
+    expect(latest).toHaveLength(2);
+    expect(latest.find(j => j.kind === 'transcription')).toMatchObject({ job_id: second, status: 'queued', error: null });
+    expect(latest.find(j => j.kind === 'analysis')).toMatchObject({ job_id: analysis, status: 'queued' });
+  });
+
+  it('同一毫秒建立的兩筆（前一筆已 succeeded）取後插入的', () => {
+    const first = jobs.enqueue('m-1', 'transcription', null, T0)!;
+    jobs.claim('transcription', 'w', 60_000, T0);
+    jobs.markSucceeded(first, T0);
+    const second = jobs.enqueue('m-1', 'transcription', null, T0)!;
+    expect(jobs.listLatestJobs().map(j => j.job_id)).toEqual([second]);
+  });
+});

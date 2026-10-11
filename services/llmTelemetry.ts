@@ -38,8 +38,8 @@ export interface LlmUsage {
 export interface LlmCallInput {
   kind: LlmCallKind;
   // 這場呼叫算在哪一場會議頭上，事後才查得出「這場會燒了多少 token」。
-  // null／缺省代表這次呼叫真的沒有單一會議可歸——目前只有前端的 polish 舊路由
-  // 還沒把 meetingId 帶進請求，其餘 kind 一律會傳
+  // null／缺省代表這次呼叫真的沒有單一會議可歸。'polish' kind 只留給解析舊的 llm.jsonl，
+  // 全文修潤已拿掉，現在不會再有這種呼叫
   meetingId?: string | null;
   // 這次實際打的 model id
   model: string;
@@ -150,8 +150,7 @@ export function extractCandidatesCount(response: unknown): number | null {
   return Array.isArray(candidates) ? candidates.length : 0;
 }
 
-// 抽 HTTP 狀態碼與訊息。與 server.ts 的 handleApiError 看的是同兩個地方
-// （err.status、JSON 字串 message 裡的 error.code），但那支綁著 express response，不能共用。
+// 抽 HTTP 狀態碼與訊息，看兩個地方：err.status、JSON 字串 message 裡的 error.code。
 export function describeLlmError(err: unknown): { status: number | null; message: string } {
   const raw = (err as { message?: unknown } | null | undefined)?.message;
   const message = typeof raw === 'string' ? raw : String(err ?? '');

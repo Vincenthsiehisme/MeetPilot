@@ -95,7 +95,6 @@ const fakeGemini = (overrides: Partial<GeminiServerClient> = {}): GeminiServerCl
   transcribeSlice: async ({ offsetSeconds = 0 }) => [
     { start: offsetSeconds, end: offsetSeconds + 30, text: `第 ${offsetSeconds} 秒開始`, speaker: 'Speaker 1' },
   ],
-  polishTranscript: async () => '潤過的',
   analyzeTranscript: async () => analysisOutput,
   extractTopicTags: async () => [{ title: '題目 A', content: '這場會對題目 A 的討論' }],
   embeddingModel: 'fake-embedding',
@@ -318,6 +317,29 @@ describe('與會者提示接進轉錄與分析呼叫（人名校正 N3）', () =
     for (const names of transcribeCalls) expect(names?.sort()).toEqual(['Philchen', '陳國煌'].sort());
     expect(analyzeCalls).toHaveLength(1);
     expect(analyzeCalls[0]?.sort()).toEqual(['Philchen', '陳國煌'].sort());
+  });
+
+  it('建會議時填的背景補充（meeting_context）帶進分析呼叫的 meetingContext', async () => {
+    store.createMeeting({
+      meeting_id: 'm-1', created_at: T0, source_file_name: 'a.m4a', source_file_size: 10, meeting_context: '第三次談採購',
+    });
+    const seen: (string | undefined)[] = [];
+    const pipeline = pipelineWith({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(30),
+      gemini: fakeGemini({
+        analyzeTranscript: async ({ meetingContext }) => {
+          seen.push(meetingContext);
+          return analysisOutput;
+        },
+      }),
+      now: () => T0 + 1,
+    });
+
+    await pipeline.run('m-1');
+
+    expect(seen).toEqual(['第三次談採購']);
   });
 
   it('沒帶 peopleStore 時 participantNames 是空陣列，既有不關心人名校正的測試不受影響', async () => {
@@ -794,6 +816,33 @@ describe('run：破洞修復（W2-2b）', () => {
     expect(calls.length).toBeGreaterThan(2);
   });
 
+  it('橋接窗也切 FLAC、mimeType 是 audio/flac，跟切片本體同一種格式（AC-5）', async () => {
+    const inner = gappyGemini(true);
+    const mimeTypes: (string | undefined)[] = [];
+    const formats: string[] = [];
+    newMeeting();
+    const pipeline = pipelineWith({
+      store,
+      audioStore: fakeAudioStore(new Set(['m-1'])),
+      slicer: fakeSlicer(SLICE_DURATION_SECONDS + 200, async (_path, _start, _duration, format) => {
+        formats.push(format);
+        return toneWav();
+      }),
+      gemini: { ...inner, transcribeSlice: (input) => { mimeTypes.push(input.mimeType); return inner.transcribeSlice(input); } },
+      now: () => T0 + 1,
+    });
+    await pipeline.run('m-1');
+
+    expect(store.getSeamReport('m-1')![0].repair?.outcome).toBe('repaired');
+    // 切片兩次 ＋ 橋接至少一次
+    expect(mimeTypes.length).toBeGreaterThan(2);
+    expect(mimeTypes.every(m => m === 'audio/flac')).toBe(true);
+    // 第一個是量音量的 WAV，其餘全是送 Gemini 的 FLAC
+    expect(formats[0]).toBe('wav');
+    expect(formats.slice(1).length).toBe(mimeTypes.length);
+    expect(formats.slice(1).every(f => f === 'flac')).toBe(true);
+  });
+
   it('補不回來時記成 failed，而且不把接不上的橋接塞進逐字稿', async () => {
     const { report, texts } = await runWith(gappyGemini(false));
 
@@ -1263,20 +1312,31 @@ describe('轉錄前擋掉整支沒有聲音的音檔', () => {
     expect(store.getMeeting('m-1')?.status).toBe('READY');
   });
 
-  it('第一片就有聲音 → 量音量用的那一片直接拿去轉錄，不重切', async () => {
+  it('第一片就有聲音 → 量音量切 WAV、找到聲音就停；送 Gemini 的每一片另切 FLAC、mimeType 是 audio/flac（AC-5）', async () => {
     newMeeting();
-    const sliced: number[] = [];
+    const sliced: string[] = [];
+    const mimeTypes: (string | undefined)[] = [];
     const pipeline = pipelineWith({
       store,
       audioStore: fakeAudioStore(new Set(['m-1'])),
-      slicer: fakeSlicer(THREE_SLICE_DURATION, async (_path, start) => { sliced.push(start); return toneWav(); }),
-      gemini: fakeGemini(),
+      slicer: fakeSlicer(THREE_SLICE_DURATION, async (_path, start, _duration, format) => {
+        sliced.push(`${start}:${format}`);
+        return toneWav();
+      }),
+      gemini: fakeGemini({
+        transcribeSlice: async ({ offsetSeconds = 0, mimeType }) => {
+          mimeTypes.push(mimeType);
+          return [{ start: offsetSeconds, end: offsetSeconds + 30, text: `片段 ${offsetSeconds}`, speaker: 'S' }];
+        },
+      }),
       now: () => T0 + 1,
     });
 
     await pipeline.run('m-1');
 
-    expect(sliced).toEqual([0, 600, 1200]);
+    // wavLevel 只讀得懂 WAV，所以量音量那一片不能沿用成送出去的那一片
+    expect(sliced).toEqual(['0:wav', '0:flac', '600:flac', '1200:flac']);
+    expect(mimeTypes).toEqual(['audio/flac', 'audio/flac', 'audio/flac']);
   });
 });
 

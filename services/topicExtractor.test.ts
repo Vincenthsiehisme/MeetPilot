@@ -14,7 +14,6 @@ let store: MeetingStore;
 
 const fakeGemini = (extract: () => Promise<ExtractedTopicTag[]>): GeminiServerClient => ({
   transcribeSlice: async () => [],
-  polishTranscript: async () => '',
   analyzeTranscript: async () => ({ title: 't', overview: 'x', topics: [], decisions: [], action_items: [], open_questions: [] }),
   extractTopicTags: extract,
   embeddingModel: 'fake-embedding',

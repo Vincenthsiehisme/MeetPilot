@@ -17,7 +17,8 @@
     "package:win": "npm run build && npm run build:electron && electron-builder --win --publish never",
     "ffmpeg:build": "bash scripts/ffmpeg/build.sh",
     "ffmpeg:verify": "tsx scripts/verifyFfmpeg.ts",
-    "icons:build": "tsx scripts/buildIcons.ts"
+    "icons:build": "tsx scripts/buildIcons.ts",
+    "cost:report": "tsx scripts/costReport.ts"
   },
   "dependencies": {
     "@google/genai": "^1.38.0",

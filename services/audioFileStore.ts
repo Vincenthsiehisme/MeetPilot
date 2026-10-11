@@ -106,6 +106,10 @@ export function createAudioFileStore(dir: string) {
      * 而它不會被任何一條路徑刪掉——`remove()` 刪的是最終檔名，續傳掃描也只看最終檔名。
      * 不清的話那些半個音檔會一直佔著空間，而且沒有人看得出來它們屬於哪一次失敗的上傳。
      * 有對應 Meeting 的也照清：那次上傳沒完成，檔案本來就不完整。
+     *
+     * 逐檔容錯：某個檔刪不掉（Windows 防毒或 OneDrive 鎖住，EBUSY／EPERM）只 warn，其餘照刪，整支不拋。
+     * server 在 listen 前呼叫這支，拋了 server 就起不來；刪不掉的下次啟動再試。
+     * 回傳的是真的刪掉的檔，刪不掉的不算進去，server 的「清掉 N 個」才不會多報。
      */
     removePartialUploads: (): string[] => {
       const removed: string[] = [];
@@ -114,7 +118,16 @@ export function createAudioFileStore(dir: string) {
         // `_part` 是 tempPathFor 給外部程式（語音備忘錄取檔捷徑）用的暫存名，理由見那支的說明
         if (!name.endsWith('.part') && !name.endsWith(EXTERNAL_TEMP_SUFFIX)) continue;
         const target = join(dir, name);
-        rmSync(target, { force: true });
+        try {
+          rmSync(target, { force: true });
+        } catch (err) {
+          const code = (err as { code?: unknown } | null | undefined)?.code;
+          console.warn(
+            `[audioFileStore] 暫存音檔刪不掉（${typeof code === 'string' ? code : '沒有錯誤碼'}），下次啟動再試：${target}`,
+            err,
+          );
+          continue;
+        }
         removed.push(target);
       }
       return removed;
