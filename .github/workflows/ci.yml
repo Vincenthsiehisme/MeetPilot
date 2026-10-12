@@ -135,17 +135,22 @@ jobs:
         run: |
           ext=""; [ "$RUNNER_OS" = "Windows" ] && ext=".exe"
           npx tsx scripts/verifyFfmpeg.ts "${{ matrix.bundled-ffmpeg }}/ffmpeg$ext" "${{ matrix.bundled-ffmpeg }}/ffprobe$ext"
+      # 安裝檔 PR 上照樣打包（守打包設定），只有 main 才上傳。artifact 吃帳號的儲存額度，2026-10-12 撞滿後
+      # 每次 CI 的 desktop 兩格都紅在上傳這一步，程式碼全過也一樣。這包只是給同一次 run 的 update-bundle 下載，留 1 天就夠
       - run: npx electron-builder ${{ matrix.dist-args }} --publish never
-      - uses: actions/upload-artifact@v4
+      - if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
         with:
           name: installer-${{ matrix.os }}
           path: ${{ matrix.artifact }}
-          retention-days: 14
+          retention-days: 1
 
   # 兩個平台的安裝檔整理成一包更新檔（E5）：安裝檔加 meetpilot-update.json（版本、每個平台的檔名、大小、sha512）。
   # admin 下載 update-bundle 這個 artifact，整包放進 OneDrive 的 MeetPilot 記錄/_更新/，舊版的檔案刪掉。
   # 少了任何一個平台、或安裝檔版本跟 package.json 不一樣，這一步就紅，不產半套的清單。
+  # 只在 main 跑：PR 不上傳安裝檔，這裡也就沒東西可下載。留 3 天，過期了在 Actions 對那次 main 的 run 按 Re-run 重產
   update-bundle:
+    if: github.ref == 'refs/heads/main'
     needs: desktop
     runs-on: ubuntu-latest
     steps:
@@ -164,4 +169,4 @@ jobs:
         with:
           name: update-bundle
           path: update-bundle/
-          retention-days: 14
+          retention-days: 3
