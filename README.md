@@ -191,6 +191,7 @@ node scripts/smokeDesktop.mjs <打包後的執行檔>   # 啟動打包後的 app
   - **發版（admin）：** 升 `package.json` 的 `version`，推上去等 CI 跑完，下載 `update-bundle` 這個 artifact，
     裡面的檔案（兩個 dmg、一個 exe、`meetpilot-update.json`）全部放進 `_更新/`，舊版的檔案刪掉。
     這包由 `scripts/writeUpdateBundle.ts` 產，少任何一個平台、或安裝檔版本跟 `package.json` 不一樣就不產。
+    只有 main 的 CI 產這包（PR 不上傳安裝檔），留 3 天；過期了在 GitHub Actions 對那次 main 的 run 按 Re-run 重產。
     升版的 PR merge 之後，在那個 merge commit 打 `v<版本>` 的 tag，tag message 寫這版之後使用者看到什麼不一樣。
   - `_更新/` 對記錄人的群組只給檢視權限，只有 admin 能寫：安裝檔沒有簽章，app 會直接執行它。
   - Windows：安裝檔先複製到暫存、複本再驗一次雜湊，才以 `--updated /S --force-run` 靜默安裝，MeetPilot 結束、裝完自動重開。
