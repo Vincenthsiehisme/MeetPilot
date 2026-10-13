@@ -239,7 +239,12 @@ function f(p: Pick) {
   `electron/gatewayClient.ts`，改之前先看檔頭；冒煙測試的「撤銷」那段守它。
 - **更新（E5）不用 electron-updater**，理由在 `electron/updater.ts` 檔頭。安裝檔檔名是契約：`build.dmg`／`build.nsis` 的
   `artifactName` 是 `MeetPilot-<版本>-<mac|win>-<架構>.<dmg|exe>`，`electron/updateBundle.ts` 從檔名讀平台與架構產清單，
-  改一邊要改另一邊的 `ARTIFACT_NAME_PATTERN`，不然 CI 的 `update-bundle` job 紅在「少了某個平台」。
+  改一邊要改另一邊的 `ARTIFACT_NAME_PATTERN`，不然 CI 的 `update-bundle` job 紅在「少了某個平台」；`ci.yml` 從 Release
+  下載安裝檔用的 `MeetPilot-*.dmg`／`MeetPilot-*.exe` 也跟著這個檔名。
+- **安裝檔與清單放 GitHub Release，不放 Actions artifact**（artifact 吃帳號的儲存額度，2026-10 撞滿過）。`ci.yml` 的 `release`
+  job 決定這次發不發（判斷順序寫在它上面的註解），傳檔期間是 draft，全部傳完、annotated tag 建好才發布。
+  tag message 與 Release 說明都是 `CHANGELOG.md` 那一版的段落（`scripts/releaseNotes.ts`），不要改成手打 tag 或
+  讓 GitHub 發布時自動建 tag：那會是沒有 message 的 lightweight tag。
   清單格式只有 `parseUpdateManifest` 一份定義，`updateBundle.test.ts` 拿 app 端的 `checkForUpdate` 讀產出的清單來守；
   改格式要升 `UPDATE_MANIFEST_SCHEMA`，舊版 app 看到不認得的 schema 會講出來、不安裝。
   「錄音中不裝」與「按下去真的安裝」在 `main.ts`，沒有自動測試，實際換版在實機驗（AC-7）。

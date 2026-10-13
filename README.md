@@ -188,11 +188,14 @@ node scripts/smokeDesktop.mjs <打包後的執行檔>   # 啟動打包後的 app
 - **從共享資料夾更新（E5，`electron/updater.ts`）。** 新版放在投影資料夾的上一層 `_更新/`，也就是 OneDrive 的
   `MeetPilot 記錄/_更新/`（投影資料夾是 `MeetPilot 記錄/<自己的名字>/`）。app 啟動時、每 4 小時、托盤「檢查更新…」各看一次；
   清單版本比這版新、安裝檔大小與 sha512 都對得上，才在托盤與畫面右上角提示「安裝新版」，按了才裝。
-  - **發版（admin）：** 升 `package.json` 的 `version`，推上去等 CI 跑完，下載 `update-bundle` 這個 artifact，
-    裡面的檔案（兩個 dmg、一個 exe、`meetpilot-update.json`）全部放進 `_更新/`，舊版的檔案刪掉。
-    這包由 `scripts/writeUpdateBundle.ts` 產，少任何一個平台、或安裝檔版本跟 `package.json` 不一樣就不產。
-    只有 main 的 CI 產這包（PR 不上傳安裝檔），留 3 天；過期了在 GitHub Actions 對那次 main 的 run 按 Re-run 重產。
-    升版的 PR merge 之後，在那個 merge commit 打 `v<版本>` 的 tag，tag message 寫這版之後使用者看到什麼不一樣。
+  - **發版（admin）：** 升 `package.json` 的 `version`，同一個 PR 在 `CHANGELOG.md` 加一段 `## v<版本>：<一句話>`，
+    寫這版之後記錄人看到什麼不一樣（少了這段 PR 的 CI 就紅）。merge 進 main 後 CI 建 `v<版本>` 的 GitHub Release：
+    兩個 dmg、一個 exe、`meetpilot-update.json`，tag 是 CI 用那段文字建的 annotated tag，不用自己打。
+    跑完從 Releases 頁下載這四個檔，全部放進 `_更新/`，舊版的檔案刪掉。
+    清單由 `scripts/writeUpdateBundle.ts` 產，少任何一個平台、或安裝檔版本跟 `package.json` 不一樣，Release 就停在 draft、不發布。
+    版本沒變的 main push 不建 Release；這一版已有 Release（含 draft）或已有 tag 也不建。
+    發到一半失敗：同一個 commit 在 GitHub Actions 按 Re-run all jobs 會接著傳。要改碼再發，先 `gh release delete v<版本> --yes`
+    刪掉 draft，新的 commit 推上去才會重建；新的 commit 已經推了、那次 run 因為舊 draft 而跳過，刪完對那次 run 按 Re-run all jobs。安裝檔不放 Actions artifact，artifact 吃帳號的儲存額度，Release 不算在內。
   - `_更新/` 對記錄人的群組只給檢視權限，只有 admin 能寫：安裝檔沒有簽章，app 會直接執行它。
   - Windows：安裝檔先複製到暫存、複本再驗一次雜湊，才以 `--updated /S --force-run` 靜默安裝，MeetPilot 結束、裝完自動重開。
     macOS：沒有簽章不能自動換版，打開 dmg 後結束，使用者把 MeetPilot 拖到「應用程式」取代，再自己打開。
