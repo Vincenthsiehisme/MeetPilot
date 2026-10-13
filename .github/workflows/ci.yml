@@ -8,6 +8,10 @@ on:
     branches: [main]
   pull_request:
 
+# 只有發版的三個 job（release、desktop、update-bundle）要寫 Release 與 tag，各自另開 contents: write
+permissions:
+  contents: read
+
 jobs:
   # 本機 hook 只在設定過的 clone 生效，GitHub 網頁 merge、fork 送來的 commit 都不經過它。
   # 這裡每次掃 HEAD 的整段祖先（改動與 commit message，兩步範圍一致，不掃 origin 上別的分支），
@@ -57,11 +61,88 @@ jobs:
       - run: npm prune --omit=dev
       - run: node scripts/smokeProduction.mjs
 
+  # 發版（安裝檔與更新清單放 GitHub Release，不用 artifact：artifact 吃帳號的儲存額度，2026-10 撞滿過，Release 不算在內）。
+  # package.json 這一版還沒有 tag，就要有 CHANGELOG.md 的那一段，PR 上就驗，升版忘了寫說明在 PR 就紅。
+  # main 上再決定這次發不發，結果（mode）給 desktop 與 update-bundle：
+  #   - 已發布的 Release 已在 → skip，不動它
+  #   - draft 已在、target 是這個 commit → resume：同一個 commit 重跑，接著傳、覆蓋 draft 上的檔
+  #   - draft 已在、target 是別的 commit → skip：同版本的另一次 push 正在發或發失敗了，要用這個 commit 發，先刪 draft 再重跑
+  #   - 沒有 Release 但 tag 已在 → skip：v0.2.0 這種當時手打 tag 的版本，main 已多了之後的碼，照建版本號會跟內容對不上
+  #   - 都沒有 → create：建 draft
+  # 傳檔期間一直是 draft，兩平台的安裝檔與清單都傳完、tag 建好才轉成發布，看得到的 Release 不會少檔案。
+  # 同一個 ref 的 release job 一次只跑一個：兩次 main push 隔幾秒的話，兩邊都還沒看到對方的 draft，會建出兩個同名 draft
+  release:
+    needs: gate
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    outputs:
+      mode: ${{ steps.decide.outputs.mode }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: 這一版有沒有 tag
+        id: version
+        run: |
+          tag="v$(node -p "require('./package.json').version")"
+          tagged=$(git ls-remote --tags origin "refs/tags/$tag")
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ -n "$tagged" ]; then echo "tagged=true" >> "$GITHUB_OUTPUT"; else echo "tagged=false" >> "$GITHUB_OUTPUT"; fi
+      - name: 版本說明（CHANGELOG.md）
+        if: steps.version.outputs.tagged == 'false'
+        run: npx tsx scripts/releaseNotes.ts > tag-message.txt
+      - name: 這次發不發
+        id: decide
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          TAGGED: ${{ steps.version.outputs.tagged }}
+        run: |
+          if [ "$GITHUB_REF" != refs/heads/main ]; then echo "mode=skip" >> "$GITHUB_OUTPUT"; exit 0; fi
+          found=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate --jq ".[] | select(.tag_name == \"$TAG\") | \"\(.draft) \(.target_commitish)\"")
+          n=0; [ -n "$found" ] && n=$(printf '%s\n' "$found" | wc -l)
+          if [ "$n" -gt 1 ]; then
+            echo "::error::$TAG 有 $n 個 Release（含 draft），只能有一個，到 Releases 頁刪掉多的再重跑"
+            exit 1
+          elif [ "$n" -eq 1 ]; then
+            read -r draft target <<< "$found"
+            if [ "$draft" = false ]; then
+              mode=skip; echo "$TAG 已發布，不動它"
+            elif [ "$target" = "$GITHUB_SHA" ]; then
+              mode=resume; echo "$TAG 的 draft 是這個 commit 建的，接著傳"
+            else
+              mode=skip; echo "::warning::$TAG 的 draft 是 commit $target 建的，不是這次的 $GITHUB_SHA。要用這個 commit 發：gh release delete $TAG --yes，再 Re-run all jobs"
+            fi
+          elif [ "$TAGGED" = true ]; then
+            mode=skip; echo "::notice::$TAG 已有 tag 沒有 Release，不建（main 可能已多了那版之後的碼）"
+          else
+            mode=create
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+      - name: 建 draft Release
+        if: steps.decide.outputs.mode == 'create'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          tail -n +3 tag-message.txt > release-notes.md
+          gh release create "$TAG" --draft --target "$GITHUB_SHA" --title "$(head -n1 tag-message.txt)" --notes-file release-notes.md
+
   # 桌面 app：兩個平台各自打包、真的把 app 啟動起來確認裡面的 server 有回應，再產出安裝檔。
   # Windows 上的外殼（utilityProcess、檔案佈局、cwd）能不能跑，只有這一步驗得到。
   # 安裝檔沒有簽章（vault plan 的裁定），macOS 要關掉自動找簽章身分，不然 electron-builder 會去翻 keychain。
   desktop:
-    needs: gate
+    needs: release
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -135,24 +216,29 @@ jobs:
         run: |
           ext=""; [ "$RUNNER_OS" = "Windows" ] && ext=".exe"
           npx tsx scripts/verifyFfmpeg.ts "${{ matrix.bundled-ffmpeg }}/ffmpeg$ext" "${{ matrix.bundled-ffmpeg }}/ffprobe$ext"
-      # 安裝檔 PR 上照樣打包（守打包設定），只有 main 才上傳。artifact 吃帳號的儲存額度，2026-10-12 撞滿後
-      # 每次 CI 的 desktop 兩格都紅在上傳這一步，程式碼全過也一樣。這包只是給同一次 run 的 update-bundle 下載，留 1 天就夠
+      # release job 過了就打包，PR 上也打（守打包設定），只有 release job 判定要發的那次才傳上 draft Release。
+      # 不用 artifact：artifact 吃帳號的儲存額度，2026-10-12 撞滿後每次 CI 的 desktop 兩格都紅在上傳，程式碼全過也一樣
       - run: npx electron-builder ${{ matrix.dist-args }} --publish never
-      - if: github.ref == 'refs/heads/main'
-        uses: actions/upload-artifact@v4
-        with:
-          name: installer-${{ matrix.os }}
-          path: ${{ matrix.artifact }}
-          retention-days: 1
+      - if: needs.release.outputs.mode == 'create' || needs.release.outputs.mode == 'resume'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: gh release upload "$TAG" ${{ matrix.artifact }} --clobber
 
-  # 兩個平台的安裝檔整理成一包更新檔（E5）：安裝檔加 meetpilot-update.json（版本、每個平台的檔名、大小、sha512）。
-  # admin 下載 update-bundle 這個 artifact，整包放進 OneDrive 的 MeetPilot 記錄/_更新/，舊版的檔案刪掉。
-  # 少了任何一個平台、或安裝檔版本跟 package.json 不一樣，這一步就紅，不產半套的清單。
-  # 只在 main 跑：PR 不上傳安裝檔，這裡也就沒東西可下載。留 3 天，過期了在 Actions 對那次 main 的 run 按 Re-run 重產
+  # 兩個平台的安裝檔整理成一份更新清單（E5）：meetpilot-update.json（版本、每個平台的檔名、大小、sha512），傳回同一個 Release。
+  # 安裝檔從 draft 下載回來算，清單對的就是 Release 上那幾個檔。少了任何一個平台、或安裝檔版本跟 package.json 不一樣，
+  # 這一步就紅，Release 停在 draft、不發布。都過了才建 annotated tag（訊息是 CHANGELOG.md 那一段）再轉成發布。
+  # admin 從 Release 下載兩個 dmg、一個 exe、meetpilot-update.json，放進 OneDrive 的 MeetPilot 記錄/_更新/，舊版的檔案刪掉
   update-bundle:
-    if: github.ref == 'refs/heads/main'
-    needs: desktop
+    needs: [release, desktop]
+    if: needs.release.outputs.mode == 'create' || needs.release.outputs.mode == 'resume'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.release.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -160,13 +246,25 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: installer-*
-          path: installers
-      - run: npx tsx scripts/writeUpdateBundle.ts --out update-bundle installers/installer-macos-latest installers/installer-windows-latest
-      - uses: actions/upload-artifact@v4
-        with:
-          name: update-bundle
-          path: update-bundle/
-          retention-days: 3
+      # 只拿安裝檔：resume 時 draft 上可能已有上一次傳的清單
+      - run: gh release download "$TAG" --pattern 'MeetPilot-*.dmg' --pattern 'MeetPilot-*.exe' --dir installers
+      - run: npx tsx scripts/writeUpdateBundle.ts --out update-bundle installers
+      - run: gh release upload "$TAG" update-bundle/meetpilot-update.json --clobber
+      # resume 時 tag 可能已在（上一次建完 tag、發布前失敗）：指在這個 commit 就沿用，指在別的 commit 就紅
+      - name: 建 annotated tag
+        run: |
+          peeled=$(git ls-remote origin "refs/tags/$TAG^{}")
+          if [ -n "$peeled" ]; then
+            if [ "${peeled%%[[:space:]]*}" != "$GITHUB_SHA" ]; then
+              echo "::error::$TAG 已指在 ${peeled%%[[:space:]]*}，不是這次的 $GITHUB_SHA"
+              exit 1
+            fi
+            echo "$TAG 已指在這個 commit，沿用"
+          else
+            npx tsx scripts/releaseNotes.ts > tag-message.txt
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$TAG" -F tag-message.txt "$GITHUB_SHA"
+            git push origin "refs/tags/$TAG"
+          fi
+      - run: gh release edit "$TAG" --draft=false
