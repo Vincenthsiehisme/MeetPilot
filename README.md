@@ -113,6 +113,9 @@ server 行程自己讀不到（`Operation not permitted`），授權是捷徑 Ap
 `MeetPilot · 跨平台打包部署`）。目前做到外殼（E1）、隨附 ffmpeg（E2）、邀請碼設定畫面（E3）、app 內錄音（E4）
 與從共享資料夾更新（E5）。
 
+系統需求：macOS 13 Ventura 以上（Apple Silicon 與 Intel 各一個 dmg）、Windows 10 以上（只出 x64 安裝程式，沒有 Windows arm64 版）。
+下限來自 Electron 44.4.5（打包出的 app `LSMinimumSystemVersion` 是 13.0），MeetPilot 沒另外設；升 Electron 大版時會跟著 Chromium 往上。
+
 ```bash
 npm run ffmpeg:build -- mac-arm64   # 先編隨附的 ffmpeg（mac-arm64、mac-x64、win-x64），輸出到 vendor/ffmpeg/
 npm run desktop        # 建置後直接開桌面 app（開發用）
@@ -154,8 +157,10 @@ node scripts/smokeDesktop.mjs <打包後的執行檔>   # 啟動打包後的 app
   `iconArtwork.test.ts` 守條與點排版時的外框落在整數像素（前傾的條渲染後邊緣本來就是斜的）、前傾之後離方塊左右仍留 1px，
   以及每個尺寸接到對的那一版（`renderPlan`）。macOS 26 會把形狀不合 Apple 格線的 icon 放進灰底框；目前的形狀是超橢圓近似，
   會不會被判不合要在 macOS 26 上裝起來看。要根治得改用 Icon Composer 的 `.icon`（electron-builder 支援，但要 Xcode 26 的 `actool`）。
-- 安裝檔沒有簽章，第一次打開 macOS 要到「系統設定 → 隱私權與安全性」按「仍要打開」，Windows 的 SmartScreen
-  要按「其他資訊 → 仍要執行」。
+- 安裝檔沒有開發者簽章（沒有 Apple 開發者帳號），第一次打開 macOS 要到「系統設定 → 隱私權與安全性」按「仍要打開」，Windows 的 SmartScreen
+  要按「其他資訊 → 仍要執行」。macOS 的 app 在打包時由 `scripts/adHocSign.cjs`（electron-builder 的 afterPack）整包補 ad-hoc 簽章：
+  沒補的話 arm64 版只有 linker 自動加的簽章、沒有 sealed resources，從瀏覽器、Teams、OneDrive 拿到的檔帶檢疫旗標，
+  macOS 26 會直接說「已損毀」、沒有「仍要打開」可按。簽完驗不過就讓打包失敗。
 - **第一次打開是設定頁**（外殼自己的 `electron/setup.html`，server 還沒起來）：輸入 admin 給的邀請碼、選會議記錄資料夾。
   邀請碼向 gateway（`https://meetpilot-gateway.vercel.app`，repo `meetpilot-gateway`）換成 token，再拿 Gemini key 與名單；
   兩樣都到手才存設定、起 server。邀請碼本身不存。之後要換資料夾或邀請碼，從托盤選單的「設定…」。

@@ -138,7 +138,8 @@ jobs:
 
   # 桌面 app：兩個平台各自打包、真的把 app 啟動起來確認裡面的 server 有回應，再產出安裝檔。
   # Windows 上的外殼（utilityProcess、檔案佈局、cwd）能不能跑，只有這一步驗得到。
-  # 安裝檔沒有簽章（vault plan 的裁定），macOS 要關掉自動找簽章身分，不然 electron-builder 會去翻 keychain。
+  # 安裝檔沒有開發者簽章（vault plan 的裁定），macOS 要關掉自動找簽章身分，不然 electron-builder 會去翻 keychain。
+  # macOS 的 app 由 afterPack（scripts/adHocSign.cjs）整包補 ad-hoc 簽章並當場驗，`--mac dir` 那一步就會跑到。
   desktop:
     needs: release
     permissions:

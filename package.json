@@ -61,6 +61,7 @@
       }
     ],
     "beforePack": "./scripts/ffmpeg/beforePack.cjs",
+    "afterPack": "./scripts/adHocSign.cjs",
     "directories": {
       "output": "release"
     },

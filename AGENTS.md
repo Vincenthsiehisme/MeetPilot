@@ -223,6 +223,9 @@ function f(p: Pick) {
 - **打包設定 `asar: false` 是刻意的。** server 用 `process.cwd()` 找 `dist/`（前端）與 `prompts/`（會議記錄規範），
   外殼把 utilityProcess 的 `cwd` 設成 app 目錄；asar 是虛擬檔案系統，不能當 cwd。要改回 asar，得先讓 server
   的這兩個路徑改吃環境變數。
+- **`mac.identity: null` 與 afterPack 的 ad-hoc 簽章要一起留著。** 前者讓 electron-builder 不找開發者憑證（沒有 Apple 開發者帳號），
+  後者（`scripts/adHocSign.cjs`）把 `MeetPilot.app` 整包 `codesign --force --deep --sign -` 再驗。拿掉後者，arm64 的 app 只剩
+  linker 的簽章、沒有 sealed resources，帶檢疫旗標時 macOS 26 判成「已損毀」、沒有「仍要打開」（2026-10-05、10-19 兩例）。
 - **Electron 版本釘死（`44.4.5`，不用 `^`）。** `node:sqlite` 能在它的 utilityProcess 裡用是對這一版實測的
   （Node 24.21.0），升版要重驗。npm 上 44 是最新穩定版，45 還是 alpha。
 - **單一實例不能拿掉。** `jobStore.reclaimAllActive` 建立在同一個 DB 只有一個 process 上。
