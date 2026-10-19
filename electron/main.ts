@@ -518,7 +518,8 @@ async function syncIntoRuntime(credentials: DesktopCredentials, vaultDir: string
     writeLog(`--- gateway 回 401，已刪掉存著的登入資料：${sync.message} ---\n`);
     return `這台電腦的邀請碼已失效（gateway：${sync.message}）。請向 admin 拿新的邀請碼。`;
   }
-  if (sync.outcome === 'no-key') return `拿不到 Gemini key：${sync.message}`;
+  // 記錄人看到的字不提 Gemini key：key 是 app 自己向 gateway 拿的，記錄人無從處理（2026-10-03 使用者裁）
+  if (sync.outcome === 'no-key') return `向 MeetPilot 伺服器拿設定沒有成功。請確認網路後按「儲存並開始」再試一次；還是不行請聯絡 Vincent，並附上原始訊息：${sync.message}`;
   // 跟設定頁同一道守衛：沒有上次的名單、這次也拿不到，起來的 server 建不了會議（Codex review 第二輪）
   if (sync.freshRoster === null && !store.hasRoster()) {
     return `拿不到人員名單，也沒有上次存的：${sync.problems.join('；')}。確認網路後按「儲存並開始」再試一次。`;
@@ -718,7 +719,9 @@ async function saveSetup(newCode: string, vaultDir: string): Promise<{ ok: true 
     }
     return { ok: false, error: `gateway 不接受這組登入資料，請輸入新的邀請碼（gateway：${sync.message}）` };
   }
-  if (sync.outcome === 'no-key') return { ok: false, error: `拿不到 Gemini key，設定沒有存：${sync.message}` };
+  if (sync.outcome === 'no-key') {
+    return { ok: false, error: `向 MeetPilot 伺服器拿設定沒有成功，設定沒有存。請確認網路後再按一次「儲存並開始」；還是不行請聯絡 Vincent，並附上原始訊息：${sync.message}` };
+  }
   // 第一次設定就拿不到名單：server 起來也建不了會議（至少要選一位與會者），這種「完成」沒有意義，
   // 留在設定頁講原因。手上有上次的名單才走離線（Codex review）
   if (sync.freshRoster === null && !store.hasRoster()) {
